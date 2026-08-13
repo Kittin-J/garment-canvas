@@ -1,0 +1,9 @@
+#!/bin/zsh
+set -euo pipefail
+
+LABEL="${GARMENT_CANVAS_LABEL:-com.garmentcanvas.server}"
+DOMAIN="gui/$(id -u)"
+
+if /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+  /bin/launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+fi

@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Data & secrets
+.env
+.secrets/
+*.pem
+*.key
+
+# Data directories (user content)
+data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temp
+tmp/
+temp/
