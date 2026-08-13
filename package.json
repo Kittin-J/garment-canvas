@@ -17,7 +17,7 @@
     "start": "NODE_ENV=production node dist-server/index.js",
     "lint": "tsc --noEmit",
     "check": "npm run lint && npm run test",
-    "test": "tsx tests/dag.test.ts && tsx tests/workflow-schema.test.ts"
+    "test": "tsx tests/dag.test.ts && tsx tests/workflow-schema.test.ts && tsx tests/provider-contract.test.ts && tsx tests/recent-results.test.ts"
   },
   "dependencies": {
     "@xyflow/react": "^12.3.6",

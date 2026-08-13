@@ -1,0 +1,56 @@
+/* ---- 主题：简白（白色为主） ---- */
+[data-theme="white"] body {
+  background-color: #f5f4f0 !important;
+  color: #1a1a1a;
+}
+[data-theme="white"] .bg-ink,
+[data-theme="white"] .react-flow { background-color: #f5f4f0 !important; }
+[data-theme="white"] .bg-\[#141414\] { background-color: #ffffff !important; }
+[data-theme="white"] .bg-\[#1a1a1a\] { background-color: #f0efe9 !important; }
+[data-theme="white"] .bg-\[#0f0f0f\] { background-color: #fafaf7 !important; }
+[data-theme="white"] .bg-\[#3a3226\] { background-color: #e9e4d5 !important; }
+[data-theme="white"] .border-\[#262626\] { border-color: #e2dfd6 !important; }
+[data-theme="white"] .border-\[#333\] { border-color: #d4d0c4 !important; }
+[data-theme="white"] .text-neutral-200 { color: #1a1a1a !important; }
+[data-theme="white"] .text-neutral-300 { color: #333333 !important; }
+[data-theme="white"] .text-neutral-400 { color: #555555 !important; }
+[data-theme="white"] .text-neutral-500 { color: #737373 !important; }
+[data-theme="white"] .text-neutral-600 { color: #8a8a8a !important; }
+[data-theme="white"] .text-neutral-700 { color: #9c9c9c !important; }
+[data-theme="white"] .text-gold { color: #896932 !important; }
+[data-theme="white"] .placeholder\:text-neutral-600::placeholder { color: #9c9c9c !important; }
+[data-theme="white"] .shadow-xl { box-shadow: 0 12px 28px rgba(26, 26, 26, 0.08) !important; }
+[data-theme="white"] .react-flow__controls { border-color: #e2dfd6 !important; box-shadow: 0 4px 16px rgba(26, 26, 26, 0.08) !important; }
+[data-theme="white"] .react-flow__controls-button { background: #ffffff !important; border-color: #e2dfd6 !important; fill: #555555 !important; }
+[data-theme="white"] .react-flow__controls-button:hover { background: #f0efe9 !important; fill: #1a1a1a !important; }
+[data-theme="white"] .react-flow__minimap { border-color: #e2dfd6 !important; }
+[data-theme="white"] ::-webkit-scrollbar-thumb { background: #d4d0c4; }
+[data-theme="white"] ::-webkit-scrollbar-thumb:hover { background: #bab5a6; }
+
+/* ---- 主题：护眼绿（绿色为主） ---- */
+[data-theme="eye"] body {
+  background-color: #cfe3c2 !important;
+  color: #22331f;
+}
+[data-theme="eye"] .bg-ink,
+[data-theme="eye"] .react-flow { background-color: #cfe3c2 !important; }
+[data-theme="eye"] .bg-\[#141414\] { background-color: #ddeccf !important; }
+[data-theme="eye"] .bg-\[#1a1a1a\] { background-color: #d2e4c3 !important; }
+[data-theme="eye"] .bg-\[#0f0f0f\] { background-color: #eaf4de !important; }
+[data-theme="eye"] .bg-\[#3a3226\] { background-color: #bcd6a8 !important; }
+[data-theme="eye"] .border-\[#262626\] { border-color: #aec99a !important; }
+[data-theme="eye"] .border-\[#333\] { border-color: #98b884 !important; }
+[data-theme="eye"] .text-neutral-200 { color: #22331f !important; }
+[data-theme="eye"] .text-neutral-300 { color: #30452b !important; }
+[data-theme="eye"] .text-neutral-400 { color: #47623f !important; }
+[data-theme="eye"] .text-neutral-500 { color: #5c7a52 !important; }
+[data-theme="eye"] .text-neutral-600 { color: #729066 !important; }
+[data-theme="eye"] .text-neutral-700 { color: #86a279 !important; }
+[data-theme="eye"] .text-gold { color: #6e5320 !important; }
+[data-theme="eye"] .placeholder\:text-neutral-600::placeholder { color: #86a279 !important; }
+[data-theme="eye"] .react-flow__controls { border-color: #aec99a !important; box-shadow: 0 4px 16px rgba(48, 69, 43, 0.15) !important; }
+[data-theme="eye"] .react-flow__controls-button { background: #ddeccf !important; border-color: #aec99a !important; fill: #47623f !important; }
+[data-theme="eye"] .react-flow__controls-button:hover { background: #d2e4c3 !important; fill: #22331f !important; }
+[data-theme="eye"] .react-flow__minimap { border-color: #aec99a !important; }
+[data-theme="eye"] ::-webkit-scrollbar-thumb { background: #98b884; }
+[data-theme="eye"] ::-webkit-scrollbar-thumb:hover { background: #7ea368; }

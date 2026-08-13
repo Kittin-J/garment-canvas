@@ -1,0 +1,68 @@
+#!/bin/zsh
+set -euo pipefail
+
+APP_ROOT="${GARMENT_CANVAS_HOME:-$HOME/Applications/GarmentCanvas}"
+SUPPORT_DIR="$HOME/Library/Application Support/GarmentCanvas"
+ENV_FILE="$SUPPORT_DIR/config/service.env"
+LABEL="${GARMENT_CANVAS_LABEL:-com.garmentcanvas.server}"
+PLIST_PATH="$HOME/Library/LaunchAgents/$LABEL.plist"
+DOMAIN="gui/$(id -u)"
+
+read_port() {
+  local line value
+  line="$(/usr/bin/grep -E '^PORT=' "$ENV_FILE" 2>/dev/null | /usr/bin/head -n 1 || true)"
+  value="${line#*=}"
+  value="${value#\"}"
+  value="${value%\"}"
+  value="${value#\'}"
+  value="${value%\'}"
+  [[ "$value" == <-> ]] && print -r -- "$value" || print -r -- "3001"
+}
+
+if [[ ! -f "$ENV_FILE" ]]; then
+  print -u2 "Missing configuration: $ENV_FILE"
+  print -u2 "Run install.command first."
+  exit 1
+fi
+
+if [[ ! -e "$APP_ROOT/current" ]] || [[ ! -f "$APP_ROOT/current/dist-server/index.js" ]]; then
+  print -u2 "No active Garment Canvas release. Run install.command first."
+  exit 1
+fi
+
+if [[ ! -f "$PLIST_PATH" ]]; then
+  print -u2 "LaunchAgent is missing: $PLIST_PATH"
+  print -u2 "Run install.command first."
+  exit 1
+fi
+
+if /usr/bin/awk '
+  /^[[:space:]]*#/ { next }
+  /sk-your-(key|gemini-group-key)|your-change2pro-host/ { found=1 }
+  END { exit found ? 0 : 1 }
+' "$ENV_FILE"; then
+  print -u2 "Edit the gateway placeholders first:"
+  print -u2 "  open -e '$ENV_FILE'"
+  exit 1
+fi
+
+/bin/launchctl enable "$DOMAIN/$LABEL" 2>/dev/null || true
+if /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+  /bin/launchctl kickstart -k "$DOMAIN/$LABEL"
+else
+  /bin/launchctl bootstrap "$DOMAIN" "$PLIST_PATH"
+  /bin/launchctl kickstart -k "$DOMAIN/$LABEL"
+fi
+
+PORT="$(read_port)"
+for _ in {1..30}; do
+  if /usr/bin/curl -fsS --max-time 2 "http://127.0.0.1:$PORT/api/ready" >/dev/null 2>&1; then
+    print "Garment Canvas is ready: http://127.0.0.1:$PORT/"
+    exit 0
+  fi
+  /bin/sleep 1
+done
+
+print -u2 "Service did not become ready. Check:"
+print -u2 "  $HOME/Library/Logs/GarmentCanvas/server-error.log"
+exit 1

@@ -1,0 +1,37 @@
+#!/bin/zsh
+set -euo pipefail
+
+LABEL="${GARMENT_CANVAS_LABEL:-com.garmentcanvas.server}"
+DOMAIN="gui/$(id -u)"
+ENV_FILE="$HOME/Library/Application Support/GarmentCanvas/config/service.env"
+
+read_port() {
+  local line value
+  line="$(/usr/bin/grep -E '^PORT=' "$ENV_FILE" 2>/dev/null | /usr/bin/head -n 1 || true)"
+  value="${line#*=}"
+  value="${value#\"}"
+  value="${value%\"}"
+  value="${value#\'}"
+  value="${value%\'}"
+  [[ "$value" == <-> ]] && print -r -- "$value" || print -r -- "3001"
+}
+
+PORT="${PORT:-$(read_port)}"
+
+if /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+  print "Service: loaded"
+  /bin/launchctl print "$DOMAIN/$LABEL" 2>/dev/null |
+    /usr/bin/grep -E '^[[:space:]]*(state|pid|last exit code) =' || true
+else
+  print "Service: not loaded"
+fi
+
+if /usr/bin/curl -fsS --max-time 3 "http://127.0.0.1:$PORT/api/ready"; then
+  print
+  print "URL: http://127.0.0.1:$PORT/"
+else
+  print -u2 "Readiness check failed on port $PORT."
+  /usr/bin/curl -sS --max-time 3 "http://127.0.0.1:$PORT/api/health" 2>/dev/null || true
+  print
+  exit 1
+fi

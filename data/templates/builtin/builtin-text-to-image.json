@@ -1,0 +1,42 @@
+{
+  "schemaVersion": 1,
+  "id": "builtin-text-to-image",
+  "name": "文生图（服装设计）",
+  "description": "输入款式、面料、色彩、模特、场景与摄影要求，直接生成服装设计效果图",
+  "builtIn": true,
+  "createdAt": "2026-08-13T00:00:00.000Z",
+  "flow": {
+    "schemaVersion": 1,
+    "nodes": [
+      {
+        "id": "generate",
+        "type": "sketch-to-render",
+        "position": { "x": 0, "y": 0 },
+        "data": {
+          "kind": "sketch-to-render",
+          "label": "文生图",
+          "status": "idle",
+          "prompt": "设计一套现代都市女装：廓形利落的短款西装搭配高腰阔腿长裤，使用有细腻垂坠感的深灰羊毛混纺面料，局部加入哑光黑色皮革滚边；年轻亚洲女模特全身站姿，正面略微侧身，服装结构、面料纹理和缝线细节清晰；极简浅灰摄影棚背景，柔和侧光，高级时装品牌 Lookbook 风格，写实摄影，高质感，画面干净，无文字、无水印。",
+          "aspectRatio": "3:4",
+          "batchSize": 1,
+          "outputImages": []
+        }
+      },
+      {
+        "id": "result",
+        "type": "result",
+        "position": { "x": 430, "y": 0 },
+        "data": {
+          "kind": "result",
+          "label": "生成结果",
+          "status": "idle",
+          "images": [],
+          "note": "可修改提示词、画幅比例和生成数量后重新生成"
+        }
+      }
+    ],
+    "edges": [
+      { "id": "generate-to-result", "source": "generate", "target": "result" }
+    ]
+  }
+}

@@ -1,14 +1,23 @@
 # Dependencies
 node_modules/
 
+# Build and release outputs
+releases/
+*.tsbuildinfo
+
 # Data & secrets
 .env
+.env.local
 .secrets/
 *.pem
 *.key
 
-# Data directories (user content)
-data/
+# Runtime data (built-in templates remain versioned)
+data/uploads/
+data/projects/
+data/assets/
+data/templates/user/
+data/quarantine/
 
 # OS
 .DS_Store
@@ -21,3 +30,9 @@ logs/
 # Temp
 tmp/
 temp/
+
+# Test and local demo outputs
+test-*.png
+test-*.jpg
+shot-*.png
+button-animation-demos.html

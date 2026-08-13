@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "id": "builtin-text-recolor",
+  "name": "文生款式→多配色",
+  "description": "纯提示词文生款式效果图，再按配色批量出图",
+  "builtIn": true,
+  "createdAt": "2026-08-05T00:00:00.000Z",
+  "flow": {
+    "schemaVersion": 1,
+    "nodes": [
+      {
+        "id": "n1",
+        "type": "sketch-to-render",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "data": {
+          "kind": "sketch-to-render",
+          "label": "草图→效果图",
+          "status": "idle",
+          "prompt": "设计一款简约通勤风女装连衣裙，正面全身效果图，浅灰纯色背景",
+          "aspectRatio": "3:4",
+          "batchSize": 1,
+          "outputImages": []
+        }
+      },
+      {
+        "id": "n2",
+        "type": "fabric-recolor",
+        "position": {
+          "x": 380,
+          "y": 0
+        },
+        "data": {
+          "kind": "fabric-recolor",
+          "label": "面料/配色替换",
+          "status": "idle",
+          "colors": [],
+          "prompt": "",
+          "outputImages": []
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e1",
+        "source": "n1",
+        "target": "n2",
+        "targetHandle": "garment"
+      }
+    ]
+  },
+  "thumbnail": "/api/files/hVpQqjuv8YxP.jpg"
+}

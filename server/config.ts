@@ -1,0 +1,77 @@
+/**
+ * 集中管理环境变量。未安装 dotenv，这里手动解析项目根目录 .env（key=value），
+ * process.env 中已存在的值优先。
+ */
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+/** 项目根目录（server/ 的上一级） */
+export const ROOT_DIR = path.resolve(__dirname, "..");
+
+function loadDotEnv(): void {
+  const envPath = path.join(ROOT_DIR, ".env");
+  if (!fs.existsSync(envPath)) return;
+  const content = fs.readFileSync(envPath, "utf-8");
+  for (const line of content.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) continue;
+    const eq = trimmed.indexOf("=");
+    if (eq <= 0) continue;
+    const key = trimmed.slice(0, eq).trim();
+    let value = trimmed.slice(eq + 1).trim();
+    if (
+      (value.startsWith('"') && value.endsWith('"')) ||
+      (value.startsWith("'") && value.endsWith("'"))
+    ) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) process.env[key] = value;
+  }
+}
+
+loadDotEnv();
+
+function required(name: string): string {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing required env var: ${name} (see .env.example)`);
+  return v;
+}
+
+export const config = {
+  /** change2pro 中转站 */
+  change2proBaseUrl: () =>
+    (process.env.CHANGE2PRO_BASE_URL ?? "https://your-change2pro-host/v1").replace(/\/+$/, ""),
+  change2proApiKey: () => required("CHANGE2PRO_API_KEY"),
+
+  /** nanobanana 可用独立 Key（如中转站按平台分组发 Key），缺省回退主 Key */
+  nanobananaApiKey: () =>
+    process.env.NANOBANANA_API_KEY || required("CHANGE2PRO_API_KEY"),
+
+  nanobananaModel: () => process.env.NANOBANANA_MODEL ?? "gpt-image-2",
+  image2Model: () => process.env.IMAGE2_MODEL ?? "gpt-image-2",
+
+  port: () => Number(process.env.PORT ?? 3001),
+  dataDir: () => path.resolve(ROOT_DIR, process.env.DATA_DIR ?? "./data"),
+  /** 生产模式是否只提供 API；true 时不要求或托管前端 dist。 */
+  apiOnly: () => process.env.API_ONLY === "true",
+
+  /** AI 调用超时（中转站网关限制，可配） */
+  aiTimeoutMs: () => Number(process.env.AI_TIMEOUT_MS ?? 300_000),
+  /** 失败重试次数（不含首次） */
+  aiMaxRetries: () => Number(process.env.AI_MAX_RETRIES ?? 2),
+
+  /** 不发外部请求的 AI 配置就绪检查，供 readiness 使用。 */
+  aiConfigReady: () => {
+    const key = process.env.CHANGE2PRO_API_KEY || process.env.NANOBANANA_API_KEY;
+    const baseUrl = process.env.CHANGE2PRO_BASE_URL ?? "";
+    if (!key || !baseUrl || /your-change2pro-host/i.test(baseUrl)) return false;
+    try {
+      const url = new URL(baseUrl);
+      return url.protocol === "https:";
+    } catch {
+      return false;
+    }
+  },
+} as const;

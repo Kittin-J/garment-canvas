@@ -46,7 +46,7 @@ var config = {
   /** 生产模式是否只提供 API；true 时不要求或托管前端 dist。 */
   apiOnly: () => process.env.API_ONLY === "true",
   /** AI 调用超时（中转站网关限制，可配） */
-  aiTimeoutMs: () => Number(process.env.AI_TIMEOUT_MS ?? 300000),
+  aiTimeoutMs: () => Number(process.env.AI_TIMEOUT_MS ?? 3e5),
   /** 失败重试次数（不含首次） */
   aiMaxRetries: () => Number(process.env.AI_MAX_RETRIES ?? 2),
   /** 不发外部请求的 AI 配置就绪检查，供 readiness 使用。 */
@@ -190,7 +190,7 @@ async function generateOnce(req) {
 }
 var nanobananaProvider = {
   id: PROVIDER_ID,
-  /** 文生图（可带参考图）；batchSize 通过多次调用实现 */
+  /** 文生图；batchSize 通过多次调用实现 */
   async generate(req) {
     const n = Math.max(1, Math.min(req.batchSize ?? 1, 4));
     const settled = await Promise.all(Array.from({ length: n }, () => generateOnce(req)));
@@ -199,7 +199,7 @@ var nanobananaProvider = {
       model: config.nanobananaModel()
     };
   },
-  /** 图生图：使用 /v1/images/edits */
+  /** 图生图：使用 /images/edits multipart 接口。 */
   async edit(req) {
     if (!req.referenceImages?.length) {
       throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID);
@@ -213,10 +213,14 @@ var nanobananaProvider = {
         form.append("prompt", req.prompt);
         form.append("size", aspectRatioToSize(req.aspectRatio));
         form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, 4))));
-        req.referenceImages.forEach((ref, i) => {
+        req.referenceImages.forEach((ref, index) => {
           const { mime, buffer } = parseDataUrl(ref);
           const ext = mime.split("/")[1] ?? "png";
-          form.append("image", new Blob([new Uint8Array(buffer)], { type: mime }), `ref-${i}.${ext}`);
+          form.append(
+            "image",
+            new Blob([new Uint8Array(buffer)], { type: mime }),
+            `ref-${index}.${ext}`
+          );
         });
         if (req.mask) {
           const { mime, buffer } = parseDataUrl(req.mask);
@@ -1584,6 +1588,14 @@ runPlanRouter.get("/:id/events", (req, res) => {
     run.emitter.off("finish", close);
   });
 });
+runPlanRouter.get("/:id", (req, res) => {
+  const run = getRun(req.params.id);
+  if (!run) {
+    res.status(404).json({ error: "run not found" });
+    return;
+  }
+  res.json({ runId: run.id, finished: run.finished });
+});
 
 // server/routes/files.ts
 import { Router as Router3 } from "express";
@@ -1909,15 +1921,119 @@ function builtinTemplates() {
         ],
         edges: [{ id: "e1", source: "n1", target: "n2", targetHandle: "garment" }]
       }
+    },
+    {
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      id: "builtin-text-to-image",
+      name: "\u6587\u751F\u56FE\uFF08\u670D\u88C5\u8BBE\u8BA1\uFF09",
+      description: "\u8F93\u5165\u6B3E\u5F0F\u3001\u9762\u6599\u3001\u8272\u5F69\u3001\u6A21\u7279\u3001\u573A\u666F\u4E0E\u6444\u5F71\u8981\u6C42\uFF0C\u76F4\u63A5\u751F\u6210\u670D\u88C5\u8BBE\u8BA1\u6548\u679C\u56FE",
+      builtIn: true,
+      createdAt: "2026-08-13T00:00:00.000Z",
+      flow: {
+        schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        nodes: [
+          {
+            id: "generate",
+            type: "sketch-to-render",
+            position: { x: 0, y: 0 },
+            data: {
+              kind: "sketch-to-render",
+              label: "\u6587\u751F\u56FE",
+              status: "idle",
+              prompt: "\u8BBE\u8BA1\u4E00\u5957\u73B0\u4EE3\u90FD\u5E02\u5973\u88C5\uFF1A\u5ED3\u5F62\u5229\u843D\u7684\u77ED\u6B3E\u897F\u88C5\u642D\u914D\u9AD8\u8170\u9614\u817F\u957F\u88E4\uFF0C\u4F7F\u7528\u6709\u7EC6\u817B\u5782\u5760\u611F\u7684\u6DF1\u7070\u7F8A\u6BDB\u6DF7\u7EBA\u9762\u6599\uFF0C\u5C40\u90E8\u52A0\u5165\u54D1\u5149\u9ED1\u8272\u76AE\u9769\u6EDA\u8FB9\uFF1B\u5E74\u8F7B\u4E9A\u6D32\u5973\u6A21\u7279\u5168\u8EAB\u7AD9\u59FF\uFF0C\u6B63\u9762\u7565\u5FAE\u4FA7\u8EAB\uFF0C\u670D\u88C5\u7ED3\u6784\u3001\u9762\u6599\u7EB9\u7406\u548C\u7F1D\u7EBF\u7EC6\u8282\u6E05\u6670\uFF1B\u6781\u7B80\u6D45\u7070\u6444\u5F71\u68DA\u80CC\u666F\uFF0C\u67D4\u548C\u4FA7\u5149\uFF0C\u9AD8\u7EA7\u65F6\u88C5\u54C1\u724C Lookbook \u98CE\u683C\uFF0C\u5199\u5B9E\u6444\u5F71\uFF0C\u9AD8\u8D28\u611F\uFF0C\u753B\u9762\u5E72\u51C0\uFF0C\u65E0\u6587\u5B57\u3001\u65E0\u6C34\u5370\u3002",
+              aspectRatio: "3:4",
+              batchSize: 1,
+              outputImages: []
+            }
+          },
+          {
+            id: "result",
+            type: "result",
+            position: { x: 430, y: 0 },
+            data: {
+              kind: "result",
+              label: "\u751F\u6210\u7ED3\u679C",
+              status: "idle",
+              images: [],
+              note: "\u53EF\u4FEE\u6539\u63D0\u793A\u8BCD\u3001\u753B\u5E45\u6BD4\u4F8B\u548C\u751F\u6210\u6570\u91CF\u540E\u91CD\u65B0\u751F\u6210"
+            }
+          }
+        ],
+        edges: [{ id: "generate-to-result", source: "generate", target: "result" }]
+      }
+    },
+    {
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      id: "builtin-style-transfer",
+      name: "\u98CE\u683C\u8FC1\u79FB\uFF08\u4EBA\u7269\u2192\u573A\u666F\uFF09",
+      description: "\u4E0A\u4F20\u56FE1\u4EBA\u7269\u4E0E\u56FE2\u573A\u666F\uFF0C\u5C06\u4EBA\u7269\u4FDD\u771F\u8FC1\u79FB\u5230\u573A\u666F\u4E2D\u5E76\u5339\u914D\u5EA7\u6905\u3001\u59FF\u6001\u3001\u5149\u5F71\u4E0E\u900F\u89C6",
+      builtIn: true,
+      createdAt: "2026-08-13T00:00:00.000Z",
+      flow: {
+        schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        nodes: [
+          {
+            id: "subject",
+            type: "image-input",
+            position: { x: 0, y: -170 },
+            data: {
+              kind: "image-input",
+              label: "\u56FE1 \xB7 \u4EBA\u7269\u4E3B\u4F53",
+              status: "idle",
+              imageRole: "garment"
+            }
+          },
+          {
+            id: "scene",
+            type: "image-input",
+            position: { x: 0, y: 190 },
+            data: {
+              kind: "image-input",
+              label: "\u56FE2 \xB7 \u573A\u666F\u80CC\u666F",
+              status: "idle",
+              imageRole: "reference"
+            }
+          },
+          {
+            id: "transfer",
+            type: "ai-modify",
+            position: { x: 430, y: 0 },
+            data: {
+              kind: "ai-modify",
+              label: "\u98CE\u683C\u8FC1\u79FB",
+              status: "idle",
+              prompt: "\u4E25\u683C\u6309\u7167\u8F93\u5165\u987A\u5E8F\u5904\u7406\uFF1A\u56FE1\u662F\u9700\u8981\u4FDD\u7559\u7684\u4EBA\u7269\u4E3B\u4F53\uFF0C\u56FE2\u662F\u76EE\u6807\u573A\u666F\u3002\u5C06\u56FE1\u4E2D\u7684\u540C\u4E00\u4EBA\u7269\u5B8C\u6574\u8FC1\u79FB\u5230\u56FE2\u7684\u80CC\u666F\u4E2D\uFF0C\u5E76\u8BA9\u4EBA\u7269\u81EA\u7136\u5750\u5728\u56FE2\u7684\u6905\u5B50\u4E0A\u3002\u4FDD\u6301\u56FE1\u4EBA\u7269\u7684\u8138\u90E8\u8EAB\u4EFD\u3001\u53D1\u578B\u3001\u4F53\u578B\u3001\u670D\u88C5\u6B3E\u5F0F\u3001\u989C\u8272\u4E0E\u6750\u8D28\u7EC6\u8282\u4E0D\u53D8\uFF1B\u4FDD\u6301\u56FE2\u7684\u80CC\u666F\u3001\u6905\u5B50\u3001\u6784\u56FE\u4E0E\u7A7A\u95F4\u9648\u8BBE\u4E0D\u53D8\u3002\u6839\u636E\u6905\u5B50\u7684\u671D\u5411\u548C\u9AD8\u5EA6\u8C03\u6574\u4EBA\u7269\u5750\u59FF\u3001\u80A2\u4F53\u906E\u6321\u3001\u6BD4\u4F8B\u4E0E\u900F\u89C6\uFF0C\u4F7F\u8EAB\u4F53\u4E0E\u6905\u9762\u6B63\u786E\u63A5\u89E6\uFF0C\u8865\u5145\u81EA\u7136\u7684\u63A5\u89E6\u9634\u5F71\uFF0C\u5E76\u7EDF\u4E00\u5149\u7EBF\u65B9\u5411\u3001\u8272\u6E29\u3001\u666F\u6DF1\u4E0E\u753B\u9762\u8D28\u611F\u3002\u4E0D\u8981\u590D\u5236\u56FE2\u4E2D\u7684\u4EBA\u7269\uFF0C\u4E0D\u8981\u6539\u53D8\u4EBA\u7269\u8EAB\u4EFD\uFF0C\u4E0D\u8981\u65B0\u589E\u591A\u4F59\u4EBA\u7269\u6216\u5BB6\u5177\u3002\u8F93\u51FA\u4E00\u5F20\u771F\u5B9E\u3001\u81EA\u7136\u3001\u65E0\u62FC\u8D34\u75D5\u8FF9\u7684\u5B8C\u6574\u56FE\u7247\u3002",
+              aspectRatio: "3:4",
+              batchSize: 1,
+              outputImages: []
+            }
+          },
+          {
+            id: "result",
+            type: "result",
+            position: { x: 860, y: 0 },
+            data: {
+              kind: "result",
+              label: "\u8FC1\u79FB\u7ED3\u679C",
+              status: "idle",
+              images: [],
+              note: "\u4EBA\u7269\u6765\u81EA\u56FE1\uFF0C\u573A\u666F\u4E0E\u6905\u5B50\u6765\u81EA\u56FE2"
+            }
+          }
+        ],
+        edges: [
+          { id: "subject-to-transfer", source: "subject", target: "transfer" },
+          { id: "scene-to-transfer", source: "scene", target: "transfer" },
+          { id: "transfer-to-result", source: "transfer", target: "result" }
+        ]
+      }
     }
   ];
 }
 function ensureBuiltinTemplates() {
-  const dir = templatesDir("builtin");
-  const hasAny = fs6.readdirSync(dir).some((f) => f.endsWith(".json"));
-  if (hasAny) return;
   for (const tpl of builtinTemplates()) {
-    writeJsonAtomicSync(templatePath("builtin", tpl.id), tpl);
+    const filePath = templatePath("builtin", tpl.id);
+    if (!fs6.existsSync(filePath)) writeJsonAtomicSync(filePath, tpl);
   }
 }
 ensureBuiltinTemplates();
@@ -2131,35 +2247,40 @@ assetsRouter.delete("/:id", (req, res) => {
   }
 });
 
+// server/lib/rateLimit.ts
+function createRateLimitMiddleware(options = {}) {
+  const windowMs = options.windowMs ?? 6e4;
+  const maxRequests = options.maxRequests ?? 5;
+  const now = options.now ?? Date.now;
+  const buckets = /* @__PURE__ */ new Map();
+  return (req, res, next) => {
+    const key = req.ip || req.socket.remoteAddress || "unknown";
+    const currentTime = now();
+    let bucket = buckets.get(key);
+    if (!bucket || bucket.resetAt <= currentTime) {
+      bucket = { count: 0, resetAt: currentTime + windowMs };
+      buckets.set(key, bucket);
+    }
+    bucket.count += 1;
+    if (bucket.count > maxRequests) {
+      res.status(429).json({
+        error: "Too many requests, please slow down",
+        retryAfter: Math.max(1, Math.ceil((bucket.resetAt - currentTime) / 1e3))
+      });
+      return;
+    }
+    next();
+  };
+}
+
 // server/index.ts
 var app = express();
 app.use(cors());
 app.use(express.json({ limit: "50mb" }));
-
-// --- simple in-memory rate limiter ---
-var RATE_WINDOW_MS = 60 * 1e3;
-var RATE_MAX = 5;
-var rateBuckets = /* @__PURE__ */ new Map();
-function rateLimitMiddleware(req, res, next) {
-  const ip = req.ip || req.socket?.remoteAddress || "unknown";
-  const now = Date.now();
-  let bucket = rateBuckets.get(ip);
-  if (!bucket || bucket.resetAt <= now) {
-    bucket = { count: 0, resetAt: now + RATE_WINDOW_MS };
-    rateBuckets.set(ip, bucket);
-  }
-  bucket.count++;
-  if (bucket.count > RATE_MAX) {
-    res.status(429).json({ error: "Too many requests, please slow down", retryAfter: Math.ceil((bucket.resetAt - now) / 1e3) });
-    return;
-  }
-  next();
-}
-// --- end rate limiter ---
-
+var aiRateLimit = createRateLimitMiddleware();
 app.get("/api/health", (_req, res) => res.json({ ok: true, status: "alive" }));
-app.use("/api/generate", rateLimitMiddleware, generateRouter);
-app.use("/api/run-plan", rateLimitMiddleware, runPlanRouter);
+app.use("/api/generate", aiRateLimit, generateRouter);
+app.use("/api/run-plan", aiRateLimit, runPlanRouter);
 app.use("/api/files", filesRouter);
 app.use("/api/projects", projectsRouter);
 app.use("/api/templates", templatesRouter);

@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 1,
+  "id": "builtin-sketch-upscale",
+  "name": "草图→效果图→高清放大",
+  "description": "上传草图渲染效果图，再放大至 2K/4K 精修细节",
+  "builtIn": true,
+  "createdAt": "2026-08-05T00:00:00.000Z",
+  "flow": {
+    "schemaVersion": 1,
+    "nodes": [
+      {
+        "id": "n1",
+        "type": "image-input",
+        "position": {
+          "x": 0,
+          "y": 0
+        },
+        "data": {
+          "kind": "image-input",
+          "label": "图片上传",
+          "status": "idle",
+          "imageRole": "sketch"
+        }
+      },
+      {
+        "id": "n2",
+        "type": "sketch-to-render",
+        "position": {
+          "x": 380,
+          "y": 0
+        },
+        "data": {
+          "kind": "sketch-to-render",
+          "label": "草图→效果图",
+          "status": "idle",
+          "prompt": "",
+          "aspectRatio": "3:4",
+          "batchSize": 1,
+          "outputImages": []
+        }
+      },
+      {
+        "id": "n3",
+        "type": "upscale",
+        "position": {
+          "x": 760,
+          "y": 0
+        },
+        "data": {
+          "kind": "upscale",
+          "label": "高清放大",
+          "status": "idle",
+          "imageSize": "2K",
+          "outputImages": []
+        }
+      }
+    ],
+    "edges": [
+      {
+        "id": "e1",
+        "source": "n1",
+        "target": "n2"
+      },
+      {
+        "id": "e2",
+        "source": "n2",
+        "target": "n3"
+      }
+    ]
+  },
+  "thumbnail": "/api/files/7qICbTj5uMWr.jpg"
+}

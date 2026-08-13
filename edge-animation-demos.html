@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>连线电流动效 · 候选方案</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0A0A0A; color: #e5e5e5; min-height: 100vh;
+    font-family: "PingFang SC", "Microsoft YaHei", sans-serif;
+    padding: 40px 24px;
+  }
+  h1 { font-size: 18px; font-weight: 600; margin-bottom: 6px; }
+  .sub { font-size: 12px; color: #737373; margin-bottom: 24px; }
+  .toggle {
+    margin-bottom: 24px; display: inline-flex; gap: 8px; align-items: center;
+    font-size: 11px; color: #a3a3a3;
+  }
+  .toggle button {
+    border: 1px solid #333; background: #141414; color: #a3a3a3; border-radius: 999px;
+    padding: 5px 14px; font-size: 11px; cursor: pointer;
+  }
+  .toggle button.on { border-color: #C9A66B; color: #C9A66B; }
+  .grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    gap: 20px; max-width: 1200px; margin: 0 auto;
+  }
+  .card { background: #141414; border: 1px solid #262626; border-radius: 12px; padding: 16px; }
+  .card h2 { font-size: 13px; color: #C9A66B; font-weight: 600; margin-bottom: 4px; }
+  .card .desc { font-size: 11px; color: #737373; line-height: 1.6; margin-bottom: 10px; }
+  .stage { background: #0A0A0A; border: 1px solid #1f1f1f; border-radius: 8px; }
+  .node-box { fill: #1a1a1a; stroke: #333; rx: 8; }
+  .node-title { fill: #d4d4d4; font-size: 11px; font-family: inherit; }
+  .node-sub { fill: #666; font-size: 9px; font-family: inherit; }
+  .port { fill: #C9A66B; stroke: #0A0A0A; stroke-width: 2; }
+
+  /* A：蚂蚁线（虚线流动） */
+  .edge-a { stroke: #6b7280; stroke-width: 1.8; fill: none; stroke-dasharray: 7 6; animation: ants 1s linear infinite; }
+  body.running .edge-a { stroke: #C9A66B; stroke-width: 2.2; animation-duration: 0.4s; }
+  @keyframes ants { to { stroke-dashoffset: -13; } }
+
+  /* B：脉冲光点（沿路径奔跑的光珠） */
+  .edge-b-base { stroke: #3a3a3a; stroke-width: 1.8; fill: none; }
+  body.running .edge-b-base { stroke: rgba(201,166,107,.35); }
+  .pulse-dot { fill: #C9A66B; filter: drop-shadow(0 0 4px #C9A66B) drop-shadow(0 0 8px rgba(201,166,107,.6)); }
+  body:not(.running) .pulse-dot { opacity: .35; filter: none; }
+
+  /* C：电弧闪电 */
+  .edge-c { stroke: #C9A66B; stroke-width: 2; fill: none; filter: drop-shadow(0 0 3px #C9A66B); }
+  body:not(.running) .edge-c { stroke: #6b7280; stroke-width: 1.2; filter: none; opacity: .6; animation: c-flicker 3s steps(1) infinite; }
+  body.running .edge-c { filter: drop-shadow(0 0 4px #C9A66B) drop-shadow(0 0 10px rgba(201,166,107,.5)); }
+  @keyframes c-flicker { 0%,92% { opacity: .6; } 93%,96% { opacity: .15; } 97%,100% { opacity: .6; } }
+
+  /* D：能量光束（宽辉光 + 流动亮段） */
+  .edge-d-glow { stroke: rgba(201,166,107,.18); stroke-width: 7; fill: none; stroke-linecap: round; }
+  body:not(.running) .edge-d-glow { stroke: rgba(120,120,120,.12); }
+  .edge-d-beam { stroke: #C9A66B; stroke-width: 2.5; fill: none; stroke-linecap: round;
+    stroke-dasharray: 26 234; animation: beam 2.2s linear infinite; }
+  body:not(.running) .edge-d-beam { stroke: #8a8a8a; animation-duration: 5s; opacity: .5; }
+  @keyframes beam { from { stroke-dashoffset: 260; } to { stroke-dashoffset: 0; } }
+
+  .footer { text-align: center; margin-top: 32px; font-size: 11px; color: #525252; }
+</style>
+</head>
+<body class="running">
+  <div style="max-width:1200px;margin:0 auto;">
+    <h1>连线电流动效 · 候选方案</h1>
+    <p class="sub">4 种风格实时演示。上方可切换「运行中 / 常态」两种状态对比亮度与速度</p>
+    <div class="toggle">
+      状态：
+      <button id="btnRun" class="on" onclick="setState(true)">⚡ 运行中（高亮快速）</button>
+      <button id="btnIdle" onclick="setState(false)">常态（低调缓慢）</button>
+    </div>
+    <div class="grid" id="grid"></div>
+    <p class="footer">回复方案字母即可（如「用 B」），也支持组合，如「常态 A + 运行中 D」</p>
+  </div>
+
+<script>
+  // 统一的贝塞尔路径：从左节点右侧到右节点左侧
+  const D = "M 70 55 C 160 55, 160 55, 250 55";
+
+  function node(x, title, sub) {
+    return `
+      <rect class="node-box" x="${x - 55}" y="25" width="110" height="60" rx="8"/>
+      <text class="node-title" x="${x}" y="50" text-anchor="middle">${title}</text>
+      <text class="node-sub" x="${x}" y="68" text-anchor="middle">${sub}</text>`;
+  }
+  const LEFT = node(15, "草图→效果图", "nanobanana");
+  const RIGHT = node(305, "AI 改款", "gpt-image-2");
+  const PORTS = `<circle class="port" cx="70" cy="55" r="4.5"/><circle class="port" cx="250" cy="55" r="4.5"/>`;
+
+  const cards = [
+    {
+      key: "A", title: "A · 蚂蚁线流动", desc: "经典虚线流动，最轻量、性能零负担，工具类产品标配",
+      svg: `<path class="edge-a" d="${D}"/>`
+    },
+    {
+      key: "B", title: "B · 脉冲光点", desc: "金色光珠沿路径奔跑，方向感最强，一眼看出数据流向",
+      svg: `<path class="edge-b-base" d="${D}"/>
+        <circle class="pulse-dot" r="4"><animateMotion dur="1.6s" repeatCount="indefinite" path="${D}"/></circle>
+        <circle class="pulse-dot" r="3" opacity="0.7"><animateMotion dur="1.6s" begin="0.53s" repeatCount="indefinite" path="${D}"/></circle>
+        <circle class="pulse-dot" r="2.4" opacity="0.5"><animateMotion dur="1.6s" begin="1.06s" repeatCount="indefinite" path="${D}"/></circle>`
+    },
+    {
+      key: "C", title: "C · 电弧闪电", desc: "锯齿电弧实时抖动 + 随机闪烁，「电流」感最逼真，但略燥",
+      svg: `<path class="edge-c" id="arcPath" d="${D}"/>`
+    },
+    {
+      key: "D", title: "D · 能量光束", desc: "底层辉光 + 一段亮束循环流动，高级感强，和显影动画气质统一",
+      svg: `<path class="edge-d-glow" d="${D}"/><path class="edge-d-beam" d="${D}"/>`
+    },
+  ];
+
+  const grid = document.getElementById("grid");
+  for (const c of cards) {
+    const div = document.createElement("div");
+    div.className = "card";
+    div.innerHTML = `<h2>${c.title}</h2><div class="desc">${c.desc}</div>
+      <svg class="stage" viewBox="0 0 320 110" width="100%">${c.svg}${LEFT}${RIGHT}${PORTS}</svg>`;
+    grid.appendChild(div);
+  }
+
+  // C 方案：电弧抖动
+  const arc = document.getElementById("arcPath");
+  function jitter() {
+    const pts = [];
+    const segs = 14;
+    for (let i = 0; i <= segs; i++) {
+      const x = 70 + (180 * i) / segs;
+      const baseY = 55 + Math.sin((Math.PI * i) / segs) * -4; // 轻微拱起
+      const y = i === 0 || i === segs ? 55 : baseY + (Math.random() - 0.5) * 14;
+      pts.push(`${i === 0 ? "M" : "L"} ${x.toFixed(1)} ${y.toFixed(1)}`);
+    }
+    arc.setAttribute("d", pts.join(" "));
+  }
+  setInterval(jitter, 90);
+
+  function setState(running) {
+    document.body.classList.toggle("running", running);
+    document.getElementById("btnRun").classList.toggle("on", running);
+    document.getElementById("btnIdle").classList.toggle("on", !running);
+  }
+</script>
+</body>
+</html>
