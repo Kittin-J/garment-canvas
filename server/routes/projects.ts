@@ -1,7 +1,8 @@
 import { Router } from "express";
 import { nanoid } from "nanoid";
-import { db } from "../lib/database";
 import { requestUser } from "../lib/auth";
+import { asyncHandler } from "../lib/asyncHandler";
+import { query, queryOne, transaction } from "../lib/database";
 import { validateAndMigrateFlow, WorkflowValidationError } from "../lib/workflowSchema";
 import type { PersistedWorkflow } from "../../src/types/workflow";
 
@@ -23,32 +24,34 @@ function imageRefs(value: unknown, output = new Set<string>()): Set<string> {
   return output;
 }
 
-function syncAssetRefs(projectId: string, flow: PersistedWorkflow): void {
+async function syncAssetRefs(projectId: string, flow: PersistedWorkflow): Promise<void> {
   const refs = imageRefs(flow);
-  const database = db();
-  const assets = database.prepare("SELECT id, image FROM assets WHERE deleted_at IS NULL").all() as Array<{ id: string; image: string }>;
+  const assets = await query<{ id: string; image: string }>("SELECT id, image FROM assets WHERE deleted_at IS NULL");
   const wanted = assets.filter((asset) => refs.has(asset.image)).map((asset) => asset.id);
   const now = new Date().toISOString();
-  database.transaction(() => {
-    database.prepare("DELETE FROM project_asset_refs WHERE project_id = ?").run(projectId);
-    const insert = database.prepare("INSERT INTO project_asset_refs (project_id, asset_id, created_at) VALUES (?, ?, ?)");
-    wanted.forEach((assetId) => insert.run(projectId, assetId, now));
-  })();
+  await transaction(async (client) => {
+    await client.query("DELETE FROM project_asset_refs WHERE project_id = $1", [projectId]);
+    for (const assetId of wanted) {
+      await client.query(
+        "INSERT INTO project_asset_refs (project_id, asset_id, created_at) VALUES ($1, $2, $3)",
+        [projectId, assetId, now],
+      );
+    }
+  });
 }
 
-function purgeExpiredProjects(): void {
-  const database = db();
-  const ids = database.prepare("SELECT id FROM projects WHERE purge_after IS NOT NULL AND purge_after <= ?")
-    .all(new Date().toISOString()) as Array<{ id: string }>;
-  database.transaction(() => {
-    ids.forEach(({ id }) => {
-      database.prepare("DELETE FROM project_asset_refs WHERE project_id = ?").run(id);
-      database.prepare("DELETE FROM projects WHERE id = ?").run(id);
-    });
-  })();
+async function purgeExpiredProjects(): Promise<void> {
+  const now = new Date().toISOString();
+  await transaction(async (client) => {
+    await client.query(`
+      DELETE FROM project_asset_refs
+      WHERE project_id IN (SELECT id FROM projects WHERE purge_after IS NOT NULL AND purge_after <= $1)
+    `, [now]);
+    await client.query("DELETE FROM projects WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
+  });
 }
 
-projectsRouter.post("/", (req, res) => {
+projectsRouter.post("/", asyncHandler(async (req, res) => {
   const user = requestUser(req);
   const { id, name, flow } = req.body as { id?: string; name?: string; flow?: unknown };
   if (typeof name !== "string" || !name.trim() || name.length > 200 || flow === undefined) {
@@ -62,35 +65,37 @@ projectsRouter.post("/", (req, res) => {
   try {
     const normalized = validateAndMigrateFlow(flow);
     const projectId = id || nanoid(10);
-    const existing = db().prepare("SELECT owner_id FROM projects WHERE id = ? AND deleted_at IS NULL")
-      .get(projectId) as { owner_id: string } | undefined;
+    const existing = await queryOne<{ owner_id: string }>(
+      "SELECT owner_id FROM projects WHERE id = $1 AND deleted_at IS NULL",
+      [projectId],
+    );
     if (existing && existing.owner_id !== user.id) {
       res.status(403).json({ error: "管理员只能查看其他用户项目，不能修改" });
       return;
     }
     const now = new Date().toISOString();
-    db().prepare(`
+    await query(`
       INSERT INTO projects (id, owner_id, name, flow_json, updated_at, created_at)
-      VALUES (?, ?, ?, ?, ?, ?)
+      VALUES ($1, $2, $3, $4, $5, $5)
       ON CONFLICT(id) DO UPDATE SET name = excluded.name, flow_json = excluded.flow_json, updated_at = excluded.updated_at
-    `).run(projectId, user.id, name.trim(), JSON.stringify(normalized), now, now);
-    syncAssetRefs(projectId, normalized);
+    `, [projectId, user.id, name.trim(), JSON.stringify(normalized), now]);
+    await syncAssetRefs(projectId, normalized);
     res.json({ ok: true, id: projectId });
   } catch (error) {
     res.status(error instanceof WorkflowValidationError ? 400 : 500)
       .json({ error: error instanceof Error ? error.message : String(error) });
   }
-});
+}));
 
-projectsRouter.get("/", (req, res) => {
-  purgeExpiredProjects();
+projectsRouter.get("/", asyncHandler(async (req, res) => {
+  await purgeExpiredProjects();
   const user = requestUser(req);
-  const rows = db().prepare(`
+  const rows = await query<Omit<ProjectRow, "flow_json">>(`
     SELECT p.id, p.owner_id, u.display_name AS owner_name, p.name, p.updated_at
     FROM projects p JOIN users u ON u.id = p.owner_id
-    WHERE p.deleted_at IS NULL AND (? = 'admin' OR p.owner_id = ?)
+    WHERE p.deleted_at IS NULL AND ($1 = 'admin' OR p.owner_id = $2)
     ORDER BY p.updated_at DESC
-  `).all(user.role, user.id) as Array<Omit<ProjectRow, "flow_json">>;
+  `, [user.role, user.id]);
   res.json(rows.map((row) => ({
     id: row.id,
     name: row.name,
@@ -99,15 +104,15 @@ projectsRouter.get("/", (req, res) => {
     readOnly: row.owner_id !== user.id,
     updatedAt: row.updated_at,
   })));
-});
+}));
 
-projectsRouter.get("/:id", (req, res) => {
+projectsRouter.get("/:id", asyncHandler(async (req, res) => {
   const user = requestUser(req);
-  const row = db().prepare(`
+  const row = await queryOne<ProjectRow>(`
     SELECT p.id, p.owner_id, u.display_name AS owner_name, p.name, p.flow_json, p.updated_at
     FROM projects p JOIN users u ON u.id = p.owner_id
-    WHERE p.id = ? AND p.deleted_at IS NULL
-  `).get(req.params.id) as ProjectRow | undefined;
+    WHERE p.id = $1 AND p.deleted_at IS NULL
+  `, [req.params.id]);
   if (!row) {
     res.status(404).json({ error: "project not found" });
     return;
@@ -124,4 +129,4 @@ projectsRouter.get("/:id", (req, res) => {
   } catch {
     res.status(422).json({ error: "项目数据损坏" });
   }
-});
+}));

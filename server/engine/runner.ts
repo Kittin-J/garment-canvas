@@ -102,7 +102,7 @@ export function getRun(id: string): Run | undefined {
   return runs.get(id);
 }
 
-export function createRun(plan: ExecutionPlan, recordContext?: GenerationRecordContext): Run {
+export async function createRun(plan: ExecutionPlan, recordContext?: GenerationRecordContext): Promise<Run> {
   pruneRuns();
   const run: Run = {
     id: nanoid(10),
@@ -115,11 +115,11 @@ export function createRun(plan: ExecutionPlan, recordContext?: GenerationRecordC
   };
   run.emitter.setMaxListeners(50);
   runs.set(run.id, run);
-  if (recordContext) createGenerationRecord(run.id, recordContext, run.createdAt);
+  if (recordContext) await createGenerationRecord(run.id, recordContext, run.createdAt);
   // 异步启动，调用方先拿到 runId 再订阅事件
   setImmediate(() => {
-    executeRun(run).catch((err) => {
-      if (run.recordContext) failGenerationRecord(run.id, err instanceof Error ? err.message : String(err), Date.now());
+    executeRun(run).catch(async (err) => {
+      if (run.recordContext) await failGenerationRecord(run.id, err instanceof Error ? err.message : String(err), Date.now());
       emit(run, { type: "run-error", error: err instanceof Error ? err.message : String(err) });
     });
   });
@@ -170,19 +170,19 @@ async function executeRun(run: Run): Promise<void> {
     }
 
     const startedAt = Date.now();
-    if (run.recordContext?.nodeId === step.nodeId) markGenerationRunning(run.id, startedAt);
+    if (run.recordContext?.nodeId === step.nodeId) await markGenerationRunning(run.id, startedAt);
     emit(run, { type: "node-status", nodeId: step.nodeId, status: "running", startedAt });
     try {
       const result = await executeStep(step, inputImages);
       // 产出统一落盘为 /api/files/:id，避免 base64 大图驻留事件与内存
       const persisted = await persistOutputImages(result.images);
       if (run.recordContext) {
-        registerGeneratedFiles(run.recordContext, run.id, step.nodeId, persisted, Date.now());
+        await registerGeneratedFiles(run.recordContext, run.id, step.nodeId, persisted, Date.now());
       }
       outputs.set(step.nodeId, persisted);
       const finishedAt = Date.now();
       if (run.recordContext?.nodeId === step.nodeId) {
-        completeGenerationRecord({
+        await completeGenerationRecord({
           runId: run.id,
           images: persisted,
           prompts: result.prompts,
@@ -211,7 +211,7 @@ async function executeRun(run: Run): Promise<void> {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const finishedAt = Date.now();
-      if (run.recordContext?.nodeId === step.nodeId) failGenerationRecord(run.id, message, finishedAt);
+      if (run.recordContext?.nodeId === step.nodeId) await failGenerationRecord(run.id, message, finishedAt);
       emit(run, {
         type: "node-status",
         nodeId: step.nodeId,

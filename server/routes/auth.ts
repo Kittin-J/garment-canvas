@@ -10,15 +10,23 @@ import {
   revokeUserSessions,
   setSessionCookie,
 } from "../lib/auth";
-import { db } from "../lib/database";
+import { asyncHandler } from "../lib/asyncHandler";
+import { db, query, queryOne, transaction } from "../lib/database";
 import { hashPassword, validatePassword, verifyPassword } from "../lib/password";
 
 export const authRouter = Router();
 
-function publicUser(row: {
-  id: string; account_id: string; display_name: string; role: "admin" | "user";
-  must_change_password: number; active?: number; created_at?: string;
-}) {
+interface UserRow {
+  id: string;
+  account_id: string;
+  display_name: string;
+  role: "admin" | "user";
+  must_change_password: number;
+  active?: number;
+  created_at?: string;
+}
+
+function publicUser(row: UserRow) {
   return {
     id: row.id,
     accountId: row.account_id,
@@ -30,27 +38,24 @@ function publicUser(row: {
   };
 }
 
-authRouter.post("/login", (req, res) => {
+authRouter.post("/login", asyncHandler(async (req, res) => {
   const { accountId, password } = req.body as { accountId?: string; password?: string };
   if (typeof accountId !== "string" || typeof password !== "string" || !accountId.trim() || !password) {
     res.status(400).json({ error: "账号和密码不能为空" });
     return;
   }
-  const row = db().prepare(`
+  const row = await queryOne<UserRow & { password_hash: string; active: number }>(`
     SELECT id, account_id, display_name, role, password_hash, must_change_password, active
-    FROM users WHERE account_id = ? AND deleted_at IS NULL
-  `).get(accountId.trim()) as {
-    id: string; account_id: string; display_name: string; role: "admin" | "user";
-    password_hash: string; must_change_password: number; active: number;
-  } | undefined;
+    FROM users WHERE account_id = $1 AND deleted_at IS NULL
+  `, [accountId.trim()]);
   if (!row || row.active !== 1 || !verifyPassword(password, row.password_hash)) {
     res.status(401).json({ error: "账号或密码错误" });
     return;
   }
-  const session = createSession(row.id);
+  const session = await createSession(row.id);
   setSessionCookie(res, session.token);
   res.json({ user: publicUser(row), expiresAt: session.expiresAt });
-});
+}));
 
 authRouter.use(requireAuth);
 
@@ -58,13 +63,13 @@ authRouter.get("/me", (req, res) => {
   res.json({ user: requestUser(req) });
 });
 
-authRouter.post("/logout", (req, res) => {
-  revokeRequestSession(req);
+authRouter.post("/logout", asyncHandler(async (req, res) => {
+  await revokeRequestSession(req);
   clearSessionCookie(res);
   res.json({ ok: true });
-});
+}));
 
-authRouter.post("/change-password", (req, res) => {
+authRouter.post("/change-password", asyncHandler(async (req, res) => {
   const user = requestUser(req);
   const { currentPassword, newPassword } = req.body as { currentPassword?: string; newPassword?: string };
   if (typeof currentPassword !== "string" || typeof newPassword !== "string") {
@@ -76,32 +81,29 @@ authRouter.post("/change-password", (req, res) => {
     res.status(400).json({ error: invalid });
     return;
   }
-  const row = db().prepare("SELECT password_hash FROM users WHERE id = ?").get(user.id) as { password_hash: string };
-  if (!verifyPassword(currentPassword, row.password_hash)) {
+  const row = await queryOne<{ password_hash: string }>("SELECT password_hash FROM users WHERE id = $1", [user.id]);
+  if (!row || !verifyPassword(currentPassword, row.password_hash)) {
     res.status(400).json({ error: "当前密码错误" });
     return;
   }
   const now = new Date().toISOString();
-  db().prepare("UPDATE users SET password_hash = ?, must_change_password = 0, updated_at = ? WHERE id = ?")
-    .run(hashPassword(newPassword), now, user.id);
-  // 密码变化使其他会话失效，并为当前设备签发新的唯一会话。
-  const session = createSession(user.id);
+  await query("UPDATE users SET password_hash = $1, must_change_password = 0, updated_at = $2 WHERE id = $3", [
+    hashPassword(newPassword), now, user.id,
+  ]);
+  const session = await createSession(user.id);
   setSessionCookie(res, session.token);
   res.json({ ok: true, user: { ...user, mustChangePassword: false }, expiresAt: session.expiresAt });
-});
+}));
 
-authRouter.get("/users", requireAdmin, (_req, res) => {
-  const rows = db().prepare(`
+authRouter.get("/users", requireAdmin, asyncHandler(async (_req, res) => {
+  const rows = await query<UserRow>(`
     SELECT id, account_id, display_name, role, must_change_password, active, created_at
     FROM users WHERE deleted_at IS NULL ORDER BY created_at ASC
-  `).all() as Array<{
-    id: string; account_id: string; display_name: string; role: "admin" | "user";
-    must_change_password: number; active: number; created_at: string;
-  }>;
+  `);
   res.json(rows.map(publicUser));
-});
+}));
 
-authRouter.post("/users", requireAdmin, (req, res) => {
+authRouter.post("/users", requireAdmin, asyncHandler(async (req, res) => {
   const { accountId, displayName, password, role } = req.body as {
     accountId?: string; displayName?: string; password?: string; role?: "admin" | "user";
   };
@@ -119,42 +121,41 @@ authRouter.post("/users", requireAdmin, (req, res) => {
   const now = new Date().toISOString();
   const id = nanoid(12);
   try {
-    db().prepare(`
+    await query(`
       INSERT INTO users (id, account_id, display_name, role, password_hash, must_change_password, active, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?)
-    `).run(id, accountId, displayName.trim(), role === "admin" ? "admin" : "user", hashPassword(password), now, now);
+      VALUES ($1, $2, $3, $4, $5, 1, 1, $6, $6)
+    `, [id, accountId, displayName.trim(), role === "admin" ? "admin" : "user", hashPassword(password), now]);
     res.status(201).json({ id });
   } catch (error) {
-    res.status(409).json({ error: error instanceof Error && /UNIQUE/.test(error.message) ? "账号已存在" : String(error) });
+    const duplicate = typeof error === "object" && error !== null && "code" in error && error.code === "23505";
+    res.status(duplicate ? 409 : 500).json({ error: duplicate ? "账号已存在" : String(error) });
   }
-});
+}));
 
-authRouter.patch("/users/:id", requireAdmin, (req, res) => {
+authRouter.patch("/users/:id", requireAdmin, asyncHandler(async (req, res) => {
   const actor = requestUser(req);
   const { active, displayName } = req.body as { active?: boolean; displayName?: string };
   if (req.params.id === actor.id && active === false) {
     res.status(400).json({ error: "不能停用当前管理员账号" });
     return;
   }
-  const row = db().prepare("SELECT id FROM users WHERE id = ? AND deleted_at IS NULL").get(req.params.id);
+  const row = await queryOne<{ id: string }>("SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL", [req.params.id]);
   if (!row) {
     res.status(404).json({ error: "用户不存在" });
     return;
   }
   const now = new Date().toISOString();
   if (typeof displayName === "string" && displayName.trim() && displayName.length <= 100) {
-    db().prepare("UPDATE users SET display_name = ?, updated_at = ? WHERE id = ?")
-      .run(displayName.trim(), now, req.params.id);
+    await query("UPDATE users SET display_name = $1, updated_at = $2 WHERE id = $3", [displayName.trim(), now, req.params.id]);
   }
   if (typeof active === "boolean") {
-    db().prepare("UPDATE users SET active = ?, updated_at = ? WHERE id = ?")
-      .run(active ? 1 : 0, now, req.params.id);
-    if (!active) revokeUserSessions(req.params.id);
+    await query("UPDATE users SET active = $1, updated_at = $2 WHERE id = $3", [active ? 1 : 0, now, req.params.id]);
+    if (!active) await revokeUserSessions(req.params.id);
   }
   res.json({ ok: true });
-});
+}));
 
-authRouter.post("/users/:id/reset-password", requireAdmin, (req, res) => {
+authRouter.post("/users/:id/reset-password", requireAdmin, asyncHandler(async (req, res) => {
   const { password } = req.body as { password?: string };
   if (typeof password !== "string") {
     res.status(400).json({ error: "新密码不能为空" });
@@ -165,19 +166,19 @@ authRouter.post("/users/:id/reset-password", requireAdmin, (req, res) => {
     res.status(400).json({ error: invalid });
     return;
   }
-  const result = db().prepare(`
-    UPDATE users SET password_hash = ?, must_change_password = 1, updated_at = ?
-    WHERE id = ? AND deleted_at IS NULL
-  `).run(hashPassword(password), new Date().toISOString(), req.params.id);
-  if (result.changes === 0) {
+  const result = await db().query(`
+    UPDATE users SET password_hash = $1, must_change_password = 1, updated_at = $2
+    WHERE id = $3 AND deleted_at IS NULL
+  `, [hashPassword(password), new Date().toISOString(), req.params.id]);
+  if (result.rowCount === 0) {
     res.status(404).json({ error: "用户不存在" });
     return;
   }
-  revokeUserSessions(req.params.id);
+  await revokeUserSessions(req.params.id);
   res.json({ ok: true });
-});
+}));
 
-authRouter.delete("/users/:id", requireAdmin, (req, res) => {
+authRouter.delete("/users/:id", requireAdmin, asyncHandler(async (req, res) => {
   const actor = requestUser(req);
   if (req.params.id === actor.id) {
     res.status(400).json({ error: "不能删除当前管理员账号" });
@@ -188,35 +189,38 @@ authRouter.delete("/users/:id", requireAdmin, (req, res) => {
     res.status(400).json({ error: "必须选择数据接收用户，或明确将数据放入 15 天回收站" });
     return;
   }
-  const database = db();
-  const source = database.prepare("SELECT id FROM users WHERE id = ? AND deleted_at IS NULL").get(req.params.id);
+  const source = await queryOne<{ id: string }>("SELECT id FROM users WHERE id = $1 AND deleted_at IS NULL", [req.params.id]);
   if (!source) {
     res.status(404).json({ error: "用户不存在" });
     return;
   }
   if (transferToUserId) {
-    const target = database.prepare("SELECT id FROM users WHERE id = ? AND active = 1 AND deleted_at IS NULL").get(transferToUserId);
+    const target = await queryOne<{ id: string }>(
+      "SELECT id FROM users WHERE id = $1 AND active = 1 AND deleted_at IS NULL",
+      [transferToUserId],
+    );
     if (!target) {
       res.status(400).json({ error: "数据接收用户不存在或已停用" });
       return;
     }
   }
   const now = new Date();
+  const nowIso = now.toISOString();
   const purgeAfter = new Date(now.getTime() + 15 * 24 * 60 * 60 * 1000).toISOString();
-  database.transaction(() => {
+  await transaction(async (client) => {
     if (transferToUserId) {
-      for (const table of ["projects", "assets", "files", "generation_runs", "usage_events"]) {
-        database.prepare(`UPDATE ${table} SET owner_id = ? WHERE owner_id = ?`).run(transferToUserId, req.params.id);
+      for (const table of ["projects", "assets", "files", "generation_runs", "usage_events"] as const) {
+        await client.query(`UPDATE ${table} SET owner_id = $1 WHERE owner_id = $2`, [transferToUserId, req.params.id]);
       }
     } else {
-      database.prepare("UPDATE projects SET deleted_at = ?, purge_after = ? WHERE owner_id = ?")
-        .run(now.toISOString(), purgeAfter, req.params.id);
-      database.prepare("UPDATE assets SET deleted_at = ?, purge_after = ? WHERE owner_id = ? AND deleted_at IS NULL")
-        .run(now.toISOString(), purgeAfter, req.params.id);
+      await client.query("UPDATE projects SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3", [nowIso, purgeAfter, req.params.id]);
+      await client.query(
+        "UPDATE assets SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3 AND deleted_at IS NULL",
+        [nowIso, purgeAfter, req.params.id],
+      );
     }
-    database.prepare("DELETE FROM sessions WHERE user_id = ?").run(req.params.id);
-    database.prepare("UPDATE users SET active = 0, deleted_at = ?, updated_at = ? WHERE id = ?")
-      .run(now.toISOString(), now.toISOString(), req.params.id);
-  })();
+    await client.query("DELETE FROM sessions WHERE user_id = $1", [req.params.id]);
+    await client.query("UPDATE users SET active = 0, deleted_at = $1, updated_at = $1 WHERE id = $2", [nowIso, req.params.id]);
+  });
   res.json({ ok: true, purgeAfter: transferToUserId ? null : purgeAfter });
-});
+}));

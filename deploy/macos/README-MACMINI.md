@@ -4,8 +4,9 @@
 
 - macOS 13 或更高版本。
 - Node.js 20 或更高版本。
-- `universal-online` 包支持 Apple Silicon 与 Intel，首次安装需要访问 npm registry。
-- `darwin-arm64-offline` 包已附带生产依赖，仅用于 Apple Silicon Mac，无需联网安装依赖。
+- Docker Desktop（必须已启动），数据库由本机 Docker 内置 PostgreSQL 提供。
+- `universal-online` 包支持 Apple Silicon 与 Intel，首次安装需要访问 npm registry 和 Docker Hub。
+- `darwin-*-offline` 包已附带生产依赖和 PostgreSQL 镜像，仅用于打包时对应的 Mac 架构。
 
 ## 安装
 
@@ -21,6 +22,7 @@
    - 版本程序：`~/Applications/GarmentCanvas/releases/<版本>`
    - 当前版本：`~/Applications/GarmentCanvas/current`
    - 数据：`~/Library/Application Support/GarmentCanvas/data`
+   - PostgreSQL：Docker 容器 `garment-canvas-postgres`、命名卷 `garment-canvas-postgres-data`
    - 私密配置：`~/Library/Application Support/GarmentCanvas/config/service.env`
    - 日志：`~/Library/Logs/GarmentCanvas`
    - 开机自启：`~/Library/LaunchAgents/com.garmentcanvas.server.plist`
@@ -33,7 +35,8 @@
    open -e "$HOME/Library/Application Support/GarmentCanvas/config/service.env"
    ```
 
-   首次部署必须填写 `INITIAL_ADMIN_ACCOUNT_ID` 和 `INITIAL_ADMIN_PASSWORD`。
+   安装器会自动生成 PostgreSQL 强密码。首次部署必须填写
+   `INITIAL_ADMIN_ACCOUNT_ID` 和 `INITIAL_ADMIN_PASSWORD`。
    初始密码只在数据库没有用户时使用，首次登录后会强制修改；请勿把实际密码写回安装包或提交到 Git。
 
 5. 双击 `start.command`。启动成功后访问：
@@ -58,7 +61,10 @@ http://192.168.1.20:3001/
 ./restore-data.command ./garment-canvas-data.tar.gz
 ```
 
-恢复前先停止服务。脚本不会直接覆盖现有数据；若目标目录已有内容，会先改名备份。
+恢复前先停止服务。脚本不会直接覆盖现有文件；若目标目录已有内容，会先改名备份。
+
+从旧 SQLite 版本升级时，请在首次启动新版本前恢复数据包。PostgreSQL 为空时，
+新版本会自动只读导入 `data/garment-canvas.db`，并保留原文件。
 
 ## 日常命令
 
@@ -68,7 +74,7 @@ http://192.168.1.20:3001/
 ./status.command
 ```
 
-卸载程序但保留业务数据：
+卸载程序但保留文件和 PostgreSQL 命名卷：
 
 ```bash
 ./uninstall.command
@@ -85,6 +91,7 @@ http://192.168.1.20:3001/
 ```bash
 tail -f ~/Library/Logs/GarmentCanvas/server.log
 tail -f ~/Library/Logs/GarmentCanvas/server-error.log
+docker logs garment-canvas-postgres
 curl http://127.0.0.1:3001/api/ready
 ```
 

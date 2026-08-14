@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requestUser } from "../lib/auth";
-import { db } from "../lib/database";
+import { asyncHandler } from "../lib/asyncHandler";
+import { query, queryOne } from "../lib/database";
 
 export const historyRouter = Router();
 
@@ -13,7 +14,7 @@ function parseJson<T>(value: unknown, fallback: T): T {
   }
 }
 
-historyRouter.get("/", (req, res) => {
+historyRouter.get("/", asyncHandler(async (req, res) => {
   const user = requestUser(req);
   const requestedUserId = typeof req.query.userId === "string" ? req.query.userId : undefined;
   if (requestedUserId && user.role !== "admin" && requestedUserId !== user.id) {
@@ -23,17 +24,17 @@ historyRouter.get("/", (req, res) => {
   const ownerId = requestedUserId ?? (user.role === "admin" && req.query.all === "true" ? null : user.id);
   const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 100));
   const offset = Math.max(0, Number(req.query.offset) || 0);
-  const rows = db().prepare(`
+  const rows = await query<Record<string, unknown>>(`
     SELECT r.*, o.id AS output_id, o.image, o.prompt AS output_prompt,
       o.status AS output_status, o.error AS output_error, u.display_name AS owner_name
     FROM generation_runs r
     JOIN users u ON u.id = r.owner_id
     LEFT JOIN generation_outputs o ON o.run_id = r.id
-    WHERE (? IS NULL OR r.owner_id = ?)
+    WHERE ($1::text IS NULL OR r.owner_id = $1)
       AND (o.id IS NOT NULL OR r.status IN ('queued','running'))
     ORDER BY r.started_at DESC, o.created_at ASC
-    LIMIT ? OFFSET ?
-  `).all(ownerId, ownerId, limit, offset) as Array<Record<string, unknown>>;
+    LIMIT $2 OFFSET $3
+  `, [ownerId, limit, offset]);
   res.json(rows.map((row) => ({
     id: (row.output_id as string | null) ?? (row.id as string),
     runId: row.id,
@@ -57,19 +58,18 @@ historyRouter.get("/", (req, res) => {
     status: (row.output_status as string | null) ?? row.status,
     error: (row.output_error as string | null) ?? row.error,
   })));
-});
+}));
 
-historyRouter.delete("/:id", (req, res) => {
+historyRouter.delete("/:id", asyncHandler(async (req, res) => {
   const user = requestUser(req);
-  const row = db().prepare(`
+  const row = await queryOne<{ owner_id: string; run_id: string }>(`
     SELECT r.owner_id, r.id AS run_id FROM generation_outputs o
-    JOIN generation_runs r ON r.id = o.run_id WHERE o.id = ?
-  `).get(req.params.id) as { owner_id: string; run_id: string } | undefined;
+    JOIN generation_runs r ON r.id = o.run_id WHERE o.id = $1
+  `, [req.params.id]);
   if (!row || row.owner_id !== user.id) {
     res.status(row ? 403 : 404).json({ error: row ? "只能删除自己的生成历史" : "记录不存在" });
     return;
   }
-  // 消耗流水通过 run_id 独立保留；只删除这张历史卡片。
-  db().prepare("DELETE FROM generation_outputs WHERE id = ?").run(req.params.id);
+  await query("DELETE FROM generation_outputs WHERE id = $1", [req.params.id]);
   res.json({ ok: true });
-});
+}));

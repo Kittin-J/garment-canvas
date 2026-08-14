@@ -1,0 +1,13 @@
+.git
+.env*
+.codebase-memory
+.cbmignore
+node_modules
+data/uploads
+data/templates/user
+data/*.db
+data/*.sqlite*
+data/*.db-wal
+data/*.db-shm
+npm-debug.log*
+releases

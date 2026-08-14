@@ -1,6 +1,6 @@
 import { nanoid } from "nanoid";
 import path from "node:path";
-import { db } from "./database";
+import { query, queryOne, transaction } from "./database";
 
 export interface GenerationRecordContext {
   userId: string;
@@ -15,47 +15,45 @@ export interface GenerationRecordContext {
   requestedCount: number;
 }
 
-export function createGenerationRecord(runId: string, context: GenerationRecordContext, startedAt: number): void {
-  db().prepare(`
+export async function createGenerationRecord(runId: string, context: GenerationRecordContext, startedAt: number): Promise<void> {
+  await query(`
     INSERT INTO generation_runs (
       id, owner_id, project_id, project_name, node_id, node_label, kind, prompt,
       parameters_json, reference_images_json, requested_count, status, started_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
-  `).run(
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued', $12)
+  `, [
     runId, context.userId, context.projectId ?? null, context.projectName ?? null,
     context.nodeId, context.nodeLabel, context.kind, context.prompt ?? null,
     JSON.stringify(context.parameters ?? {}), JSON.stringify(context.referenceImages ?? []),
     context.requestedCount, startedAt,
-  );
+  ]);
 }
 
-export function markGenerationRunning(runId: string, startedAt: number): void {
-  db().prepare("UPDATE generation_runs SET status = 'running', started_at = ? WHERE id = ?")
-    .run(startedAt, runId);
+export async function markGenerationRunning(runId: string, startedAt: number): Promise<void> {
+  await query("UPDATE generation_runs SET status = 'running', started_at = $1 WHERE id = $2", [startedAt, runId]);
 }
 
-export function registerGeneratedFiles(
+export async function registerGeneratedFiles(
   context: GenerationRecordContext,
   runId: string,
   nodeId: string,
   images: string[],
   createdAt: number,
-): void {
-  const insert = db().prepare(`
-    INSERT OR IGNORE INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)
-    VALUES (?, ?, 'generated', ?, ?, ?, ?)
-  `);
+): Promise<void> {
   const createdAtIso = new Date(createdAt).toISOString();
-  db().transaction(() => {
+  await transaction(async (client) => {
     for (const image of images) {
-      if (image.startsWith("/api/files/")) {
-        insert.run(path.basename(image), context.userId, context.projectId ?? null, nodeId, runId, createdAtIso);
-      }
+      if (!image.startsWith("/api/files/")) continue;
+      await client.query(`
+        INSERT INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)
+        VALUES ($1, $2, 'generated', $3, $4, $5, $6)
+        ON CONFLICT (id) DO NOTHING
+      `, [path.basename(image), context.userId, context.projectId ?? null, nodeId, runId, createdAtIso]);
     }
-  })();
+  });
 }
 
-export function completeGenerationRecord(args: {
+export async function completeGenerationRecord(args: {
   runId: string;
   images: string[];
   prompts?: string[];
@@ -64,59 +62,69 @@ export function completeGenerationRecord(args: {
   providerRequests: number;
   startedAt: number;
   finishedAt: number;
-}): void {
-  const database = db();
-  const run = database.prepare("SELECT owner_id, project_id, node_id FROM generation_runs WHERE id = ?")
-    .get(args.runId) as { owner_id: string; project_id: string | null; node_id: string } | undefined;
-  if (!run) return;
-  database.transaction(() => {
-    database.prepare("DELETE FROM generation_outputs WHERE run_id = ?").run(args.runId);
-    const insertOutput = database.prepare(`
-      INSERT INTO generation_outputs (id, run_id, image, prompt, status, error, created_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?)
-    `);
-    args.images.forEach((image, index) => {
-      insertOutput.run(nanoid(12), args.runId, image, args.prompts?.[index] ?? null, "success", null, args.finishedAt + index);
+}): Promise<void> {
+  await transaction(async (client) => {
+    const run = await queryOne<{ owner_id: string; project_id: string | null; node_id: string }>(
+      "SELECT owner_id, project_id, node_id FROM generation_runs WHERE id = $1 FOR UPDATE",
+      [args.runId],
+      client,
+    );
+    if (!run) return;
+    await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [args.runId]);
+    for (const [index, image] of args.images.entries()) {
+      await client.query(`
+        INSERT INTO generation_outputs (id, run_id, image, prompt, status, error, created_at)
+        VALUES ($1, $2, $3, $4, 'success', NULL, $5)
+      `, [nanoid(12), args.runId, image, args.prompts?.[index] ?? null, args.finishedAt + index]);
       if (image.startsWith("/api/files/")) {
-        database.prepare(`
-          INSERT OR IGNORE INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)
-          VALUES (?, ?, 'generated', ?, ?, ?, ?)
-        `).run(path.basename(image), run.owner_id, run.project_id, run.node_id, args.runId, new Date(args.finishedAt).toISOString());
+        await client.query(`
+          INSERT INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)
+          VALUES ($1, $2, 'generated', $3, $4, $5, $6)
+          ON CONFLICT (id) DO NOTHING
+        `, [path.basename(image), run.owner_id, run.project_id, run.node_id, args.runId, new Date(args.finishedAt).toISOString()]);
       }
-    });
-    (args.failures ?? []).forEach((failure, index) => {
-      insertOutput.run(nanoid(12), args.runId, "", failure.prompt ?? null, "error", failure.error, args.finishedAt + args.images.length + index);
-    });
+    }
+    for (const [index, failure] of (args.failures ?? []).entries()) {
+      await client.query(`
+        INSERT INTO generation_outputs (id, run_id, image, prompt, status, error, created_at)
+        VALUES ($1, $2, '', $3, 'error', $4, $5)
+      `, [nanoid(12), args.runId, failure.prompt ?? null, failure.error, args.finishedAt + args.images.length + index]);
+    }
     const warning = args.failures?.length ? `${args.failures.length} 个生成任务失败` : null;
-    database.prepare(`
-      UPDATE generation_runs SET status = 'success', successful_count = ?, provider_requests = ?,
-        model = ?, error = ?, finished_at = ? WHERE id = ?
-    `).run(args.images.length, args.providerRequests, args.model ?? null, warning, args.finishedAt, args.runId);
+    await client.query(`
+      UPDATE generation_runs SET status = 'success', successful_count = $1, provider_requests = $2,
+        model = $3, error = $4, finished_at = $5 WHERE id = $6
+    `, [args.images.length, args.providerRequests, args.model ?? null, warning, args.finishedAt, args.runId]);
     if (args.images.length > 0) {
-      database.prepare(`
-        INSERT OR REPLACE INTO usage_events (
+      await client.query(`
+        INSERT INTO usage_events (
           id, owner_id, run_id, project_id, node_id, model, successful_count,
           provider_requests, duration_ms, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (run_id) DO UPDATE SET
+          model = excluded.model,
+          successful_count = excluded.successful_count,
+          provider_requests = excluded.provider_requests,
+          duration_ms = excluded.duration_ms,
+          created_at = excluded.created_at
+      `, [
         nanoid(12), run.owner_id, args.runId, run.project_id, run.node_id, args.model ?? null,
         args.images.length, args.providerRequests, Math.max(0, args.finishedAt - args.startedAt),
         new Date(args.finishedAt).toISOString(),
-      );
+      ]);
     }
-  })();
+  });
 }
 
-export function failGenerationRecord(runId: string, error: string, finishedAt: number): void {
-  const database = db();
-  database.transaction(() => {
-    database.prepare(`
-      UPDATE generation_runs SET status = 'error', error = ?, finished_at = ? WHERE id = ?
-    `).run(error, finishedAt, runId);
-    database.prepare("DELETE FROM generation_outputs WHERE run_id = ?").run(runId);
-    database.prepare(`
+export async function failGenerationRecord(runId: string, error: string, finishedAt: number): Promise<void> {
+  await transaction(async (client) => {
+    await client.query("UPDATE generation_runs SET status = 'error', error = $1, finished_at = $2 WHERE id = $3", [
+      error, finishedAt, runId,
+    ]);
+    await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [runId]);
+    await client.query(`
       INSERT INTO generation_outputs (id, run_id, image, status, error, created_at)
-      SELECT ?, id, '', 'error', ?, ? FROM generation_runs WHERE id = ?
-    `).run(nanoid(12), error, finishedAt, runId);
-  })();
+      SELECT $1, id, '', 'error', $2, $3 FROM generation_runs WHERE id = $4
+    `, [nanoid(12), error, finishedAt, runId]);
+  });
 }

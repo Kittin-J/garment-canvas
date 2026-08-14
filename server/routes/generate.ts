@@ -30,7 +30,7 @@ generateRouter.post("/", async (req, res) => {
   const runId = nanoid(10);
   const startedAt = Date.now();
   const requestedCount = Math.max(1, Math.min(8, Number(request.batchSize) || 1));
-  createGenerationRecord(runId, {
+  await createGenerationRecord(runId, {
     userId: requestUser(req).id,
     projectId,
     projectName,
@@ -42,7 +42,7 @@ generateRouter.post("/", async (req, res) => {
     referenceImages: request.referenceImages,
     requestedCount,
   }, startedAt);
-  markGenerationRunning(runId, startedAt);
+  await markGenerationRunning(runId, startedAt);
   try {
     const provider = getProvider(providerId);
     // 参考图统一归一化为 dataURL（http URL 会带 SSRF/体积/超时防护下载）
@@ -58,13 +58,13 @@ generateRouter.post("/", async (req, res) => {
     const images = await Promise.all(raw.images.map(persistImageRef));
     const finishedAt = Date.now();
     const failures = raw.failures.map((error) => ({ prompt: request.prompt, error }));
-    completeGenerationRecord({
+    await completeGenerationRecord({
       runId, images, prompts: images.map(() => request.prompt), failures,
       model: raw.model, providerRequests: raw.providerRequests, startedAt, finishedAt,
     });
     res.json({ ...raw, images, runId });
   } catch (err) {
-    failGenerationRecord(runId, err instanceof Error ? err.message : String(err), Date.now());
+    await failGenerationRecord(runId, err instanceof Error ? err.message : String(err), Date.now());
     if (err instanceof ProviderError) {
       res.status(err.status && err.status >= 400 && err.status < 600 ? err.status : 502).json({
         error: err.message,

@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requestUser } from "../lib/auth";
-import { db } from "../lib/database";
+import { asyncHandler } from "../lib/asyncHandler";
+import { query } from "../lib/database";
 
 export const usageRouter = Router();
 
@@ -10,15 +11,15 @@ interface UsageRow {
   successful_count: number; provider_requests: number; duration_ms: number; created_at: string;
 }
 
-function queryRows(ownerId: string | null, from: string | null, to: string | null): UsageRow[] {
-  return db().prepare(`
+async function queryRows(ownerId: string | null, from: string | null, to: string | null): Promise<UsageRow[]> {
+  return query<UsageRow>(`
     SELECT e.*, u.account_id, u.display_name
     FROM usage_events e JOIN users u ON u.id = e.owner_id
-    WHERE (? IS NULL OR e.owner_id = ?)
-      AND (? IS NULL OR e.created_at >= ?)
-      AND (? IS NULL OR e.created_at <= ?)
+    WHERE ($1::text IS NULL OR e.owner_id = $1)
+      AND ($2::text IS NULL OR e.created_at >= $2)
+      AND ($3::text IS NULL OR e.created_at <= $3)
     ORDER BY e.created_at DESC
-  `).all(ownerId, ownerId, from, from, to, to) as UsageRow[];
+  `, [ownerId, from, to]);
 }
 
 function csvCell(value: unknown): string {
@@ -26,7 +27,7 @@ function csvCell(value: unknown): string {
   return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
 }
 
-usageRouter.get("/", (req, res) => {
+usageRouter.get("/", asyncHandler(async (req, res) => {
   const user = requestUser(req);
   const selected = typeof req.query.userId === "string" ? req.query.userId : undefined;
   if (selected && user.role !== "admin" && selected !== user.id) {
@@ -36,7 +37,7 @@ usageRouter.get("/", (req, res) => {
   const ownerId = selected ?? (user.role === "admin" && req.query.all === "true" ? null : user.id);
   const from = typeof req.query.from === "string" && Number.isFinite(Date.parse(req.query.from)) ? req.query.from : null;
   const to = typeof req.query.to === "string" && Number.isFinite(Date.parse(req.query.to)) ? req.query.to : null;
-  const rows = queryRows(ownerId, from, to);
+  const rows = await queryRows(ownerId, from, to);
   if (req.query.format === "csv") {
     const header = ["记录ID", "账号", "用户", "生成任务", "项目", "节点", "模型", "成功图片数", "服务商请求数", "耗时毫秒", "时间"];
     const lines = [header, ...rows.map((row) => [
@@ -62,4 +63,4 @@ usageRouter.get("/", (req, res) => {
     durationMs: row.duration_ms,
     createdAt: row.created_at,
   })));
-});
+}));

@@ -251,7 +251,7 @@ async function main() {
       [imgNode("input", "/api/files/seed.png"), resultNode("out")],
       [edge("input", "out")],
     );
-    const run = createRun(plan);
+    const run = await createRun(plan);
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("run timeout")), 5000);
       run.emitter.on(
@@ -273,17 +273,17 @@ async function main() {
     });
   });
 
-  await ok("runs 有界：终态 Run 超上限被清理", () => {
+  await ok("runs 有界：终态 Run 超上限被清理", async () => {
     // 直接造 60 个终态 Run 再触发一次 createRun 的清理
     const plan = buildExecutionPlan([resultNode("x")], []);
     let oldestRunId = "";
     for (let i = 0; i < 60; i++) {
-      const r = createRun(plan);
+      const r = await createRun(plan);
       if (i === 0) oldestRunId = r.id;
       r.finished = true;
     }
-    createRun(plan);
-    const probe = createRun(plan);
+    await createRun(plan);
+    const probe = await createRun(plan);
     assert.ok(getRun(probe.id), "新 Run 必须存在");
     assert.strictEqual(getRun(oldestRunId), undefined, "最老的终态 Run 必须已被回收");
   });

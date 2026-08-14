@@ -7,6 +7,19 @@ ENV_FILE="$SUPPORT_DIR/config/service.env"
 LABEL="${GARMENT_CANVAS_LABEL:-com.garmentcanvas.server}"
 PLIST_PATH="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
+POSTGRES_CONTAINER="${GARMENT_CANVAS_POSTGRES_CONTAINER:-garment-canvas-postgres}"
+POSTGRES_VOLUME="${GARMENT_CANVAS_POSTGRES_VOLUME:-garment-canvas-postgres-data}"
+
+read_env() {
+  local key="$1" fallback="$2" line value
+  line="$(/usr/bin/grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | /usr/bin/head -n 1 || true)"
+  value="${line#*=}"
+  value="${value#\"}"
+  value="${value%\"}"
+  value="${value#\'}"
+  value="${value%\'}"
+  [[ -n "$value" ]] && print -r -- "$value" || print -r -- "$fallback"
+}
 
 read_port() {
   local line value
@@ -36,6 +49,15 @@ if [[ ! -f "$PLIST_PATH" ]]; then
   exit 1
 fi
 
+if ! command -v docker >/dev/null 2>&1; then
+  print -u2 "Docker Desktop is required for the built-in PostgreSQL database."
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  print -u2 "Docker is not running. Start Docker Desktop first."
+  exit 1
+fi
+
 if /usr/bin/awk '
   /^[[:space:]]*#/ { next }
   /sk-your-(key|gemini-group-key)|your-change2pro-host/ { found=1 }
@@ -43,6 +65,50 @@ if /usr/bin/awk '
 ' "$ENV_FILE"; then
   print -u2 "Edit the gateway placeholders first:"
   print -u2 "  open -e '$ENV_FILE'"
+  exit 1
+fi
+
+PGDATABASE="$(read_env POSTGRES_DB garment_canvas)"
+PGUSER="$(read_env POSTGRES_USER garment_canvas)"
+PGPASSWORD="$(read_env POSTGRES_PASSWORD '')"
+PGPORT="$(read_env POSTGRES_HOST_PORT 54329)"
+if [[ -z "$PGPASSWORD" ]] || [[ "$PGPASSWORD" == replace-* ]]; then
+  print -u2 "PostgreSQL password is not configured in: $ENV_FILE"
+  exit 1
+fi
+if [[ "$PGPORT" != <-> ]]; then
+  print -u2 "POSTGRES_HOST_PORT must be a number in: $ENV_FILE"
+  exit 1
+fi
+
+if docker container inspect "$POSTGRES_CONTAINER" >/dev/null 2>&1; then
+  OWNER_LABEL="$(docker container inspect -f '{{ index .Config.Labels "com.garmentcanvas.component" }}' "$POSTGRES_CONTAINER" 2>/dev/null || true)"
+  if [[ "$OWNER_LABEL" != "postgres" ]]; then
+    print -u2 "Container name is already used by another service: $POSTGRES_CONTAINER"
+    exit 1
+  fi
+  docker start "$POSTGRES_CONTAINER" >/dev/null
+else
+  docker run -d \
+    --name "$POSTGRES_CONTAINER" \
+    --label com.garmentcanvas.component=postgres \
+    --restart unless-stopped \
+    -e "POSTGRES_DB=$PGDATABASE" \
+    -e "POSTGRES_USER=$PGUSER" \
+    -e "POSTGRES_PASSWORD=$PGPASSWORD" \
+    -p "127.0.0.1:$PGPORT:5432" \
+    -v "$POSTGRES_VOLUME:/var/lib/postgresql/data" \
+    postgres:17-alpine >/dev/null
+fi
+
+for _ in {1..60}; do
+  if docker exec "$POSTGRES_CONTAINER" pg_isready -U "$PGUSER" -d "$PGDATABASE" >/dev/null 2>&1; then
+    break
+  fi
+  /bin/sleep 1
+done
+if ! docker exec "$POSTGRES_CONTAINER" pg_isready -U "$PGUSER" -d "$PGDATABASE" >/dev/null 2>&1; then
+  print -u2 "PostgreSQL did not become ready. Check: docker logs $POSTGRES_CONTAINER"
   exit 1
 fi
 

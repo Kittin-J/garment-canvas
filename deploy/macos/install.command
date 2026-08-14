@@ -59,6 +59,25 @@ if (( NODE_MAJOR < 20 )); then
   exit 1
 fi
 
+if ! command -v docker >/dev/null 2>&1; then
+  print -u2 "Docker Desktop is required for the built-in PostgreSQL database."
+  print -u2 "Install and start Docker Desktop, then run this installer again."
+  exit 1
+fi
+if ! docker info >/dev/null 2>&1; then
+  print -u2 "Docker is installed but not running. Start Docker Desktop first."
+  exit 1
+fi
+if ! docker image inspect postgres:17-alpine >/dev/null 2>&1; then
+  if [[ -f "$SOURCE_DIR/postgres-17-alpine.tar" ]]; then
+    print "Loading the bundled PostgreSQL image..."
+    docker load -i "$SOURCE_DIR/postgres-17-alpine.tar" >/dev/null
+  else
+    print "Downloading the PostgreSQL image..."
+    docker pull postgres:17-alpine >/dev/null
+  fi
+fi
+
 /bin/mkdir -p "$RELEASES_DIR" "$APP_ROOT/bin" "$DATA_DIR" "$CONFIG_DIR" "$LOG_DIR" "$PLIST_DIR"
 /bin/chmod 700 "$APP_ROOT" "$RELEASES_DIR" "$SUPPORT_DIR" "$DATA_DIR" "$CONFIG_DIR" "$LOG_DIR"
 
@@ -107,6 +126,7 @@ fi
 (
   cd "$STAGE_DIR"
   "$NODE_PATH" -e "import('express').then(() => process.exit(0)).catch(() => process.exit(1))"
+  "$NODE_PATH" -e "import('pg').then(() => process.exit(0)).catch(() => process.exit(1))"
   "$NODE_PATH" -e "import('better-sqlite3').then(m => { const db = new m.default(':memory:'); db.close(); }).catch(() => process.exit(1))"
 )
 
@@ -123,14 +143,24 @@ fi
 
 # Keep mutable configuration outside release directories. Each release receives
 # only a symlink, so secrets never enter the application package.
-ENV_FILE_PATH="$ENV_FILE" DATA_DIR_VALUE="$DATA_DIR" "$NODE_PATH" --input-type=module <<'NODE'
+POSTGRES_PASSWORD_VALUE="$(/usr/bin/openssl rand -hex 24)"
+ENV_FILE_PATH="$ENV_FILE" DATA_DIR_VALUE="$DATA_DIR" POSTGRES_PASSWORD_VALUE="$POSTGRES_PASSWORD_VALUE" "$NODE_PATH" --input-type=module <<'NODE'
 import fs from "node:fs";
 const envPath = process.env.ENV_FILE_PATH;
 const dataDir = process.env.DATA_DIR_VALUE;
 let content = fs.readFileSync(envPath, "utf8");
-const line = `DATA_DIR=${JSON.stringify(dataDir)}`;
-if (/^DATA_DIR=.*$/m.test(content)) content = content.replace(/^DATA_DIR=.*$/m, line);
-else content = `${content.replace(/\s*$/, "")}\n${line}\n`;
+function setValue(key, value, options = {}) {
+  const pattern = new RegExp(`^${key}=.*$`, "m");
+  const match = content.match(pattern)?.[0];
+  if (match && !options.replaceExisting && !(options.replacePlaceholder && /replace-/.test(match))) return;
+  const line = `${key}=${value}`;
+  content = match ? content.replace(pattern, line) : `${content.replace(/\s*$/, "")}\n${line}\n`;
+}
+setValue("DATA_DIR", JSON.stringify(dataDir), { replaceExisting: true });
+setValue("POSTGRES_DB", "garment_canvas");
+setValue("POSTGRES_USER", "garment_canvas");
+setValue("POSTGRES_HOST_PORT", "54329");
+setValue("POSTGRES_PASSWORD", process.env.POSTGRES_PASSWORD_VALUE, { replacePlaceholder: true });
 fs.writeFileSync(envPath, content, { mode: 0o600 });
 NODE
 /bin/chmod 600 "$ENV_FILE"

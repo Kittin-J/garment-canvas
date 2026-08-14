@@ -3,7 +3,12 @@ set -euo pipefail
 
 LABEL="${GARMENT_CANVAS_LABEL:-com.garmentcanvas.server}"
 DOMAIN="gui/$(id -u)"
+POSTGRES_CONTAINER="${GARMENT_CANVAS_POSTGRES_CONTAINER:-garment-canvas-postgres}"
 
 if /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
   /bin/launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
+fi
+
+if command -v docker >/dev/null 2>&1 && docker container inspect "$POSTGRES_CONTAINER" >/dev/null 2>&1; then
+  docker stop "$POSTGRES_CONTAINER" >/dev/null
 fi

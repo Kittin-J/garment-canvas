@@ -54,7 +54,14 @@ export const config = {
 
   port: () => Number(process.env.PORT ?? 3001),
   dataDir: () => path.resolve(ROOT_DIR, process.env.DATA_DIR ?? "./data"),
-  databasePath: () => path.resolve(config.dataDir(), process.env.DATABASE_FILE ?? "garment-canvas.db"),
+  databaseUrl: () => process.env.DATABASE_URL?.trim() || undefined,
+  databaseHost: () => process.env.PGHOST?.trim() || "127.0.0.1",
+  databasePort: () => Number(process.env.PGPORT ?? process.env.POSTGRES_HOST_PORT ?? 54329),
+  databaseName: () => process.env.PGDATABASE?.trim() || process.env.POSTGRES_DB?.trim() || "garment_canvas",
+  databaseUser: () => process.env.PGUSER?.trim() || process.env.POSTGRES_USER?.trim() || "garment_canvas",
+  databasePassword: () => process.env.PGPASSWORD ?? process.env.POSTGRES_PASSWORD ?? "",
+  databasePoolSize: () => Math.max(1, Math.min(50, Number(process.env.DATABASE_POOL_SIZE) || 10)),
+  sqliteImportPath: () => path.resolve(config.dataDir(), process.env.SQLITE_IMPORT_FILE ?? "garment-canvas.db"),
   initialAdminAccountId: () => process.env.INITIAL_ADMIN_ACCOUNT_ID?.trim() ?? "",
   initialAdminPassword: () => process.env.INITIAL_ADMIN_PASSWORD ?? "",
   /** 生产模式是否只提供 API；true 时不要求或托管前端 dist。 */
