@@ -9,8 +9,11 @@
 docker compose up -d --build --wait
 ```
 
-网页默认为 `http://localhost:3002`。PostgreSQL 数据保存在 Docker 命名卷
+网页默认为 `http://localhost:3002`。PostgreSQL 18 数据保存在 Docker 命名卷
 `garment-canvas_postgres_data`，上传和生成文件仍保存在 `data/`。
+
+PostgreSQL 18 官方镜像的卷挂载点是 `/var/lib/postgresql`。从 17 升级时不能直接
+复用 17 的数据目录，必须先用 `pg_dump` 导出，再在新建的 18 卷中恢复。
 
 如果 `data/garment-canvas.db` 存在且 PostgreSQL 还没有用户，首次启动会自动导入
 旧 SQLite 中的用户、会话、项目、素材、生成记录和消耗流水。导入成功后原
@@ -18,7 +21,7 @@ SQLite 文件会保留，便于回退核对。
 
 ## 本地开发
 
-要求 Node.js 20 或更高版本。先只启动 PostgreSQL，再启动开发服务：
+要求 Node.js 20.9.0 或更高版本。先只启动 PostgreSQL，再启动开发服务：
 
 ```bash
 docker compose up -d postgres --wait
@@ -61,7 +64,7 @@ npm start
 - `GET /api/health`：进程存活检查；
 - `GET /api/ready`：检查 PostgreSQL、`DATA_DIR`、AI 配置和完整模式下的前端构建。
 
-用户、会话、项目、素材、生成记录和消耗流水保存在 Docker 内置 PostgreSQL；上传及
+用户、会话、项目、素材、生成记录和消耗流水保存在 Docker 内置 PostgreSQL 18；上传及
 生成图片保存在 `DATA_DIR`。当前部署使用本地磁盘，不自动备份，但 PostgreSQL 命名卷
 与文件目录已分离，可后续接入备份接口。
 

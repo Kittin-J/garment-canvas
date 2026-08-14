@@ -15,6 +15,7 @@ import {
   parseDataUrl,
   toDataUrl,
   ProviderError,
+  providerErrorFromMessage,
 } from "./base";
 
 interface ImagesApiResponse {
@@ -25,6 +26,7 @@ interface ImagesApiResponse {
 const PROVIDER_ID = "nanobanana";
 
 async function generateOnce(req: ImageGenRequest): Promise<string[]> {
+  const capabilities = config.nanobananaCapabilities();
   const url = `${config.change2proBaseUrl()}/images/generations`;
   const res = await fetchWithRetry(
     url,
@@ -37,7 +39,9 @@ async function generateOnce(req: ImageGenRequest): Promise<string[]> {
       body: JSON.stringify({
         model: config.nanobananaModel(),
         prompt: req.prompt,
-        n: 1,
+        ...(capabilities.supportsBatchN
+          ? { n: Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize)) }
+          : {}),
         size: aspectRatioToSize(req.aspectRatio),
         quality: "low",
         output_format: "png",
@@ -48,7 +52,7 @@ async function generateOnce(req: ImageGenRequest): Promise<string[]> {
 
   const json = (await res.json()) as ImagesApiResponse;
   if (json.error) {
-    throw new ProviderError(json.error.message ?? "images api error", json.error.code, PROVIDER_ID);
+    throw providerErrorFromMessage(json.error.message ?? "images api error", PROVIDER_ID, json.error.code);
   }
 
   const images: string[] = [];
@@ -57,7 +61,7 @@ async function generateOnce(req: ImageGenRequest): Promise<string[]> {
     else if (item.url) images.push(item.url);
   }
   if (images.length === 0) {
-    throw new ProviderError("nanobanana returned no image", undefined, PROVIDER_ID);
+    throw new ProviderError("AI 服务未返回图片，请重试", 502, PROVIDER_ID, "empty_response");
   }
   return images;
 }
@@ -65,12 +69,10 @@ async function generateOnce(req: ImageGenRequest): Promise<string[]> {
 export const nanobananaProvider: AIProvider = {
   id: PROVIDER_ID,
 
-  /** 文生图；batchSize 通过多次调用实现 */
+  /** 文生图；不支持批量 n 的网关由 generateExactImages 在上层按缺口补发。 */
   async generate(req: ImageGenRequest): Promise<ImageGenResult> {
-    const n = Math.max(1, Math.min(req.batchSize ?? 1, 4));
-    const settled = await Promise.all(Array.from({ length: n }, () => generateOnce(req)));
     return {
-      images: settled.flat(),
+      images: await generateOnce(req),
       model: config.nanobananaModel(),
     };
   },
@@ -80,8 +82,13 @@ export const nanobananaProvider: AIProvider = {
     if (!req.referenceImages?.length) {
       throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID);
     }
-    if (req.referenceImages.length > MAX_REFERENCE_IMAGES) {
-      throw new ProviderError(`edit supports at most ${MAX_REFERENCE_IMAGES} reference images`, 400, PROVIDER_ID);
+    const capabilities = config.nanobananaCapabilities();
+    const maxReferences = Math.min(MAX_REFERENCE_IMAGES, capabilities.maxReferenceImages);
+    if (req.referenceImages.length > maxReferences) {
+      throw new ProviderError(`当前 AI 服务最多支持 ${maxReferences} 张参考图`, 400, PROVIDER_ID, "invalid_request");
+    }
+    if (req.referenceImages.length > 1 && (!capabilities.supportsMultiReference || !capabilities.supportsImageArray)) {
+      throw new ProviderError("当前 AI 服务不支持多参考图，请只保留一张参考图", 400, PROVIDER_ID, "invalid_request");
     }
     const url = `${config.change2proBaseUrl()}/images/edits`;
     const res = await fetchWithRetry(
@@ -91,12 +98,14 @@ export const nanobananaProvider: AIProvider = {
         form.append("model", config.nanobananaModel());
         form.append("prompt", req.prompt);
         form.append("size", aspectRatioToSize(req.aspectRatio));
-        form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, 4))));
+        if (capabilities.supportsBatchN) {
+          form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize))));
+        }
         req.referenceImages!.forEach((ref, index) => {
           const { mime, buffer } = parseDataUrl(ref);
           const ext = mime.split("/")[1] ?? "png";
           form.append(
-            "image[]",
+            capabilities.supportsImageArray ? "image[]" : "image",
             new Blob([new Uint8Array(buffer)], { type: mime }),
             `ref-${index}.${ext}`,
           );
@@ -115,7 +124,7 @@ export const nanobananaProvider: AIProvider = {
     );
     const json = (await res.json()) as ImagesApiResponse;
     if (json.error) {
-      throw new ProviderError(json.error.message ?? "images api error", json.error.code, PROVIDER_ID);
+      throw providerErrorFromMessage(json.error.message ?? "images api error", PROVIDER_ID, json.error.code);
     }
     const images: string[] = [];
     for (const item of json.data ?? []) {
@@ -123,7 +132,7 @@ export const nanobananaProvider: AIProvider = {
       else if (item.url) images.push(item.url);
     }
     if (images.length === 0) {
-      throw new ProviderError("nanobanana returned no image", undefined, PROVIDER_ID);
+      throw new ProviderError("AI 服务未返回图片，请重试", 502, PROVIDER_ID, "empty_response");
     }
     return { images, model: config.nanobananaModel() };
   },

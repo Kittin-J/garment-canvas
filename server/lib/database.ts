@@ -9,6 +9,7 @@ types.setTypeParser(20, Number);
 
 let pool: pg.Pool | undefined;
 let initialization: Promise<void> | undefined;
+const REQUIRED_POSTGRES_MAJOR = 18;
 
 export function db(): pg.Pool {
   if (!pool) {
@@ -65,11 +66,23 @@ export async function transaction<T>(fn: (client: PoolClient) => Promise<T>): Pr
 
 export async function initializeDatabase(): Promise<void> {
   initialization ??= (async () => {
+    await assertDatabaseVersion();
     await migrate();
-    await importSqliteIfNeeded();
     await bootstrapInitialAdmin();
   })();
   return initialization;
+}
+
+async function assertDatabaseVersion(): Promise<void> {
+  const row = await queryOne<{ version_num: number }>(
+    "SELECT current_setting('server_version_num')::int AS version_num",
+  );
+  const major = Math.floor((row?.version_num ?? 0) / 10_000);
+  if (major !== REQUIRED_POSTGRES_MAJOR) {
+    throw new Error(
+      `PostgreSQL ${REQUIRED_POSTGRES_MAJOR} is required; connected server is major version ${major || "unknown"}`,
+    );
+  }
 }
 
 export async function closeDatabaseForTests(): Promise<void> {
@@ -80,7 +93,24 @@ export async function closeDatabaseForTests(): Promise<void> {
 }
 
 async function migrate(): Promise<void> {
-  await db().query(`
+  const importedRows = await transaction(async (client) => {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      )
+    `);
+    await client.query("LOCK TABLE schema_migrations IN EXCLUSIVE MODE");
+    const appliedRows = await query<{ version: number }>(
+      "SELECT version FROM schema_migrations",
+      [],
+      client,
+    );
+    const applied = new Set(appliedRows.map((row) => row.version));
+
+    if (!applied.has(1)) {
+      await client.query(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       account_id TEXT NOT NULL UNIQUE,
@@ -191,7 +221,83 @@ async function migrate(): Promise<void> {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS usage_owner_idx ON usage_events(owner_id, created_at DESC);
-  `);
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, $1, $2)",
+        ["initial_schema", new Date().toISOString()],
+      );
+    }
+
+    // 旧 SQLite 的 project_asset_refs 尚无 project_id 外键，必须先导入，
+    // 再由迁移 2 清理其中的孤立引用并建立正式约束。
+    const imported = await importSqliteIfNeeded(client);
+
+    if (!applied.has(2)) {
+      // 旧版允许 project_id 指向不存在的项目；先清理孤立行，再补正式外键。
+      await client.query(`
+        DELETE FROM project_asset_refs refs
+        WHERE NOT EXISTS (SELECT 1 FROM projects WHERE projects.id = refs.project_id)
+           OR NOT EXISTS (SELECT 1 FROM assets WHERE assets.id = refs.asset_id)
+      `);
+      await client.query(`
+        DO $$
+        DECLARE
+          existing_constraint RECORD;
+        BEGIN
+          FOR existing_constraint IN
+            SELECT constraint_row.conname
+            FROM pg_constraint constraint_row
+            JOIN pg_attribute column_row
+              ON column_row.attrelid = constraint_row.conrelid
+             AND column_row.attnum = ANY(constraint_row.conkey)
+            WHERE constraint_row.contype = 'f'
+              AND constraint_row.conrelid = 'project_asset_refs'::regclass
+              AND constraint_row.confrelid = 'projects'::regclass
+              AND column_row.attname = 'project_id'
+          LOOP
+            EXECUTE format(
+              'ALTER TABLE project_asset_refs DROP CONSTRAINT %I',
+              existing_constraint.conname
+            );
+          END LOOP;
+          ALTER TABLE project_asset_refs
+            ADD CONSTRAINT project_asset_refs_project_id_fkey
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+        END
+        $$
+      `);
+      await client.query(
+        "CREATE INDEX IF NOT EXISTS project_asset_refs_asset_idx ON project_asset_refs(asset_id)",
+      );
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (2, $1, $2)",
+        ["project_asset_refs_project_foreign_key", new Date().toISOString()],
+      );
+    }
+
+    if (!applied.has(3)) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS revoked_sessions (
+          token_hash TEXT PRIMARY KEY,
+          reason TEXT NOT NULL CHECK (reason IN ('replaced')),
+          revoked_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS revoked_sessions_expiry_idx ON revoked_sessions(expires_at);
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (3, $1, $2)",
+        ["revoked_session_reasons", new Date().toISOString()],
+      );
+    }
+
+    return imported;
+  });
+  if (importedRows !== undefined) {
+    console.log(
+      `[garment-canvas] imported ${importedRows} rows from SQLite into PostgreSQL`,
+    );
+  }
 }
 
 async function bootstrapInitialAdmin(): Promise<void> {
@@ -217,7 +323,7 @@ export async function hasUsers(): Promise<boolean> {
 
 export async function databaseReady(): Promise<boolean> {
   try {
-    await db().query("SELECT 1");
+    await assertDatabaseVersion();
     return true;
   } catch {
     return false;

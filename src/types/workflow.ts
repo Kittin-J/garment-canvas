@@ -209,6 +209,8 @@ export interface Asset {
   category: "print" | "fabric" | "reference";
   /** 图片 URL（/api/files/xxx） */
   image: string;
+  /** 列表/画布预览使用的轻量缩略图；执行节点时仍使用 image 原图。 */
+  thumbnail?: string;
   /** 来源说明（如来自哪个节点/项目） */
   sourceNote?: string;
   createdAt: string;

@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { nanoid } from "nanoid";
+import type { PoolClient } from "pg";
 import { requestUser } from "../lib/auth";
 import { asyncHandler } from "../lib/asyncHandler";
 import { query, queryOne, transaction } from "../lib/database";
@@ -24,20 +25,26 @@ function imageRefs(value: unknown, output = new Set<string>()): Set<string> {
   return output;
 }
 
-async function syncAssetRefs(projectId: string, flow: PersistedWorkflow): Promise<void> {
+async function syncAssetRefs(
+  client: PoolClient,
+  projectId: string,
+  ownerId: string,
+  flow: PersistedWorkflow,
+): Promise<void> {
   const refs = imageRefs(flow);
-  const assets = await query<{ id: string; image: string }>("SELECT id, image FROM assets WHERE deleted_at IS NULL");
+  const assets = await query<{ id: string; image: string }>(`
+    SELECT id, image FROM assets
+    WHERE deleted_at IS NULL AND (scope IN ('global','shared') OR owner_id = $1)
+  `, [ownerId], client);
   const wanted = assets.filter((asset) => refs.has(asset.image)).map((asset) => asset.id);
   const now = new Date().toISOString();
-  await transaction(async (client) => {
-    await client.query("DELETE FROM project_asset_refs WHERE project_id = $1", [projectId]);
-    for (const assetId of wanted) {
-      await client.query(
-        "INSERT INTO project_asset_refs (project_id, asset_id, created_at) VALUES ($1, $2, $3)",
-        [projectId, assetId, now],
-      );
-    }
-  });
+  await client.query("DELETE FROM project_asset_refs WHERE project_id = $1", [projectId]);
+  for (const assetId of wanted) {
+    await client.query(
+      "INSERT INTO project_asset_refs (project_id, asset_id, created_at) VALUES ($1, $2, $3)",
+      [projectId, assetId, now],
+    );
+  }
 }
 
 async function purgeExpiredProjects(): Promise<void> {
@@ -65,21 +72,30 @@ projectsRouter.post("/", asyncHandler(async (req, res) => {
   try {
     const normalized = validateAndMigrateFlow(flow);
     const projectId = id || nanoid(10);
-    const existing = await queryOne<{ owner_id: string }>(
-      "SELECT owner_id FROM projects WHERE id = $1 AND deleted_at IS NULL",
-      [projectId],
-    );
-    if (existing && existing.owner_id !== user.id) {
+    const now = new Date().toISOString();
+    const saved = await transaction(async (client) => {
+      const existing = await queryOne<{ owner_id: string }>(
+        "SELECT owner_id FROM projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        [projectId],
+        client,
+      );
+      if (existing && existing.owner_id !== user.id) return false;
+      const result = await client.query(`
+        INSERT INTO projects (id, owner_id, name, flow_json, updated_at, created_at)
+        VALUES ($1, $2, $3, $4, $5, $5)
+        ON CONFLICT(id) DO UPDATE
+          SET name = excluded.name, flow_json = excluded.flow_json, updated_at = excluded.updated_at
+          WHERE projects.owner_id = excluded.owner_id
+        RETURNING id
+      `, [projectId, user.id, name.trim(), JSON.stringify(normalized), now]);
+      if (result.rowCount !== 1) return false;
+      await syncAssetRefs(client, projectId, user.id, normalized);
+      return true;
+    });
+    if (!saved) {
       res.status(403).json({ error: "管理员只能查看其他用户项目，不能修改" });
       return;
     }
-    const now = new Date().toISOString();
-    await query(`
-      INSERT INTO projects (id, owner_id, name, flow_json, updated_at, created_at)
-      VALUES ($1, $2, $3, $4, $5, $5)
-      ON CONFLICT(id) DO UPDATE SET name = excluded.name, flow_json = excluded.flow_json, updated_at = excluded.updated_at
-    `, [projectId, user.id, name.trim(), JSON.stringify(normalized), now]);
-    await syncAssetRefs(projectId, normalized);
     res.json({ ok: true, id: projectId });
   } catch (error) {
     res.status(error instanceof WorkflowValidationError ? 400 : 500)
@@ -122,11 +138,14 @@ projectsRouter.get("/:id", asyncHandler(async (req, res) => {
     return;
   }
   try {
+    const flow = validateAndMigrateFlow(JSON.parse(row.flow_json));
     res.json({
-      id: row.id, name: row.name, flow: JSON.parse(row.flow_json), updatedAt: row.updated_at,
+      id: row.id, name: row.name, flow, updatedAt: row.updated_at,
       ownerId: row.owner_id, ownerName: row.owner_name, readOnly: row.owner_id !== user.id,
     });
-  } catch {
-    res.status(422).json({ error: "项目数据损坏" });
+  } catch (error) {
+    res.status(422).json({
+      error: error instanceof WorkflowValidationError ? `项目数据无法迁移：${error.message}` : "项目数据损坏",
+    });
   }
 }));

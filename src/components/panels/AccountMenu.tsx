@@ -11,10 +11,31 @@ interface UsageItem {
   successfulCount: number; providerRequests: number; durationMs: number; createdAt: string;
 }
 
+interface AiDiagnosticProvider {
+  providerId: "nanobanana" | "gpt-image-2";
+  model: string;
+  configured: boolean;
+  error?: string;
+  capabilities?: {
+    supportsBatchN: boolean;
+    maxBatchSize: number;
+    supportsMultiReference: boolean;
+    supportsImageArray: boolean;
+    maxReferenceImages: number;
+  };
+}
+
+interface AiDiagnostics {
+  gateway: string;
+  providers: AiDiagnosticProvider[];
+}
+
+type AccountPanelTab = "usage" | "users" | "diagnostics";
+
 export function AccountMenu() {
   const { user, logout } = useAuth();
   const [open, setOpen] = useState(false);
-  const [panel, setPanel] = useState<"usage" | "users" | null>(null);
+  const [panel, setPanel] = useState<AccountPanelTab | null>(null);
   const root = useRef<HTMLDivElement>(null);
   if (!user) return null;
 
@@ -32,8 +53,12 @@ export function AccountMenu() {
           <button className="w-full rounded px-2.5 py-2 text-left text-[11px] hover:bg-[var(--gc-panel-hover)]"
             onClick={() => { setPanel("usage"); setOpen(false); }}>消耗记录</button>
           {user.role === "admin" && (
-            <button className="w-full rounded px-2.5 py-2 text-left text-[11px] hover:bg-[var(--gc-panel-hover)]"
-              onClick={() => { setPanel("users"); setOpen(false); }}>用户管理</button>
+            <>
+              <button className="w-full rounded px-2.5 py-2 text-left text-[11px] hover:bg-[var(--gc-panel-hover)]"
+                onClick={() => { setPanel("users"); setOpen(false); }}>用户管理</button>
+              <button className="w-full rounded px-2.5 py-2 text-left text-[11px] hover:bg-[var(--gc-panel-hover)]"
+                onClick={() => { setPanel("diagnostics"); setOpen(false); }}>AI 服务诊断</button>
+            </>
           )}
           <button className="w-full rounded px-2.5 py-2 text-left text-[11px] text-red-400 hover:bg-red-950/20"
             onClick={() => void logout()}>退出登录</button>
@@ -44,11 +69,14 @@ export function AccountMenu() {
   );
 }
 
-function AccountPanel({ initialTab, onClose }: { initialTab: "usage" | "users"; onClose: () => void }) {
+function AccountPanel({ initialTab, onClose }: { initialTab: AccountPanelTab; onClose: () => void }) {
   const { user } = useAuth();
   const [tab, setTab] = useState(initialTab);
   const [users, setUsers] = useState<ManagedUser[]>([]);
   const [usage, setUsage] = useState<UsageItem[]>([]);
+  const [diagnostics, setDiagnostics] = useState<AiDiagnostics | null>(null);
+  const [probing, setProbing] = useState<string | null>(null);
+  const [probeResults, setProbeResults] = useState<Record<string, string>>({});
   const [selectedUser, setSelectedUser] = useState(user?.role === "admin" ? "all" : user?.id ?? "");
   const [error, setError] = useState<string | null>(null);
 
@@ -66,11 +94,41 @@ function AccountPanel({ initialTab, onClose }: { initialTab: "usage" | "users"; 
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     setUsage(await response.json() as UsageItem[]);
   };
+  const loadDiagnostics = async () => {
+    if (user?.role !== "admin") return;
+    const response = await fetch("/api/ai-diagnostics");
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    setDiagnostics(await response.json() as AiDiagnostics);
+  };
 
   useEffect(() => {
     setError(null);
-    void Promise.all([loadUsers(), loadUsage()]).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+    void Promise.all([loadUsers(), loadUsage(), loadDiagnostics()]).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, [selectedUser]);
+
+  const runProbe = async (providerId: AiDiagnosticProvider["providerId"], mode: "model" | "generate" | "edit") => {
+    const key = `${providerId}:${mode}`;
+    setProbing(key);
+    setError(null);
+    try {
+      const response = await fetch("/api/ai-diagnostics/probe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ providerId, mode }),
+      });
+      const body = await response.json() as { ok?: boolean; error?: string; durationMs?: number };
+      setProbeResults((current) => ({
+        ...current,
+        [key]: response.ok && body.ok
+          ? `正常 · ${((body.durationMs ?? 0) / 1000).toFixed(1)} 秒`
+          : body.error ?? "诊断失败",
+      }));
+    } catch (reason) {
+      setProbeResults((current) => ({ ...current, [key]: reason instanceof Error ? reason.message : "诊断失败" }));
+    } finally {
+      setProbing(null);
+    }
+  };
 
   const exportUsage = () => {
     const query = user?.role === "admin"
@@ -134,6 +192,7 @@ function AccountPanel({ initialTab, onClose }: { initialTab: "usage" | "users"; 
         <header className="flex items-center border-b border-[var(--gc-border)] px-5 py-3">
           <button onClick={() => setTab("usage")} className={`px-3 py-1.5 text-xs ${tab === "usage" ? "text-[var(--gc-accent)]" : "text-[var(--gc-text-muted)]"}`}>消耗记录</button>
           {user?.role === "admin" && <button onClick={() => setTab("users")} className={`px-3 py-1.5 text-xs ${tab === "users" ? "text-[var(--gc-accent)]" : "text-[var(--gc-text-muted)]"}`}>用户管理</button>}
+          {user?.role === "admin" && <button onClick={() => setTab("diagnostics")} className={`px-3 py-1.5 text-xs ${tab === "diagnostics" ? "text-[var(--gc-accent)]" : "text-[var(--gc-text-muted)]"}`}>AI 服务诊断</button>}
           <button onClick={onClose} className="ml-auto text-sm text-[var(--gc-text-muted)]">✕</button>
         </header>
         {error && <p className="mx-5 mt-3 rounded bg-red-950/20 px-3 py-2 text-xs text-red-400">{error}</p>}
@@ -155,10 +214,49 @@ function AccountPanel({ initialTab, onClose }: { initialTab: "usage" | "users"; 
               </table>
             </div>
           </div>
-        ) : (
+        ) : tab === "users" ? (
           <div className="min-h-0 flex-1 overflow-auto p-5">
             <button onClick={() => void createUser()} className="mb-3 rounded bg-[var(--gc-accent)] px-3 py-1.5 text-xs text-white">创建用户</button>
             <div className="space-y-2">{users.map((item) => <div key={item.id} className="flex items-center rounded border border-[var(--gc-border)] p-3 text-xs"><span className="min-w-0 flex-1"><strong>{item.displayName}</strong><span className="ml-2 text-[var(--gc-text-muted)]">{item.accountId} · {item.role === "admin" ? "管理员" : "用户"}</span></span><button onClick={() => void resetPassword(item)} className="mr-2 rounded border border-[var(--gc-border)] px-2 py-1">重置密码</button><button disabled={item.id === user?.id} onClick={() => void toggleUser(item)} className={`mr-2 rounded px-2 py-1 ${item.active ? "bg-red-950/30 text-red-400" : "bg-emerald-950/30 text-emerald-400"}`}>{item.active ? "停用" : "启用"}</button>{item.id !== user?.id && <button onClick={() => void deleteUser(item)} className="rounded border border-red-900/50 px-2 py-1 text-red-400">删除</button>}</div>)}</div>
+          </div>
+        ) : (
+          <div className="min-h-0 flex-1 overflow-auto p-5">
+            <p className="mb-4 text-xs text-[var(--gc-text-muted)]">
+              网关：{diagnostics?.gateway ?? "读取中…"}。模型检查不产生图片；生成与改图检查会各发起一次真实 AI 请求，可能产生少量消耗。
+            </p>
+            <div className="space-y-3">
+              {diagnostics?.providers.map((provider) => (
+                <section key={provider.providerId} className="rounded-lg border border-[var(--gc-border)] p-4 text-xs">
+                  <div className="mb-2 flex items-center gap-2">
+                    <strong>{provider.providerId}</strong>
+                    <span className="text-[var(--gc-text-muted)]">{provider.model || provider.error || "未配置模型"}</span>
+                    <span className={provider.configured ? "ml-auto text-emerald-400" : "ml-auto text-red-400"}>
+                      {provider.configured ? "配置完整" : "配置缺失"}
+                    </span>
+                  </div>
+                  {provider.capabilities && (
+                    <p className="mb-3 text-[11px] text-[var(--gc-text-muted)]">
+                      批量参数：{provider.capabilities.supportsBatchN ? `支持，单次最多 ${provider.capabilities.maxBatchSize} 张` : "不发送，由系统循环补足"}
+                      ；多参考图：{provider.capabilities.supportsMultiReference && provider.capabilities.supportsImageArray ? `支持，最多 ${provider.capabilities.maxReferenceImages} 张` : "不支持"}
+                    </p>
+                  )}
+                  <div className="flex flex-wrap gap-2">
+                    {(["model", "generate", "edit"] as const).map((mode) => {
+                      const key = `${provider.providerId}:${mode}`;
+                      const label = mode === "model" ? "检查模型" : mode === "generate" ? "检查文生图" : "检查改图";
+                      return (
+                        <button key={mode} disabled={!provider.configured || probing !== null}
+                          onClick={() => void runProbe(provider.providerId, mode)}
+                          className="rounded border border-[var(--gc-border)] px-2.5 py-1.5 disabled:opacity-40">
+                          {probing === key ? "检查中…" : label}
+                          {probeResults[key] ? ` · ${probeResults[key]}` : ""}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </section>
+              ))}
+            </div>
           </div>
         )}
       </section>

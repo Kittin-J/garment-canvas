@@ -1,5 +1,5 @@
 import type { AIProvider, ImageGenRequest, ImageGenResult } from "../../src/types/workflow";
-import { ProviderError } from "./base";
+import { ProviderError, publicProviderErrorMessage } from "./base";
 
 export interface ExactImageResult extends ImageGenResult {
   providerRequests: number;
@@ -37,7 +37,7 @@ export async function generateExactImages(
       if (accepted.length === 0) failures.push("模型未返回图片");
     } catch (error) {
       firstError ??= error;
-      failures.push(error instanceof Error ? error.message : String(error));
+      failures.push(publicProviderErrorMessage(error));
       if (error instanceof ProviderError && error.status !== undefined && error.status >= 400 && error.status < 500) break;
     }
   }

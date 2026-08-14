@@ -4,6 +4,7 @@ import { nanoid } from "nanoid";
 import { useFlowStore, type FlowNode } from "@/store/flowStore";
 import { WORKFLOW_SCHEMA_VERSION, type WorkflowTemplate } from "@/types/workflow";
 import { WorkflowMini } from "./WorkflowMini";
+import { thumbnailImageUrl } from "@/lib/images";
 
 /**
  * 画布顶部中央的模板悬浮入口：
@@ -143,7 +144,9 @@ export function TemplatesDock() {
                     >
                       {tpl.thumbnail ? (
                         <img
-                          src={tpl.thumbnail}
+                          src={thumbnailImageUrl(tpl.thumbnail)}
+                          loading="lazy"
+                          decoding="async"
                           alt={tpl.name}
                           className="aspect-[16/9] w-full object-cover"
                         />

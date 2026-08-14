@@ -3,8 +3,8 @@
 ## 系统要求
 
 - macOS 13 或更高版本。
-- Node.js 20 或更高版本。
-- Docker Desktop（必须已启动），数据库由本机 Docker 内置 PostgreSQL 提供。
+- Node.js 20.9.0 或更高版本。
+- Docker Desktop（必须已启动），数据库由本机 Docker 内置 PostgreSQL 18 提供。
 - `universal-online` 包支持 Apple Silicon 与 Intel，首次安装需要访问 npm registry 和 Docker Hub。
 - `darwin-*-offline` 包已附带生产依赖和 PostgreSQL 镜像，仅用于打包时对应的 Mac 架构。
 
@@ -85,6 +85,8 @@ http://192.168.1.20:3001/
 解压新版本后再次运行 `install.command`。它会安装到新的版本目录，再原子切换 `current`；不会覆盖私密配置、业务数据和日志。旧版本暂时保留，便于回退。
 
 升级应安排在没有生成任务运行时进行：当前任务队列保存在内存中，服务重启会中断未完成任务。
+从 PostgreSQL 17 升级到 18 时必须先导出数据库，在新的 18 卷中恢复；安装器会拒绝
+直接用 18 镜像启动旧版容器，避免损坏数据。
 
 ## 排错
 

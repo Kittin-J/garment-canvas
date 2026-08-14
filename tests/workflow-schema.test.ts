@@ -6,6 +6,7 @@ import { writeJsonAtomicSync } from "../server/lib/atomicJson";
 import {
   assertUrlAllowed,
   downloadImageToDataUrl,
+  ensureThumbnail,
   isGlobalIpAddress,
   type HostLookup,
   type ImageFetch,
@@ -201,6 +202,27 @@ async function main() {
       assert.deepEqual(JSON.parse(fs.readFileSync(target, "utf-8")), { version: 2, nested: { ok: true } });
       assert.deepEqual(fs.readdirSync(dir), ["project.json"]);
     } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  await test("服务端为原图生成可复用 WebP 缩略图缓存", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "garment-canvas-thumbnails-"));
+    const originalDataDir = process.env.DATA_DIR;
+    try {
+      process.env.DATA_DIR = dir;
+      const uploads = path.join(dir, "uploads");
+      fs.mkdirSync(uploads, { recursive: true });
+      fs.writeFileSync(path.join(uploads, "source.png"), PNG);
+      const first = await ensureThumbnail("source.png");
+      const second = await ensureThumbnail("source.png");
+      assert.equal(first, second);
+      const bytes = fs.readFileSync(first);
+      assert.equal(bytes.subarray(0, 4).toString("ascii"), "RIFF");
+      assert.equal(bytes.subarray(8, 12).toString("ascii"), "WEBP");
+    } finally {
+      if (originalDataDir === undefined) delete process.env.DATA_DIR;
+      else process.env.DATA_DIR = originalDataDir;
       fs.rmSync(dir, { recursive: true, force: true });
     }
   });

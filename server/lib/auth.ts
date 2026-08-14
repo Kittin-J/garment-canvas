@@ -17,6 +17,11 @@ export interface AuthenticatedRequest extends Request {
 export const SESSION_COOKIE = "gc_session";
 export const SESSION_DAYS = 30;
 
+export type AuthenticationResult =
+  | { status: "authenticated"; user: AuthUser }
+  | { status: "replaced" }
+  | { status: "unauthenticated" };
+
 function sessionHash(token: string): string {
   return createHash("sha256").update(token).digest("hex");
 }
@@ -36,7 +41,16 @@ export async function createSession(userId: string): Promise<{ token: string; ex
   const now = new Date();
   const expiresAt = new Date(now.getTime() + SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
   await transaction(async (client) => {
+    // 串行化同一账号的并发登录，避免 sessions.user_id 唯一约束竞争。
+    const lockedUser = await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [userId]);
+    if (lockedUser.rowCount !== 1) throw new Error("用户不存在");
     // 单账号单设备：新登录成功后，旧设备会话立即失效。
+    await client.query(`
+      INSERT INTO revoked_sessions (token_hash, reason, revoked_at, expires_at)
+      SELECT token_hash, 'replaced', $2, expires_at FROM sessions WHERE user_id = $1
+      ON CONFLICT (token_hash) DO UPDATE
+        SET reason = excluded.reason, revoked_at = excluded.revoked_at, expires_at = excluded.expires_at
+    `, [userId, now.toISOString()]);
     await client.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
     await client.query(
       "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
@@ -70,9 +84,10 @@ export async function revokeUserSessions(userId: string): Promise<void> {
   await query("DELETE FROM sessions WHERE user_id = $1", [userId]);
 }
 
-export async function authenticatedUser(req: Request): Promise<AuthUser | undefined> {
+export async function authenticateRequest(req: Request): Promise<AuthenticationResult> {
   const token = cookieValue(req, SESSION_COOKIE);
-  if (!token) return undefined;
+  if (!token) return { status: "unauthenticated" };
+  const tokenHash = sessionHash(token);
   const now = new Date().toISOString();
   const row = await queryOne<{
     id: string; account_id: string; display_name: string; role: "admin" | "user"; must_change_password: number;
@@ -80,28 +95,51 @@ export async function authenticatedUser(req: Request): Promise<AuthUser | undefi
     SELECT u.id, u.account_id, u.display_name, u.role, u.must_change_password
     FROM sessions s JOIN users u ON u.id = s.user_id
     WHERE s.token_hash = $1 AND s.expires_at > $2 AND u.active = 1 AND u.deleted_at IS NULL
-  `, [sessionHash(token), now]);
-  if (!row) return undefined;
-  return {
-    id: row.id,
-    accountId: row.account_id,
-    displayName: row.display_name,
-    role: row.role,
-    mustChangePassword: row.must_change_password === 1,
+  `, [tokenHash, now]);
+  if (row) {
+    return {
+      status: "authenticated",
+      user: {
+        id: row.id,
+        accountId: row.account_id,
+        displayName: row.display_name,
+        role: row.role,
+        mustChangePassword: row.must_change_password === 1,
+      },
+    };
+  }
+  const revoked = await queryOne<{ reason: "replaced" }>(`
+    SELECT reason FROM revoked_sessions WHERE token_hash = $1 AND expires_at > $2
+  `, [tokenHash, now]);
+  return revoked?.reason === "replaced" ? { status: "replaced" } : { status: "unauthenticated" };
+}
+
+export async function authenticatedUser(req: Request): Promise<AuthUser | undefined> {
+  const result = await authenticateRequest(req);
+  return result.status === "authenticated" ? result.user : undefined;
+}
+
+function authenticateMiddleware() {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    void authenticateRequest(req).then((result) => {
+      if (result.status !== "authenticated") {
+        const replaced = result.status === "replaced";
+        // 401 响应不触碰 Cookie：旧请求可能晚于另一页签的新登录响应到达。
+        // 成功登录会覆盖旧 token，显式 logout 仍负责清除 Cookie。
+        res.status(401).json({
+          error: replaced ? "账号已在其他设备登录" : "请先登录",
+          code: replaced ? "SESSION_REPLACED" : "UNAUTHENTICATED",
+        });
+        return;
+      }
+      (req as AuthenticatedRequest).authUser = result.user;
+      next();
+    }).catch(next);
   };
 }
 
-export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  void authenticatedUser(req).then((user) => {
-    if (!user) {
-      clearSessionCookie(res);
-      res.status(401).json({ error: "请先登录", code: "UNAUTHENTICATED" });
-      return;
-    }
-    (req as AuthenticatedRequest).authUser = user;
-    next();
-  }).catch(next);
-}
+export const requireAuth = authenticateMiddleware();
+export const requireAuthForSessionCheck = authenticateMiddleware();
 
 export function requirePasswordChanged(req: Request, res: Response, next: NextFunction): void {
   const user = (req as AuthenticatedRequest).authUser;
@@ -126,5 +164,9 @@ export function requestUser(req: Request): AuthUser {
 }
 
 export async function pruneExpiredSessions(): Promise<void> {
-  await query("DELETE FROM sessions WHERE expires_at <= $1", [new Date().toISOString()]);
+  const now = new Date().toISOString();
+  await transaction(async (client) => {
+    await client.query("DELETE FROM sessions WHERE expires_at <= $1", [now]);
+    await client.query("DELETE FROM revoked_sessions WHERE expires_at <= $1", [now]);
+  });
 }

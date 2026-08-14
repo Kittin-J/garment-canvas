@@ -18,8 +18,9 @@ import type { WorkflowNodeData } from "../src/types/workflow";
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "garment-canvas-test-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
 
-const { createRun, getRun } = await import("../server/engine/runner");
+const { createRun, getRunForUser } = await import("../server/engine/runner");
 const { uploadsDir } = await import("../server/lib/fileStore");
+const TEST_OWNER_ID = "dag-test-owner";
 
 // 造一张真实存在的测试图片（落盘校验需要）。
 const SEED_PNG = Buffer.from(
@@ -251,7 +252,7 @@ async function main() {
       [imgNode("input", "/api/files/seed.png"), resultNode("out")],
       [edge("input", "out")],
     );
-    const run = await createRun(plan);
+    const run = await createRun(plan, TEST_OWNER_ID);
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => reject(new Error("run timeout")), 5000);
       run.emitter.on(
@@ -278,14 +279,15 @@ async function main() {
     const plan = buildExecutionPlan([resultNode("x")], []);
     let oldestRunId = "";
     for (let i = 0; i < 60; i++) {
-      const r = await createRun(plan);
+      const r = await createRun(plan, TEST_OWNER_ID);
       if (i === 0) oldestRunId = r.id;
       r.finished = true;
     }
-    await createRun(plan);
-    const probe = await createRun(plan);
-    assert.ok(getRun(probe.id), "新 Run 必须存在");
-    assert.strictEqual(getRun(oldestRunId), undefined, "最老的终态 Run 必须已被回收");
+    await createRun(plan, TEST_OWNER_ID);
+    const probe = await createRun(plan, TEST_OWNER_ID);
+    assert.ok(getRunForUser(probe.id, TEST_OWNER_ID), "新 Run 必须存在");
+    assert.strictEqual(getRunForUser(probe.id, "another-owner"), undefined, "其他用户不能读取 Run");
+    assert.strictEqual(getRunForUser(oldestRunId, TEST_OWNER_ID), undefined, "最老的终态 Run 必须已被回收");
   });
 
   console.log(`\n通过 ${passed} 项`);

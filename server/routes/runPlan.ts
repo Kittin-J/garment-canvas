@@ -7,7 +7,7 @@
 import { Router } from "express";
 import { WORKFLOW_SCHEMA_VERSION } from "../../src/types/workflow";
 import { assertPlanInputs, buildExecutionPlan, DagError } from "../engine/dag";
-import { createRun, getRun, type RunEvent } from "../engine/runner";
+import { createRun, getRunForUser, type RunEvent } from "../engine/runner";
 import { validateAndMigrateFlow, WorkflowValidationError } from "../lib/workflowSchema";
 import { requestUser } from "../lib/auth";
 import { asyncHandler } from "../lib/asyncHandler";
@@ -74,7 +74,7 @@ runPlanRouter.post("/", asyncHandler(async (req, res) => {
         return;
       }
     }
-    const run = await createRun(plan, {
+    const run = await createRun(plan, user.id, {
       userId: user.id,
       projectId: typeof projectId === "string" ? projectId : undefined,
       projectName: typeof projectName === "string" ? projectName : undefined,
@@ -97,7 +97,7 @@ runPlanRouter.post("/", asyncHandler(async (req, res) => {
 }));
 
 runPlanRouter.get("/:id/events", (req, res) => {
-  const run = getRun(req.params.id);
+  const run = getRunForUser(req.params.id, requestUser(req).id);
   if (!run) {
     res.status(404).json({ error: "run not found" });
     return;
@@ -141,7 +141,7 @@ runPlanRouter.get("/:id/events", (req, res) => {
 
 /** 刷新后先确认内存中的 Run 仍可恢复，避免对已丢失的 id 无限 SSE 重连。 */
 runPlanRouter.get("/:id", (req, res) => {
-  const run = getRun(req.params.id);
+  const run = getRunForUser(req.params.id, requestUser(req).id);
   if (!run) {
     res.status(404).json({ error: "run not found" });
     return;

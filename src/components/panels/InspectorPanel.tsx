@@ -1,6 +1,7 @@
 import { useFlowStore, type RecentResult } from "@/store/flowStore";
 import { NODE_SPECS, type ImageInputNodeData } from "@/types/workflow";
 import { inputClass, STATUS_TEXT } from "../nodes/NodeFrame";
+import { thumbnailImageUrl } from "@/lib/images";
 
 function PropertyEditor({ nodeId }: { nodeId: string }) {
   const node = useFlowStore((s) => s.nodes.find((n) => n.id === nodeId));
@@ -136,7 +137,9 @@ function ResultRecordDetail({ resultId }: { resultId: string }) {
 
       {record.image && (
         <img
-          src={record.image}
+          src={record.thumbnail ?? thumbnailImageUrl(record.image)}
+          loading="lazy"
+          decoding="async"
           alt={record.nodeLabel}
           className="w-full rounded-md border border-[#262626] object-cover"
         />

@@ -4,7 +4,7 @@
  */
 import { Router } from "express";
 import { MAX_REFERENCE_IMAGES, type ImageGenRequest } from "../../src/types/workflow";
-import { getProvider, ProviderError } from "../providers";
+import { getProvider, ProviderError, publicProviderErrorMessage } from "../providers";
 import { generateExactImages } from "../providers/exact";
 import { normalizeImageRef, persistImageRef } from "../lib/fileStore";
 import { nanoid } from "nanoid";
@@ -64,14 +64,18 @@ generateRouter.post("/", async (req, res) => {
     });
     res.json({ ...raw, images, runId });
   } catch (err) {
-    await failGenerationRecord(runId, err instanceof Error ? err.message : String(err), Date.now());
+    const message = err instanceof ProviderError
+      ? publicProviderErrorMessage(err)
+      : err instanceof Error ? err.message : String(err);
+    await failGenerationRecord(runId, message, Date.now());
     if (err instanceof ProviderError) {
       res.status(err.status && err.status >= 400 && err.status < 600 ? err.status : 502).json({
-        error: err.message,
+        error: message,
         providerId: err.providerId ?? providerId,
+        category: err.category,
       });
     } else {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      res.status(500).json({ error: message });
     }
   }
 });

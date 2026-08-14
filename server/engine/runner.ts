@@ -12,6 +12,7 @@ import {
   type NodeRunStatus,
 } from "../../src/types/workflow";
 import { getProvider } from "../providers";
+import { ProviderError, publicProviderErrorMessage } from "../providers/base";
 import { generateExactImages } from "../providers/exact";
 import { normalizeImageRef, persistImageRef } from "../lib/fileStore";
 import { buildRecolorPrompt } from "../../src/lib/colors";
@@ -29,13 +30,9 @@ export interface RunFailure {
   error: string;
 }
 
-export interface RunEvent {
+interface RunEventMeta {
   /** Run 内单调递增事件序号，供 SSE 重连去重。 */
   seq?: number;
-  type: "node-status" | "done" | "run-error";
-  nodeId?: string;
-  status?: NodeRunStatus;
-  images?: string[];
   error?: string;
   model?: string;
   /** 每张成功图片对应的实际提示词；顺序与 images 一致。 */
@@ -44,6 +41,29 @@ export interface RunEvent {
   startedAt?: number;
   finishedAt?: number;
 }
+
+export type RunEvent =
+  | (RunEventMeta & {
+      type: "node-status";
+      nodeId: string;
+      status: Exclude<NodeRunStatus, "success" | "error" | "idle">;
+      images?: never;
+    })
+  | (RunEventMeta & {
+      type: "node-status";
+      nodeId: string;
+      status: "success";
+      images: string[];
+    })
+  | (Omit<RunEventMeta, "error"> & {
+      type: "node-status";
+      nodeId: string;
+      status: "error";
+      error: string;
+      images?: never;
+    })
+  | { seq?: number; type: "done" }
+  | { seq?: number; type: "run-error"; nodeId?: string; error: string; finishedAt?: number };
 
 interface StepResult {
   images: string[];
@@ -61,6 +81,8 @@ const DEFAULT_PROMPTS: Partial<Record<NodeExecution["kind"], string>> = {
 
 interface Run {
   id: string;
+  /** 实时运行数据始终绑定发起用户；不从可选的记录上下文间接推断。 */
+  ownerId: string;
   plan: ExecutionPlan;
   emitter: EventEmitter;
   events: RunEvent[]; // 已完成事件（供 SSE 重放）
@@ -98,14 +120,24 @@ function pruneRuns(): void {
   }
 }
 
-export function getRun(id: string): Run | undefined {
-  return runs.get(id);
+export function getRunForUser(id: string, ownerId: string): Run | undefined {
+  const run = runs.get(id);
+  return run?.ownerId === ownerId ? run : undefined;
 }
 
-export async function createRun(plan: ExecutionPlan, recordContext?: GenerationRecordContext): Promise<Run> {
+export async function createRun(
+  plan: ExecutionPlan,
+  ownerId: string,
+  recordContext?: GenerationRecordContext,
+): Promise<Run> {
+  if (!ownerId.trim()) throw new Error("run ownerId is required");
+  if (recordContext && recordContext.userId !== ownerId) {
+    throw new Error("run ownerId must match recordContext.userId");
+  }
   pruneRuns();
   const run: Run = {
     id: nanoid(10),
+    ownerId,
     plan,
     emitter: new EventEmitter(),
     events: [],
@@ -119,8 +151,9 @@ export async function createRun(plan: ExecutionPlan, recordContext?: GenerationR
   // 异步启动，调用方先拿到 runId 再订阅事件
   setImmediate(() => {
     executeRun(run).catch(async (err) => {
-      if (run.recordContext) await failGenerationRecord(run.id, err instanceof Error ? err.message : String(err), Date.now());
-      emit(run, { type: "run-error", error: err instanceof Error ? err.message : String(err) });
+      const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
+      if (run.recordContext) await failGenerationRecord(run.id, message, Date.now());
+      emit(run, { type: "run-error", error: message });
     });
   });
   return run;
@@ -209,7 +242,9 @@ async function executeRun(run: Run): Promise<void> {
         finishedAt,
       });
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
+      const message = err instanceof ProviderError
+        ? publicProviderErrorMessage(err)
+        : err instanceof Error ? err.message : String(err);
       const finishedAt = Date.now();
       if (run.recordContext?.nodeId === step.nodeId) await failGenerationRecord(run.id, message, finishedAt);
       emit(run, {
@@ -287,7 +322,9 @@ async function executeStep(step: NodeExecution, inputImages: string[]): Promise<
             } catch (err) {
               failures.push({
                 prompt,
-                error: err instanceof Error ? err.message : String(err),
+                error: err instanceof ProviderError
+                  ? publicProviderErrorMessage(err)
+                  : err instanceof Error ? err.message : String(err),
               });
             }
           }
