@@ -90,6 +90,25 @@ async function main() {
     }
   });
 
+  await test("工作流 Schema 拒绝超过节点上限的参考图连接", () => {
+    const flow = legacyAiFlow();
+    for (let index = 0; index < 9; index += 1) {
+      flow.nodes.push({
+        id: `ref${index}`,
+        type: "image-input",
+        position: { x: 0, y: index * 10 },
+        data: {
+          kind: "image-input",
+          label: `ref${index}`,
+          status: "idle",
+          imageRole: "reference",
+        },
+      } as never);
+      flow.edges.push({ id: `e${index}`, source: `ref${index}`, target: "n1" } as never);
+    }
+    assert.throws(() => validateAndMigrateFlow(flow), /accepts at most 8 incoming image connections/);
+  });
+
   await test("干净检出也可迁移旧项目，并校验仓库内置模板", () => {
     // 不依赖被 .gitignore 排除的 data/projects；旧项目夹具必须由测试自己提供。
     const legacyProject = {
@@ -102,19 +121,24 @@ async function main() {
 
     const builtinRoot = "data/templates/builtin";
     const builtinFiles = fs.readdirSync(builtinRoot).filter((name) => name.endsWith(".json"));
-    assert.equal(builtinFiles.length, 5, "仓库应包含五份内置模板");
+    assert.equal(builtinFiles.length, 6, "仓库应包含六份内置模板");
     for (const file of builtinFiles) {
       const value = JSON.parse(fs.readFileSync(path.join(builtinRoot, file), "utf-8")) as { flow: unknown };
       assert.equal(validateAndMigrateFlow(value.flow).schemaVersion, 1, `${builtinRoot}/${file}`);
     }
-    const transfer = JSON.parse(
-      fs.readFileSync(path.join(builtinRoot, "builtin-style-transfer.json"), "utf-8"),
-    ) as { flow: { nodes: Array<{ id: string }>; edges: Array<{ source: string; target: string }> } };
-    assert.deepEqual(
-      transfer.flow.edges.filter((edge) => edge.target === "transfer").map((edge) => edge.source),
-      ["subject", "scene"],
-      "风格迁移必须按图1人物、图2场景的顺序传入参考图",
-    );
+    for (const [file, expected] of [
+      ["builtin-person-scene-transfer.json", ["subject", "scene"]],
+      ["builtin-pattern-style-transfer.json", ["pattern", "style"]],
+    ] as const) {
+      const transfer = JSON.parse(fs.readFileSync(path.join(builtinRoot, file), "utf-8")) as {
+        flow: { edges: Array<{ source: string; target: string }> };
+      };
+      assert.deepEqual(
+        transfer.flow.edges.filter((edge) => edge.target === "transfer").map((edge) => edge.source),
+        expected,
+        `${file} 必须按图1、图2顺序传入参考图`,
+      );
+    }
     const textToImage = JSON.parse(
       fs.readFileSync(path.join(builtinRoot, "builtin-text-to-image.json"), "utf-8"),
     ) as { flow: { nodes: Array<{ id: string; data: { prompt?: string } }>; edges: unknown[] } };
@@ -132,16 +156,19 @@ async function main() {
       fs.mkdirSync(builtinDir, { recursive: true });
       const existingPath = path.join(builtinDir, "builtin-sketch-recolor.json");
       fs.writeFileSync(existingPath, "preserve-existing", "utf-8");
+      fs.writeFileSync(path.join(builtinDir, "builtin-style-transfer.json"), "deprecated", "utf-8");
 
       ensureBuiltinTemplates();
 
       assert.equal(fs.readFileSync(existingPath, "utf-8"), "preserve-existing");
+      assert.equal(fs.existsSync(path.join(builtinDir, "builtin-style-transfer.json")), false);
       assert.deepEqual(
         fs.readdirSync(builtinDir).filter((name) => name.endsWith(".json")).sort(),
         [
+          "builtin-pattern-style-transfer.json",
+          "builtin-person-scene-transfer.json",
           "builtin-sketch-recolor.json",
           "builtin-sketch-upscale.json",
-          "builtin-style-transfer.json",
           "builtin-text-recolor.json",
           "builtin-text-to-image.json",
         ],

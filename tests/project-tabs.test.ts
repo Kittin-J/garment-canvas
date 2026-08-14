@@ -1,0 +1,126 @@
+import assert from "node:assert/strict";
+import type { Edge } from "@xyflow/react";
+import { useFlowStore, type FlowNode } from "../src/store/flowStore";
+
+let passed = 0;
+
+async function test(name: string, run: () => void | Promise<void>): Promise<void> {
+  try {
+    await run();
+    passed += 1;
+    console.log(`  ✓ ${name}`);
+  } catch (error) {
+    console.error(`  ✗ ${name}`);
+    throw error;
+  }
+}
+
+function imageNode(id: string, label: string): FlowNode {
+  return {
+    id,
+    type: "image-input",
+    position: { x: 0, y: 0 },
+    data: { kind: "image-input", label, status: "idle", imageRole: "default" },
+  };
+}
+
+console.log("项目多页签状态测试");
+
+const initial = useFlowStore.getState();
+const tabA = initial.activeTabId;
+initial.setProjectName("项目 A");
+initial.updateNodeData(initial.nodes[0].id, { label: "A 上传节点" });
+
+useFlowStore.getState().openFlowTab({
+  projectId: "project-b",
+  projectName: "项目 B",
+  nodes: [imageNode("b-node", "B 上传节点")],
+  edges: [] as Edge[],
+});
+const tabB = useFlowStore.getState().activeTabId;
+
+await test("切换页签保留各自画布与项目名称", () => {
+  assert.notEqual(tabA, tabB);
+  assert.equal(useFlowStore.getState().projectName, "项目 B");
+  assert.equal(useFlowStore.getState().nodes[0].id, "b-node");
+  useFlowStore.getState().switchTab(tabA);
+  assert.equal(useFlowStore.getState().projectName, "项目 A");
+  assert.equal(useFlowStore.getState().nodes[0].data.label, "A 上传节点");
+  useFlowStore.getState().switchTab(tabB);
+  assert.equal(useFlowStore.getState().nodes[0].data.label, "B 上传节点");
+});
+
+await test("重复打开同一项目复用已有页签且不覆盖未保存状态", () => {
+  useFlowStore.getState().updateNodeData("b-node", { label: "B 本地修改" });
+  const count = useFlowStore.getState().tabs.length;
+  useFlowStore.getState().openFlowTab({
+    projectId: "project-b",
+    projectName: "服务端旧名称",
+    nodes: [imageNode("replacement", "不应覆盖")],
+    edges: [],
+  });
+  assert.equal(useFlowStore.getState().tabs.length, count);
+  assert.equal(useFlowStore.getState().activeTabId, tabB);
+  assert.equal(useFlowStore.getState().nodes[0].data.label, "B 本地修改");
+});
+
+await test("后台任务可定向回写非当前页签", () => {
+  useFlowStore.getState().switchTab(tabA);
+  useFlowStore.getState().updateNodeDataInTab(tabB, "b-node", {
+    status: "success",
+    imageUrl: "/api/files/background-result.png",
+  });
+  assert.equal(useFlowStore.getState().projectName, "项目 A");
+  useFlowStore.getState().switchTab(tabB);
+  const node = useFlowStore.getState().nodes.find((candidate) => candidate.id === "b-node");
+  assert.equal(node?.data.status, "success");
+  assert.equal(node?.data.kind === "image-input" ? node.data.imageUrl : undefined, "/api/files/background-result.png");
+});
+
+await test("关闭当前页签后切换到相邻页签，至少保留一个画布", () => {
+  useFlowStore.getState().closeTab(tabB);
+  assert.equal(useFlowStore.getState().activeTabId, tabA);
+  assert.equal(useFlowStore.getState().tabs.length, 1);
+  useFlowStore.getState().closeTab(tabA);
+  assert.equal(useFlowStore.getState().tabs.length, 1);
+  assert.ok(useFlowStore.getState().activeTabId);
+  assert.equal(useFlowStore.getState().nodes.length, 1);
+});
+
+await test("保存期间继续编辑会排队并最终写入最新版本", async () => {
+  const requests: Array<{ body: string; resolve: (response: Response) => void }> = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (_input, init) =>
+    new Promise<Response>((resolve) => {
+      requests.push({ body: String(init?.body ?? ""), resolve });
+    });
+
+  try {
+    const before = useFlowStore.getState();
+    const firstSave = before.saveProject();
+    assert.equal(requests.length, 1);
+
+    useFlowStore.getState().setProjectName("保存期间的新名称");
+    const secondSave = useFlowStore.getState().saveProject();
+    assert.equal(requests.length, 1, "第二次保存应等待当前请求完成");
+
+    requests[0].resolve(Response.json({ ok: true }));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(requests.length, 2, "旧快照完成后应自动发送最新快照");
+
+    const latestPayload = JSON.parse(requests[1].body) as { name: string };
+    assert.equal(latestPayload.name, "保存期间的新名称");
+    requests[1].resolve(Response.json({ ok: true }));
+    await Promise.all([firstSave, secondSave]);
+
+    const after = useFlowStore.getState();
+    assert.equal(after.dirty, false);
+    assert.equal(after.saveState, "saved");
+    assert.equal(after.savedRevision, after.revision);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+console.log(`\n通过 ${passed} 项`);

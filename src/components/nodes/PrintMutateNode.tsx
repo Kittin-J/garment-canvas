@@ -38,6 +38,7 @@ export function PrintMutateNode({ id, data, selected }: NodeProps<Node<PrintMuta
             placeholder="可选：如「保持花卉元素，换一种排列」"
             className={`${inputClass} resize-none`}
           />
+          <span className="text-[9px] text-neutral-600">可连接 1–8 张参考图，按连线顺序传入</span>
         </label>
         <RunButton running={running} onClick={() => void runNode(id)} label="印花裂变" />
         {running && <Developing />}

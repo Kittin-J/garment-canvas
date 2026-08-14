@@ -10,6 +10,7 @@ import type {
   WorkflowNodeData,
 } from "../../src/types/workflow";
 import { NODE_SPECS } from "../../src/types/workflow";
+import { MAX_REFERENCE_IMAGES } from "../../src/types/workflow";
 
 /** React Flow 节点/边的最小结构（前端传入） */
 export interface FlowNode {
@@ -42,6 +43,9 @@ export function assertPlanInputs(plan: ExecutionPlan, edges: FlowEdge[]): void {
     const usableImages = (step.upstream ?? []).flatMap((upstream) =>
       executingNodeIds.has(upstream.nodeId) ? ["__runtime_output__"] : upstream.images,
     );
+    if (usableImages.length > MAX_REFERENCE_IMAGES) {
+      throw new DagError(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
+    }
     if (step.kind === "sketch-to-render" && usableImages.length === 0) {
       // sketch-to-render 同时承担文生款式，只有 prompt 时允许无图片执行。
       const prompt = typeof step.params.prompt === "string" ? step.params.prompt.trim() : "";

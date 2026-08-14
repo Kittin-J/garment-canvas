@@ -25,6 +25,7 @@ export function AiModifyNode({ id, data, selected }: NodeProps<Node<AiModifyNode
             placeholder="描述需要如何组合、迁移或修改参考图"
             className={`${inputClass} resize-none`}
           />
+          <span className="text-[9px] text-neutral-600">可连接 1–8 张参考图，按连线顺序传入</span>
         </label>
         <div className="grid grid-cols-2 gap-2">
           <label className="block space-y-1">

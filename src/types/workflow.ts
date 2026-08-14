@@ -22,6 +22,9 @@ export type NodeRunStatus =
   | "success"
   | "error";
 
+/** OpenAI Images Edit 最多支持 16 图；产品端为控制成本与上传体积限制为 8 图。 */
+export const MAX_REFERENCE_IMAGES = 8;
+
 // ---------- 节点数据（存 React Flow node.data）----------
 export interface BaseNodeData {
   label: string;
@@ -139,7 +142,7 @@ export interface PersistedWorkflow {
 /** 所有 AI 调用必须经此接口，禁止业务代码直连第三方 SDK */
 export interface ImageGenRequest {
   prompt: string;
-  /** 参考图（dataURL 数组），image2 图改图/面料替换时必传 */
+  /** 参考图（dataURL 数组，按连线顺序，最多 8 张） */
   referenceImages?: string[];
   aspectRatio?: string;
   batchSize?: number;
@@ -245,7 +248,7 @@ export const NODE_SPECS: Record<NodeKind, NodeSpec> = {
     title: "草图→效果图",
     description: "AI 将线稿渲染为服装效果图",
     providerId: "gpt-image-2",
-    inputs: 1,
+    inputs: MAX_REFERENCE_IMAGES,
     outputs: "images",
   },
   "ai-modify": {
@@ -253,7 +256,7 @@ export const NODE_SPECS: Record<NodeKind, NodeSpec> = {
     title: "AI 改款",
     description: "gpt-image-2 改领型/袖型/长度/细节",
     providerId: "gpt-image-2",
-    inputs: 1,
+    inputs: MAX_REFERENCE_IMAGES,
     outputs: "images",
   },
   "fabric-recolor": {
@@ -261,7 +264,7 @@ export const NODE_SPECS: Record<NodeKind, NodeSpec> = {
     title: "面料/配色替换",
     description: "gpt-image-2 替换面料纹理与配色",
     providerId: "gpt-image-2",
-    inputs: 2,
+    inputs: MAX_REFERENCE_IMAGES,
     outputs: "images",
   },
   upscale: {
@@ -277,7 +280,7 @@ export const NODE_SPECS: Record<NodeKind, NodeSpec> = {
     title: "印花提取",
     description: "gpt-image-2 从服装上抠出印花，平铺展开存素材",
     providerId: "gpt-image-2",
-    inputs: 1,
+    inputs: MAX_REFERENCE_IMAGES,
     outputs: "images",
   },
   "print-mutate": {
@@ -285,7 +288,7 @@ export const NODE_SPECS: Record<NodeKind, NodeSpec> = {
     title: "印花裂变",
     description: "gpt-image-2 基于印花生成 1~8 张风格一致的变体",
     providerId: "gpt-image-2",
-    inputs: 1,
+    inputs: MAX_REFERENCE_IMAGES,
     outputs: "images",
   },
   result: {

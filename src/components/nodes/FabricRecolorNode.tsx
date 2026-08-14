@@ -92,7 +92,7 @@ export function FabricRecolorNode({
       />
       <NodeFrame nodeId={id} title={data.label} status={data.status} error={data.error} selected={selected}>
         <div className="rounded-md border border-[#262626] bg-[#0f0f0f] px-2 py-1.5 text-[10px] leading-relaxed text-neutral-500">
-          左侧输入口：上 = 款式图，下 = 面料图（可选）
+          左侧输入口：上 = 款式/补充参考，下 = 面料参考；总计最多 8 图
         </div>
 
         {/* 已选配色（最多 3 色，点击移除） */}

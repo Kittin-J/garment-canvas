@@ -44,7 +44,26 @@ export interface RecentResult {
 
 type SaveState = "idle" | "saving" | "saved" | "error";
 
+export interface ProjectTab {
+  id: string;
+  projectId: string;
+  projectName: string;
+  nodes: FlowNode[];
+  edges: Edge[];
+  selectedNodeId: string | null;
+  selectedResultId: string | null;
+  compareIds: string[];
+  saveState: SaveState;
+  revision: number;
+  savedRevision: number;
+  dirty: boolean;
+  documentEpoch: number;
+}
+
 interface FlowState {
+  /** 应用内项目页签；当前页签的实时内容仍映射到下方兼容字段。 */
+  tabs: ProjectTab[];
+  activeTabId: string;
   projectId: string;
   projectName: string;
   nodes: FlowNode[];
@@ -68,6 +87,16 @@ interface FlowState {
   /** 每次整体载入画布递增，用来隔离旧文档的异步响应。 */
   documentEpoch: number;
 
+  switchTab: (tabId: string) => void;
+  closeTab: (tabId: string) => void;
+  openFlowTab: (opts: {
+    projectId: string;
+    projectName: string;
+    nodes: FlowNode[];
+    edges: Edge[];
+    markDirty?: boolean;
+  }) => void;
+  createBlankTab: () => void;
   setProjectName: (name: string) => void;
   setSelectedNodeId: (id: string | null) => void;
   setSelectedResultId: (id: string | null) => void;
@@ -83,6 +112,7 @@ interface FlowState {
   /** 复制/粘贴等调用方已有完整节点时，仍通过此入口维护 revision/dirty。 */
   addExistingNode: (node: FlowNode) => void;
   updateNodeData: (id: string, patch: Record<string, unknown>) => void;
+  updateNodeDataInTab: (tabId: string, id: string, patch: Record<string, unknown>) => void;
   setNodeStatus: (id: string, status: NodeRunStatus, error?: string) => void;
   runNode: (id: string) => Promise<void>;
   saveProject: () => Promise<void>;
@@ -103,10 +133,13 @@ interface FlowState {
   redo: () => void;
 }
 
-/** 只允许最新保存请求更新保存状态，避免乱序响应覆盖新状态。 */
-let latestSaveRequestId = 0;
-let saveInFlight: Promise<void> | null = null;
-let saveQueued = false;
+interface TabSaveQueue {
+  promise: Promise<void>;
+  queued: boolean;
+}
+
+/** 每个页签独立串行保存；切页不会使旧页签的保存响应失效。 */
+const saveQueueByTab = new Map<string, TabSaveQueue>();
 
 /** 仅屏蔽这一小段运行态/UI 写入，不暂停用户在异步任务期间产生的文档历史。 */
 function withoutTemporalTracking(run: () => void): void {
@@ -192,17 +225,184 @@ function nodeOutputImages(data: WorkflowNodeData): string[] {
   return data.outputImages ?? [];
 }
 
-const starterNode: FlowNode = {
-  id: nanoid(8),
-  type: "image-input",
-  position: { x: 0, y: 0 },
-  data: defaultNodeData("image-input"),
-};
+function makeStarterNode(): FlowNode {
+  return {
+    id: nanoid(8),
+    type: "image-input",
+    position: { x: 0, y: 0 },
+    data: defaultNodeData("image-input"),
+  };
+}
+
+type ActiveDocumentState = Pick<
+  FlowState,
+  | "projectId"
+  | "projectName"
+  | "nodes"
+  | "edges"
+  | "selectedNodeId"
+  | "selectedResultId"
+  | "compareIds"
+  | "saveState"
+  | "revision"
+  | "savedRevision"
+  | "dirty"
+  | "documentEpoch"
+>;
+
+function snapshotActiveTab(state: FlowState): ProjectTab {
+  return {
+    id: state.activeTabId,
+    projectId: state.projectId,
+    projectName: state.projectName,
+    nodes: state.nodes,
+    edges: state.edges,
+    selectedNodeId: state.selectedNodeId,
+    selectedResultId: state.selectedResultId,
+    compareIds: state.compareIds,
+    saveState: state.saveState,
+    revision: state.revision,
+    savedRevision: state.savedRevision,
+    dirty: state.dirty,
+    documentEpoch: state.documentEpoch,
+  };
+}
+
+function activeFields(tab: ProjectTab): ActiveDocumentState {
+  return {
+    projectId: tab.projectId,
+    projectName: tab.projectName,
+    nodes: tab.nodes,
+    edges: tab.edges,
+    selectedNodeId: tab.selectedNodeId,
+    selectedResultId: tab.selectedResultId,
+    compareIds: tab.compareIds,
+    saveState: tab.saveState,
+    revision: tab.revision,
+    savedRevision: tab.savedRevision,
+    dirty: tab.dirty,
+    documentEpoch: tab.documentEpoch,
+  };
+}
+
+function replaceTab(tabs: ProjectTab[], tab: ProjectTab): ProjectTab[] {
+  return tabs.map((candidate) => (candidate.id === tab.id ? tab : candidate));
+}
+
+function documentForTab(state: FlowState, tabId: string): ProjectTab | undefined {
+  return tabId === state.activeTabId
+    ? snapshotActiveTab(state)
+    : state.tabs.find((tab) => tab.id === tabId);
+}
+
+function patchTab(
+  set: (partial: Partial<FlowState> | ((state: FlowState) => Partial<FlowState>)) => unknown,
+  tabId: string,
+  patch: Partial<ProjectTab> | ((tab: ProjectTab) => Partial<ProjectTab>),
+): void {
+  set((state) => {
+    const tab = documentForTab(state, tabId);
+    if (!tab) return {};
+    const changes = typeof patch === "function" ? patch(tab) : patch;
+    const next = { ...tab, ...changes };
+    if (state.activeTabId === tabId) return changes;
+    return { tabs: replaceTab(state.tabs, next) };
+  });
+}
+
+function newTab(opts?: {
+  projectId?: string;
+  projectName?: string;
+  nodes?: FlowNode[];
+  edges?: Edge[];
+  markDirty?: boolean;
+}): ProjectTab {
+  const markDirty = opts?.markDirty ?? false;
+  return {
+    id: nanoid(10),
+    projectId: opts?.projectId ?? nanoid(10),
+    projectName: opts?.projectName ?? "未命名设计项目",
+    nodes: opts?.nodes ?? [makeStarterNode()],
+    edges: opts?.edges ?? [],
+    selectedNodeId: null,
+    selectedResultId: null,
+    compareIds: [],
+    saveState: "idle",
+    revision: markDirty ? 1 : 0,
+    savedRevision: 0,
+    dirty: markDirty,
+    documentEpoch: 0,
+  };
+}
+
+/** 在目标页签内更新节点；目标为当前页签时同步兼容字段。 */
+function updateTabNodes(
+  set: (partial: Partial<FlowState> | ((state: FlowState) => Partial<FlowState>)) => unknown,
+  tabId: string,
+  update: (nodes: FlowNode[]) => FlowNode[],
+  opts?: { markDirty?: boolean },
+): void {
+  patchTab(set, tabId, (tab) => {
+    const nodes = update(tab.nodes);
+    if (nodes === tab.nodes) return {};
+    return {
+      nodes,
+      revision: opts?.markDirty ? tab.revision + 1 : tab.revision,
+      dirty: opts?.markDirty ? true : tab.dirty,
+      saveState: opts?.markDirty && tab.saveState !== "saving" ? "idle" : tab.saveState,
+    };
+  });
+}
 
 type FlowTemporalState = Pick<FlowState, "nodes" | "edges">;
 
 /** 最近生成持久化（localStorage）：刷新/重开浏览器不丢 */
 const RECENT_STORAGE_KEY = "garment-canvas-recent-results";
+const TAB_SESSION_STORAGE_KEY = "garment-canvas-project-tabs";
+
+function loadTabSession(): { tabs: ProjectTab[]; activeTabId: string } | undefined {
+  try {
+    const raw = window.sessionStorage.getItem(TAB_SESSION_STORAGE_KEY);
+    if (!raw) return undefined;
+    const parsed = JSON.parse(raw) as { tabs?: unknown; activeTabId?: unknown };
+    if (!Array.isArray(parsed.tabs) || typeof parsed.activeTabId !== "string") return undefined;
+    const tabs = parsed.tabs.flatMap((value): ProjectTab[] => {
+      if (!value || typeof value !== "object") return [];
+      const tab = value as Partial<ProjectTab>;
+      const valid =
+        typeof tab.id === "string" &&
+        typeof tab.projectId === "string" &&
+        typeof tab.projectName === "string" &&
+        Array.isArray(tab.nodes) &&
+        Array.isArray(tab.edges);
+      if (!valid) return [];
+      return [{
+        ...(tab as ProjectTab),
+        // 页面刷新会中断原保存请求，不能恢复一个已不存在的 in-flight 状态。
+        saveState:
+          tab.saveState === "saved" || tab.saveState === "error"
+            ? tab.saveState
+            : "idle",
+      }];
+    });
+    if (tabs.length === 0 || !tabs.some((tab) => tab.id === parsed.activeTabId)) return undefined;
+    return { tabs, activeTabId: parsed.activeTabId };
+  } catch {
+    return undefined;
+  }
+}
+
+function persistTabSession(state: FlowState): void {
+  try {
+    const current = snapshotActiveTab(state);
+    window.sessionStorage.setItem(
+      TAB_SESSION_STORAGE_KEY,
+      JSON.stringify({ tabs: replaceTab(state.tabs, current), activeTabId: state.activeTabId }),
+    );
+  } catch {
+    // 浏览器会话存储不可用或容量不足时退化为仅本次页面生命周期可用。
+  }
+}
 
 function loadRecentResults(): RecentResult[] {
   try {
@@ -395,21 +595,86 @@ function consumeRunEvents(
 
 export const useFlowStore = create<FlowState>()(
   temporal<FlowState, [], [], FlowTemporalState>(
-    (set, get) => ({
-      projectId: nanoid(10),
-      projectName: "未命名设计项目",
-      nodes: [starterNode],
-      edges: [],
-      selectedNodeId: null,
-      selectedResultId: null,
+    (set, get) => {
+      const restored = typeof window === "undefined" ? undefined : loadTabSession();
+      const initialTab =
+        restored?.tabs.find((tab) => tab.id === restored.activeTabId) ?? newTab();
+      return ({
+      tabs: restored?.tabs ?? [initialTab],
+      activeTabId: initialTab.id,
+      ...activeFields(initialTab),
       recentResults: typeof window === "undefined" ? [] : loadRecentResults(),
-      compareIds: [],
       viewer: null,
-      saveState: "idle",
-      revision: 0,
-      savedRevision: 0,
-      dirty: false,
-      documentEpoch: 0,
+
+      switchTab: (tabId) => {
+        const state = get();
+        if (tabId === state.activeTabId) return;
+        const target = state.tabs.find((tab) => tab.id === tabId);
+        if (!target) return;
+        const current = snapshotActiveTab(state);
+        set({
+          tabs: replaceTab(state.tabs, current),
+          activeTabId: target.id,
+          ...activeFields(target),
+          viewer: null,
+        });
+        useFlowStore.temporal.getState().clear();
+      },
+      closeTab: (tabId) => {
+        const state = get();
+        const current = snapshotActiveTab(state);
+        const syncedTabs = replaceTab(state.tabs, current);
+        const closingIndex = syncedTabs.findIndex((tab) => tab.id === tabId);
+        if (closingIndex < 0) return;
+        const remaining = syncedTabs.filter((tab) => tab.id !== tabId);
+        if (remaining.length === 0) remaining.push(newTab());
+        if (tabId !== state.activeTabId) {
+          set({ tabs: remaining });
+          return;
+        }
+        const target = remaining[Math.min(closingIndex, remaining.length - 1)];
+        set({
+          tabs: remaining,
+          activeTabId: target.id,
+          ...activeFields(target),
+          viewer: null,
+        });
+        useFlowStore.temporal.getState().clear();
+      },
+      openFlowTab: ({ projectId, projectName, nodes, edges, markDirty = false }) => {
+        const state = get();
+        const current = snapshotActiveTab(state);
+        const syncedTabs = replaceTab(state.tabs, current);
+        const existing = syncedTabs.find((tab) => tab.projectId === projectId);
+        if (existing) {
+          set({
+            tabs: syncedTabs,
+            activeTabId: existing.id,
+            ...activeFields(existing),
+            viewer: null,
+          });
+        } else {
+          const tab = newTab({ projectId, projectName, nodes, edges, markDirty });
+          set({
+            tabs: [...syncedTabs, tab],
+            activeTabId: tab.id,
+            ...activeFields(tab),
+            viewer: null,
+          });
+        }
+        useFlowStore.temporal.getState().clear();
+      },
+      createBlankTab: () => {
+        const tab = newTab();
+        const state = get();
+        set({
+          tabs: [...replaceTab(state.tabs, snapshotActiveTab(state)), tab],
+          activeTabId: tab.id,
+          ...activeFields(tab),
+          viewer: null,
+        });
+        useFlowStore.temporal.getState().clear();
+      },
 
       setProjectName: (name) => {
         if (name === get().projectName) return;
@@ -486,6 +751,21 @@ export const useFlowStore = create<FlowState>()(
           ),
         });
       },
+      updateNodeDataInTab: (tabId, id, patch) => {
+        updateTabNodes(
+          set,
+          tabId,
+          (nodes) => {
+            if (!nodes.some((node) => node.id === id)) return nodes;
+            return nodes.map((node) =>
+              node.id === id
+                ? { ...node, data: { ...node.data, ...patch } as WorkflowNodeData }
+                : node,
+            );
+          },
+          { markDirty: true },
+        );
+      },
 
       setNodeStatus: (id, status, error) =>
         (() => {
@@ -508,14 +788,11 @@ export const useFlowStore = create<FlowState>()(
 
         const nodesSnapshot = initialState.nodes;
         const edgesSnapshot = initialState.edges;
-        const documentEpoch = initialState.documentEpoch;
+        const tabId = initialState.activeTabId;
         const localStartedAt = Date.now();
         const recordId = nanoid(8);
         const releaseNonUndoableRun = beginNonUndoableRun(`run:${id}`);
         let terminalRecorded = false;
-
-        const isCurrentDocument = () =>
-          get().documentEpoch === documentEpoch && get().nodes.some((candidate) => candidate.id === id);
 
         // 先记录用户的这次生成操作，再请求后端；即使请求失败或页面刷新也不会丢记录。
         const initialRecord: RecentResult = {
@@ -539,7 +816,13 @@ export const useFlowStore = create<FlowState>()(
         });
 
         try {
-          get().setNodeStatus(id, "queued", undefined);
+          updateTabNodes(set, tabId, (nodes) =>
+            nodes.map((candidate) =>
+              candidate.id === id
+                ? { ...candidate, data: { ...candidate.data, status: "queued", error: undefined } }
+                : candidate,
+            ),
+          );
           const response = await fetch("/api/run-plan", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -570,14 +853,22 @@ export const useFlowStore = create<FlowState>()(
               recentResults: applyRunEventToRecentResults(state.recentResults, recordId, event),
             }));
             if (event.status === "running" || event.status === "queued") {
-              if (isCurrentDocument()) get().setNodeStatus(id, event.status, event.error);
+              updateTabNodes(set, tabId, (nodes) =>
+                nodes.map((candidate) =>
+                  candidate.id === id
+                    ? { ...candidate, data: { ...candidate.data, status: event.status!, error: event.error } }
+                    : candidate,
+                ),
+              );
               return;
             }
             if (event.status !== "success" && event.status !== "error") return;
             terminalRecorded = true;
-            if (isCurrentDocument() && event.images?.length) {
-              markDocumentChanged(set, {
-                nodes: get().nodes.map((candidate) =>
+            updateTabNodes(
+              set,
+              tabId,
+              (nodes) =>
+                nodes.map((candidate) =>
                   candidate.id === id
                     ? {
                         ...candidate,
@@ -590,9 +881,8 @@ export const useFlowStore = create<FlowState>()(
                       }
                     : candidate,
                 ),
-              });
-            }
-            if (isCurrentDocument()) get().setNodeStatus(id, event.status, event.error);
+              { markDirty: Boolean(event.images?.length) },
+            );
           });
         } catch (err) {
           if (!terminalRecorded) {
@@ -608,7 +898,13 @@ export const useFlowStore = create<FlowState>()(
             set((state) => ({
               recentResults: applyRunEventToRecentResults(state.recentResults, recordId, event),
             }));
-            if (isCurrentDocument()) get().setNodeStatus(id, "error", message);
+            updateTabNodes(set, tabId, (nodes) =>
+              nodes.map((candidate) =>
+                candidate.id === id
+                  ? { ...candidate, data: { ...candidate.data, status: "error", error: message } }
+                  : candidate,
+              ),
+            );
           }
         } finally {
           releaseNonUndoableRun();
@@ -616,61 +912,58 @@ export const useFlowStore = create<FlowState>()(
       },
 
       saveProject: async () => {
-        if (saveInFlight) {
-          saveQueued = true;
-          await saveInFlight;
-          return;
+        const tabId = get().activeTabId;
+        const existing = saveQueueByTab.get(tabId);
+        if (existing) {
+          existing.queued = true;
+          return existing.promise;
         }
-        const drainSaves = async () => {
+
+        const queue: TabSaveQueue = { promise: Promise.resolve(), queued: false };
+        queue.promise = (async () => {
           do {
-            saveQueued = false;
-            const { projectId, projectName, nodes, edges, revision, documentEpoch } = get();
-            const requestId = ++latestSaveRequestId;
-            set({ saveState: "saving" });
+            queue.queued = false;
+            const snapshot = documentForTab(get(), tabId);
+            if (!snapshot) return;
+            patchTab(set, tabId, { saveState: "saving" });
             try {
               const res = await fetch("/api/projects", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
                 body: JSON.stringify({
-                  id: projectId,
-                  name: projectName,
-                  flow: { schemaVersion: WORKFLOW_SCHEMA_VERSION, nodes, edges },
+                  id: snapshot.projectId,
+                  name: snapshot.projectName,
+                  flow: {
+                    schemaVersion: WORKFLOW_SCHEMA_VERSION,
+                    nodes: snapshot.nodes,
+                    edges: snapshot.edges,
+                  },
                 }),
               });
               if (!res.ok) throw new Error(`HTTP ${res.status}`);
-              set((state) => {
-                if (
-                  requestId !== latestSaveRequestId ||
-                  state.documentEpoch !== documentEpoch ||
-                  state.projectId !== projectId
-                ) return {};
-                const savedRevision = Math.max(state.savedRevision, revision);
-                const clean = state.revision === revision;
-                if (!clean) saveQueued = true;
+              patchTab(set, tabId, (latest) => {
+                const clean = latest.revision === snapshot.revision;
+                if (!clean) queue.queued = true;
                 return {
-                  savedRevision,
+                  savedRevision: Math.max(latest.savedRevision, snapshot.revision),
                   dirty: !clean,
                   saveState: clean ? "saved" : "saving",
                 };
               });
             } catch {
-              set((state) => {
-                if (
-                  requestId !== latestSaveRequestId ||
-                  state.documentEpoch !== documentEpoch ||
-                  state.projectId !== projectId
-                ) return {};
-                return { saveState: "error", dirty: state.revision !== state.savedRevision };
-              });
-              saveQueued = false;
+              queue.queued = false;
+              patchTab(set, tabId, (latest) => ({
+                saveState: "error",
+                dirty: latest.revision !== latest.savedRevision,
+              }));
             }
-          } while (saveQueued);
-        };
-        saveInFlight = drainSaves();
+          } while (queue.queued);
+        })();
+        saveQueueByTab.set(tabId, queue);
         try {
-          await saveInFlight;
+          await queue.promise;
         } finally {
-          saveInFlight = null;
+          if (saveQueueByTab.get(tabId) === queue) saveQueueByTab.delete(tabId);
         }
       },
 
@@ -738,8 +1031,9 @@ export const useFlowStore = create<FlowState>()(
       },
 
       loadFlow: ({ projectId, projectName, nodes, edges, markDirty = false }) => {
-        latestSaveRequestId += 1;
-        set({
+        const state = get();
+        const tab: ProjectTab = {
+          ...snapshotActiveTab(state),
           projectId,
           projectName,
           nodes,
@@ -747,17 +1041,18 @@ export const useFlowStore = create<FlowState>()(
           selectedNodeId: null,
           selectedResultId: null,
           compareIds: [],
-          viewer: null,
           saveState: "idle",
           revision: markDirty ? 1 : 0,
           savedRevision: 0,
           dirty: markDirty,
-          documentEpoch: get().documentEpoch + 1,
-        });
+          documentEpoch: state.documentEpoch + 1,
+        };
+        set({ tabs: replaceTab(state.tabs, tab), ...activeFields(tab), viewer: null });
         // 清空撤销历史，避免撤销回上一个项目的画布状态
         useFlowStore.temporal.getState().clear();
       },
-    }),
+    });
+    },
     {
       limit: 50,
       partialize: (state): FlowTemporalState => ({
@@ -776,6 +1071,46 @@ if (typeof window !== "undefined") {
     if (state.recentResults !== lastRecent) {
       lastRecent = state.recentResults;
       persistRecentResults(lastRecent);
+    }
+  });
+
+  let lastTabSessionJson = "";
+  useFlowStore.subscribe((state) => {
+    const current = snapshotActiveTab(state);
+    const sessionJson = JSON.stringify({
+      tabs: replaceTab(state.tabs, current),
+      activeTabId: state.activeTabId,
+    });
+    if (sessionJson === lastTabSessionJson) return;
+    lastTabSessionJson = sessionJson;
+    persistTabSession(state);
+  });
+  persistTabSession(useFlowStore.getState());
+
+  // 当前页签内容持续同步进 tabs，保证非激活页签始终是完整快照。
+  let lastActiveSnapshot = snapshotActiveTab(useFlowStore.getState());
+  useFlowStore.subscribe((state) => {
+    const snapshot = snapshotActiveTab(state);
+    if (
+      snapshot.id !== lastActiveSnapshot.id ||
+      snapshot.projectId !== lastActiveSnapshot.projectId ||
+      snapshot.projectName !== lastActiveSnapshot.projectName ||
+      snapshot.nodes !== lastActiveSnapshot.nodes ||
+      snapshot.edges !== lastActiveSnapshot.edges ||
+      snapshot.selectedNodeId !== lastActiveSnapshot.selectedNodeId ||
+      snapshot.selectedResultId !== lastActiveSnapshot.selectedResultId ||
+      snapshot.compareIds !== lastActiveSnapshot.compareIds ||
+      snapshot.saveState !== lastActiveSnapshot.saveState ||
+      snapshot.revision !== lastActiveSnapshot.revision ||
+      snapshot.savedRevision !== lastActiveSnapshot.savedRevision ||
+      snapshot.dirty !== lastActiveSnapshot.dirty ||
+      snapshot.documentEpoch !== lastActiveSnapshot.documentEpoch
+    ) {
+      lastActiveSnapshot = snapshot;
+      const current = state.tabs.find((tab) => tab.id === snapshot.id);
+      if (current && current !== snapshot) {
+        useFlowStore.setState({ tabs: replaceTab(state.tabs, snapshot) });
+      }
     }
   });
 
@@ -800,6 +1135,30 @@ if (typeof window !== "undefined") {
           useFlowStore.setState((state) => ({
             recentResults: applyRunEventToRecentResults(state.recentResults, record.id, event),
           }));
+          const tabId = useFlowStore
+            .getState()
+            .tabs.find((tab) => tab.projectId === record.projectId)?.id;
+          if (tabId && event.status) {
+            updateTabNodes(
+              useFlowStore.setState,
+              tabId,
+              (nodes) =>
+                nodes.map((node) =>
+                  node.id === record.nodeId
+                    ? {
+                        ...node,
+                        data: {
+                          ...node.data,
+                          ...(event.images?.length ? { outputImages: event.images } : {}),
+                          status: event.status!,
+                          error: event.error,
+                        } as WorkflowNodeData,
+                      }
+                    : node,
+                ),
+              { markDirty: event.status === "success" && Boolean(event.images?.length) },
+            );
+          }
           if (event.status === "success" || event.status === "error") terminalRecorded = true;
         });
       } catch (error) {
@@ -815,6 +1174,18 @@ if (typeof window !== "undefined") {
             finishedAt: Date.now(),
           }),
         }));
+        const tabId = useFlowStore
+          .getState()
+          .tabs.find((tab) => tab.projectId === record.projectId)?.id;
+        if (tabId) {
+          updateTabNodes(useFlowStore.setState, tabId, (nodes) =>
+            nodes.map((node) =>
+              node.id === record.nodeId
+                ? { ...node, data: { ...node.data, status: "error", error: message } }
+                : node,
+            ),
+          );
+        }
       }
     })();
   }

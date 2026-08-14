@@ -3,7 +3,7 @@
  * 有参考图调 provider.edit，无参考图调 provider.generate。
  */
 import { Router } from "express";
-import type { ImageGenRequest } from "../../src/types/workflow";
+import { MAX_REFERENCE_IMAGES, type ImageGenRequest } from "../../src/types/workflow";
 import { getProvider, ProviderError } from "../providers";
 import { normalizeImageRef, persistImageRef } from "../lib/fileStore";
 
@@ -16,6 +16,10 @@ generateRouter.post("/", async (req, res) => {
   };
   if (!providerId || !request?.prompt) {
     res.status(400).json({ error: "providerId and request.prompt are required" });
+    return;
+  }
+  if (request.referenceImages && request.referenceImages.length > MAX_REFERENCE_IMAGES) {
+    res.status(400).json({ error: `referenceImages must contain at most ${MAX_REFERENCE_IMAGES} images` });
     return;
   }
   try {

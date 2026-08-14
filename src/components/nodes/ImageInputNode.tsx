@@ -26,8 +26,7 @@ function readAsDataURL(file: File): Promise<string> {
 }
 
 export function ImageInputNode({ id, data, selected }: NodeProps<Node<ImageInputNodeData>>) {
-  const updateNodeData = useFlowStore((s) => s.updateNodeData);
-  const setNodeStatus = useFlowStore((s) => s.setNodeStatus);
+  const updateNodeDataInTab = useFlowStore((s) => s.updateNodeDataInTab);
   const openViewer = useFlowStore((s) => s.openViewer);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const uploadRequestRef = useRef(0);
@@ -38,33 +37,30 @@ export function ImageInputNode({ id, data, selected }: NodeProps<Node<ImageInput
     async (file: File | undefined | null) => {
       if (!file || !file.type.startsWith("image/")) return;
       const requestId = ++uploadRequestRef.current;
-      const documentEpoch = useFlowStore.getState().documentEpoch;
+      const tabId = useFlowStore.getState().activeTabId;
       setUploading(true);
       try {
         const url = await uploadFile(file);
         if (
           requestId !== uploadRequestRef.current ||
-          useFlowStore.getState().documentEpoch !== documentEpoch ||
-          !useFlowStore.getState().nodes.some((node) => node.id === id)
+          !useFlowStore.getState().tabs.some((tab) =>
+            tab.id === tabId && tab.nodes.some((node) => node.id === id),
+          )
         ) return;
-        updateNodeData(id, { imageUrl: url, status: "success", error: undefined });
+        updateNodeDataInTab(tabId, id, { imageUrl: url, status: "success", error: undefined });
       } catch (err) {
-        if (
-          requestId !== uploadRequestRef.current ||
-          useFlowStore.getState().documentEpoch !== documentEpoch
-        ) return;
+        if (requestId !== uploadRequestRef.current) return;
         const message = err instanceof Error ? err.message : String(err);
-        setNodeStatus(id, "error", message || "上传失败，请重试");
+        updateNodeDataInTab(tabId, id, {
+          status: "error",
+          error: message || "上传失败，请重试",
+        });
       } finally {
         if (requestId === uploadRequestRef.current) setUploading(false);
       }
     },
-    [id, setNodeStatus, updateNodeData],
+    [id, updateNodeDataInTab],
   );
-
-  useEffect(() => () => {
-    uploadRequestRef.current += 1;
-  }, []);
 
   // Ctrl+V 粘贴（节点被选中时生效）
   useEffect(() => {
@@ -115,7 +111,7 @@ export function ImageInputNode({ id, data, selected }: NodeProps<Node<ImageInput
               setDragOver(false);
               void handleFile(e.dataTransfer.files?.[0]);
             }}
-            className={`nodrag cursor-pointer rounded-md border border-dashed py-6 text-center text-[10px] leading-relaxed transition-colors ${
+            className={`nodrag cursor-pointer rounded-md border border-dashed bg-[#0f0f0f] py-6 text-center text-[10px] leading-relaxed transition-colors ${
               dragOver
                 ? "border-gold bg-gold/5 text-gold"
                 : "border-[#2a2a2a] text-neutral-500 hover:border-neutral-500"

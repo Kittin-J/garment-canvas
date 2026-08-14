@@ -2,7 +2,12 @@
  * nanobanana —— 使用独立分组 Key 的 OpenAI Images 兼容接口。
  * 无参考图走 /images/generations，有参考图走 /images/edits。
  */
-import type { AIProvider, ImageGenRequest, ImageGenResult } from "../../src/types/workflow";
+import {
+  MAX_REFERENCE_IMAGES,
+  type AIProvider,
+  type ImageGenRequest,
+  type ImageGenResult,
+} from "../../src/types/workflow";
 import { config } from "../config";
 import {
   aspectRatioToSize,
@@ -75,6 +80,9 @@ export const nanobananaProvider: AIProvider = {
     if (!req.referenceImages?.length) {
       throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID);
     }
+    if (req.referenceImages.length > MAX_REFERENCE_IMAGES) {
+      throw new ProviderError(`edit supports at most ${MAX_REFERENCE_IMAGES} reference images`, 400, PROVIDER_ID);
+    }
     const url = `${config.change2proBaseUrl()}/images/edits`;
     const res = await fetchWithRetry(
       url,
@@ -88,7 +96,7 @@ export const nanobananaProvider: AIProvider = {
           const { mime, buffer } = parseDataUrl(ref);
           const ext = mime.split("/")[1] ?? "png";
           form.append(
-            "image",
+            "image[]",
             new Blob([new Uint8Array(buffer)], { type: mime }),
             `ref-${index}.${ext}`,
           );

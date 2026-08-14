@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "builtin-pattern-style-transfer",
+  "name": "图案风格迁移（图案→参考风格）",
+  "description": "保留图1的主题与构图，使用图2的材料、工艺、色彩和视觉语言重新演绎",
+  "builtIn": true,
+  "createdAt": "2026-08-13T00:00:00.000Z",
+  "flow": {
+    "schemaVersion": 1,
+    "nodes": [
+      { "id": "pattern", "type": "image-input", "position": { "x": 0, "y": -170 }, "data": { "kind": "image-input", "label": "图1 · 原始图案", "status": "idle", "imageRole": "garment" } },
+      { "id": "style", "type": "image-input", "position": { "x": 0, "y": 190 }, "data": { "kind": "image-input", "label": "图2 · 风格参考", "status": "idle", "imageRole": "reference" } },
+      {
+        "id": "transfer",
+        "type": "ai-modify",
+        "position": { "x": 430, "y": 0 },
+        "data": {
+          "kind": "ai-modify",
+          "label": "图案风格迁移",
+          "status": "idle",
+          "prompt": "严格按照输入顺序处理：图1是必须保留的原始图案，图2是仅用于学习材料、工艺、色彩和视觉语言的风格参考。保留图1的主题元素、数量、构图布局、轮廓比例和主要识别特征，将它们重新演绎为图2的面料纹理、手工工艺、笔触、配色和质感。不要复制图2的主体或构图，不要丢失图1的主体，不要新增无关文字、水印或元素。输出完整、清晰、可用于服装印花的单张图案。",
+          "aspectRatio": "3:4",
+          "batchSize": 1,
+          "outputImages": []
+        }
+      },
+      { "id": "result", "type": "result", "position": { "x": 860, "y": 0 }, "data": { "kind": "result", "label": "迁移结果", "status": "idle", "images": [], "note": "图案主题来自图1，材料、工艺与视觉风格来自图2" } }
+    ],
+    "edges": [
+      { "id": "pattern-to-transfer", "source": "pattern", "target": "transfer" },
+      { "id": "style-to-transfer", "source": "style", "target": "transfer" },
+      { "id": "transfer-to-result", "source": "transfer", "target": "result" }
+    ]
+  }
+}

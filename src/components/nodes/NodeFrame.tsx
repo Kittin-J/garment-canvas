@@ -51,11 +51,11 @@ export function NodeFrame({ title, status, error, selected, nodeId, children }: 
 
   return (
     <div
-      className={`w-[280px] rounded-xl border bg-[#141414] shadow-xl shadow-black/40 transition-colors ${
+      className={`gc-node-card w-[280px] rounded-xl border bg-[#141414] shadow-xl shadow-black/40 transition-colors ${
         selected ? "border-gold" : "border-[#262626]"
       }`}
     >
-      <div className="flex items-center gap-2 rounded-t-xl border-b border-[#262626] bg-[#1a1a1a] px-3 py-2">
+      <div className="gc-node-header flex items-center gap-2 rounded-t-xl border-b border-[#262626] bg-[#1a1a1a] px-3 py-2">
         <StatusDot status={status} />
         {editing ? (
           <input
@@ -86,7 +86,7 @@ export function NodeFrame({ title, status, error, selected, nodeId, children }: 
           </span>
         )}
       </div>
-      <div className="space-y-3 p-3">{children}</div>
+      <div className="gc-node-body space-y-3 p-3">{children}</div>
       {error && (
         <div className="mx-3 mb-3 rounded-md border border-red-900/50 bg-red-950/40 px-2 py-1.5 text-[10px] leading-relaxed text-red-400">
           {error}

@@ -66,6 +66,74 @@ var config = {
 // server/routes/generate.ts
 import { Router } from "express";
 
+// src/types/workflow.ts
+var MAX_REFERENCE_IMAGES = 8;
+var WORKFLOW_SCHEMA_VERSION = 1;
+var NODE_SPECS = {
+  "image-input": {
+    kind: "image-input",
+    title: "\u56FE\u7247\u4E0A\u4F20",
+    description: "\u4E0A\u4F20\u8349\u56FE / \u6B3E\u5F0F\u56FE / \u9762\u6599\u53C2\u8003",
+    inputs: 0,
+    outputs: "images"
+  },
+  "sketch-to-render": {
+    kind: "sketch-to-render",
+    title: "\u8349\u56FE\u2192\u6548\u679C\u56FE",
+    description: "AI \u5C06\u7EBF\u7A3F\u6E32\u67D3\u4E3A\u670D\u88C5\u6548\u679C\u56FE",
+    providerId: "gpt-image-2",
+    inputs: MAX_REFERENCE_IMAGES,
+    outputs: "images"
+  },
+  "ai-modify": {
+    kind: "ai-modify",
+    title: "AI \u6539\u6B3E",
+    description: "gpt-image-2 \u6539\u9886\u578B/\u8896\u578B/\u957F\u5EA6/\u7EC6\u8282",
+    providerId: "gpt-image-2",
+    inputs: MAX_REFERENCE_IMAGES,
+    outputs: "images"
+  },
+  "fabric-recolor": {
+    kind: "fabric-recolor",
+    title: "\u9762\u6599/\u914D\u8272\u66FF\u6362",
+    description: "gpt-image-2 \u66FF\u6362\u9762\u6599\u7EB9\u7406\u4E0E\u914D\u8272",
+    providerId: "gpt-image-2",
+    inputs: MAX_REFERENCE_IMAGES,
+    outputs: "images"
+  },
+  upscale: {
+    kind: "upscale",
+    title: "\u9AD8\u6E05\u653E\u5927",
+    description: "AI \u653E\u5927\u81F3 2K/4K\uFF0C\u7CBE\u4FEE\u7EC6\u8282",
+    providerId: "gpt-image-2",
+    inputs: 1,
+    outputs: "images"
+  },
+  "print-extract": {
+    kind: "print-extract",
+    title: "\u5370\u82B1\u63D0\u53D6",
+    description: "gpt-image-2 \u4ECE\u670D\u88C5\u4E0A\u62A0\u51FA\u5370\u82B1\uFF0C\u5E73\u94FA\u5C55\u5F00\u5B58\u7D20\u6750",
+    providerId: "gpt-image-2",
+    inputs: MAX_REFERENCE_IMAGES,
+    outputs: "images"
+  },
+  "print-mutate": {
+    kind: "print-mutate",
+    title: "\u5370\u82B1\u88C2\u53D8",
+    description: "gpt-image-2 \u57FA\u4E8E\u5370\u82B1\u751F\u6210 1~8 \u5F20\u98CE\u683C\u4E00\u81F4\u7684\u53D8\u4F53",
+    providerId: "gpt-image-2",
+    inputs: MAX_REFERENCE_IMAGES,
+    outputs: "images"
+  },
+  result: {
+    kind: "result",
+    title: "\u7ED3\u679C",
+    description: "\u6C47\u603B\u5C55\u793A\u4E0E\u5BFC\u51FA",
+    inputs: 4,
+    outputs: "none"
+  }
+};
+
 // server/providers/base.ts
 var ProviderError = class extends Error {
   constructor(message, status, providerId) {
@@ -204,6 +272,9 @@ var nanobananaProvider = {
     if (!req.referenceImages?.length) {
       throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID);
     }
+    if (req.referenceImages.length > MAX_REFERENCE_IMAGES) {
+      throw new ProviderError(`edit supports at most ${MAX_REFERENCE_IMAGES} reference images`, 400, PROVIDER_ID);
+    }
     const url = `${config.change2proBaseUrl()}/images/edits`;
     const res = await fetchWithRetry(
       url,
@@ -217,7 +288,7 @@ var nanobananaProvider = {
           const { mime, buffer } = parseDataUrl(ref);
           const ext = mime.split("/")[1] ?? "png";
           form.append(
-            "image",
+            "image[]",
             new Blob([new Uint8Array(buffer)], { type: mime }),
             `ref-${index}.${ext}`
           );
@@ -298,6 +369,9 @@ var image2Provider = {
     if (!req.referenceImages?.length) {
       throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID2);
     }
+    if (req.referenceImages.length > MAX_REFERENCE_IMAGES) {
+      throw new ProviderError(`edit supports at most ${MAX_REFERENCE_IMAGES} reference images`, 400, PROVIDER_ID2);
+    }
     const url = `${config.change2proBaseUrl()}/images/edits`;
     const res = await fetchWithRetry(
       url,
@@ -310,7 +384,7 @@ var image2Provider = {
         req.referenceImages.forEach((ref, i) => {
           const { mime, buffer } = parseDataUrl(ref);
           const ext = mime.split("/")[1] ?? "png";
-          form.append("image", new Blob([new Uint8Array(buffer)], { type: mime }), `ref-${i}.${ext}`);
+          form.append("image[]", new Blob([new Uint8Array(buffer)], { type: mime }), `ref-${i}.${ext}`);
         });
         if (req.mask) {
           const { mime, buffer } = parseDataUrl(req.mask);
@@ -703,6 +777,10 @@ generateRouter.post("/", async (req, res) => {
     res.status(400).json({ error: "providerId and request.prompt are required" });
     return;
   }
+  if (request.referenceImages && request.referenceImages.length > MAX_REFERENCE_IMAGES) {
+    res.status(400).json({ error: `referenceImages must contain at most ${MAX_REFERENCE_IMAGES} images` });
+    return;
+  }
   try {
     const provider = getProvider(providerId);
     const resolved = {
@@ -728,73 +806,6 @@ generateRouter.post("/", async (req, res) => {
 // server/routes/runPlan.ts
 import { Router as Router2 } from "express";
 
-// src/types/workflow.ts
-var WORKFLOW_SCHEMA_VERSION = 1;
-var NODE_SPECS = {
-  "image-input": {
-    kind: "image-input",
-    title: "\u56FE\u7247\u4E0A\u4F20",
-    description: "\u4E0A\u4F20\u8349\u56FE / \u6B3E\u5F0F\u56FE / \u9762\u6599\u53C2\u8003",
-    inputs: 0,
-    outputs: "images"
-  },
-  "sketch-to-render": {
-    kind: "sketch-to-render",
-    title: "\u8349\u56FE\u2192\u6548\u679C\u56FE",
-    description: "AI \u5C06\u7EBF\u7A3F\u6E32\u67D3\u4E3A\u670D\u88C5\u6548\u679C\u56FE",
-    providerId: "gpt-image-2",
-    inputs: 1,
-    outputs: "images"
-  },
-  "ai-modify": {
-    kind: "ai-modify",
-    title: "AI \u6539\u6B3E",
-    description: "gpt-image-2 \u6539\u9886\u578B/\u8896\u578B/\u957F\u5EA6/\u7EC6\u8282",
-    providerId: "gpt-image-2",
-    inputs: 1,
-    outputs: "images"
-  },
-  "fabric-recolor": {
-    kind: "fabric-recolor",
-    title: "\u9762\u6599/\u914D\u8272\u66FF\u6362",
-    description: "gpt-image-2 \u66FF\u6362\u9762\u6599\u7EB9\u7406\u4E0E\u914D\u8272",
-    providerId: "gpt-image-2",
-    inputs: 2,
-    outputs: "images"
-  },
-  upscale: {
-    kind: "upscale",
-    title: "\u9AD8\u6E05\u653E\u5927",
-    description: "AI \u653E\u5927\u81F3 2K/4K\uFF0C\u7CBE\u4FEE\u7EC6\u8282",
-    providerId: "gpt-image-2",
-    inputs: 1,
-    outputs: "images"
-  },
-  "print-extract": {
-    kind: "print-extract",
-    title: "\u5370\u82B1\u63D0\u53D6",
-    description: "gpt-image-2 \u4ECE\u670D\u88C5\u4E0A\u62A0\u51FA\u5370\u82B1\uFF0C\u5E73\u94FA\u5C55\u5F00\u5B58\u7D20\u6750",
-    providerId: "gpt-image-2",
-    inputs: 1,
-    outputs: "images"
-  },
-  "print-mutate": {
-    kind: "print-mutate",
-    title: "\u5370\u82B1\u88C2\u53D8",
-    description: "gpt-image-2 \u57FA\u4E8E\u5370\u82B1\u751F\u6210 1~8 \u5F20\u98CE\u683C\u4E00\u81F4\u7684\u53D8\u4F53",
-    providerId: "gpt-image-2",
-    inputs: 1,
-    outputs: "images"
-  },
-  result: {
-    kind: "result",
-    title: "\u7ED3\u679C",
-    description: "\u6C47\u603B\u5C55\u793A\u4E0E\u5BFC\u51FA",
-    inputs: 4,
-    outputs: "none"
-  }
-};
-
 // server/engine/dag.ts
 var DagError = class extends Error {
   constructor(message) {
@@ -810,6 +821,9 @@ function assertPlanInputs(plan, edges) {
     const usableImages = (step.upstream ?? []).flatMap(
       (upstream) => executingNodeIds.has(upstream.nodeId) ? ["__runtime_output__"] : upstream.images
     );
+    if (usableImages.length > MAX_REFERENCE_IMAGES) {
+      throw new DagError(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
+    }
     if (step.kind === "sketch-to-render" && usableImages.length === 0) {
       const prompt = typeof step.params.prompt === "string" ? step.params.prompt.trim() : "";
       if (!prompt) throw new DagError(`Node ${step.nodeId} requires an image or a prompt`);
@@ -1134,6 +1148,13 @@ async function executeRun(run) {
     const inputImages = (step.upstream ?? []).flatMap(
       (u) => outputs.get(u.nodeId) ?? u.images
     );
+    if (NODE_SPECS[step.kind].providerId && inputImages.length > MAX_REFERENCE_IMAGES) {
+      const message = `Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`;
+      const finishedAt = Date.now();
+      emit(run, { type: "node-status", nodeId: step.nodeId, status: "error", error: message, finishedAt });
+      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      return;
+    }
     if (NODE_SPECS[step.kind].providerId && step.kind !== "sketch-to-render" && inputImages.length === 0) {
       const message = `Node ${step.nodeId} requires an upstream image`;
       const finishedAt = Date.now();
@@ -1208,6 +1229,9 @@ async function executeStep(step, inputImages) {
       const fabricImageUrl = step.params.fabricImageUrl;
       if (step.kind === "fabric-recolor" && fabricImageUrl) {
         referenceImages.push(...await resolveImageRefs([fabricImageUrl]));
+      }
+      if (referenceImages.length > MAX_REFERENCE_IMAGES) {
+        throw new Error(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
       }
       const extra = (step.params.prompt ?? "").trim();
       if (step.kind === "fabric-recolor") {
@@ -1499,6 +1523,18 @@ function validateAndMigrateFlow(value) {
     edgeIds.add(edge.id);
     if (!nodeIds.has(edge.source)) fail("flow.edges", `edge ${edge.id} source not found: ${edge.source}`);
     if (!nodeIds.has(edge.target)) fail("flow.edges", `edge ${edge.id} target not found: ${edge.target}`);
+  }
+  for (const node of nodes) {
+    const incomingCount = edges.filter((edge) => edge.target === node.id).length;
+    if (incomingCount > NODE_SPECS[node.type].inputs) {
+      fail(
+        "flow.edges",
+        `node ${node.id} accepts at most ${NODE_SPECS[node.type].inputs} incoming image connections`
+      );
+    }
+    if (NODE_SPECS[node.type].providerId && incomingCount > MAX_REFERENCE_IMAGES) {
+      fail("flow.edges", `node ${node.id} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
+    }
   }
   return { schemaVersion: WORKFLOW_SCHEMA_VERSION, nodes, edges };
 }
@@ -1964,8 +2000,8 @@ function builtinTemplates() {
     },
     {
       schemaVersion: WORKFLOW_SCHEMA_VERSION,
-      id: "builtin-style-transfer",
-      name: "\u98CE\u683C\u8FC1\u79FB\uFF08\u4EBA\u7269\u2192\u573A\u666F\uFF09",
+      id: "builtin-person-scene-transfer",
+      name: "\u4EBA\u7269\u573A\u666F\u8FC1\u79FB\uFF08\u4EBA\u7269\u2192\u80CC\u666F/\u5EA7\u6905\uFF09",
       description: "\u4E0A\u4F20\u56FE1\u4EBA\u7269\u4E0E\u56FE2\u573A\u666F\uFF0C\u5C06\u4EBA\u7269\u4FDD\u771F\u8FC1\u79FB\u5230\u573A\u666F\u4E2D\u5E76\u5339\u914D\u5EA7\u6905\u3001\u59FF\u6001\u3001\u5149\u5F71\u4E0E\u900F\u89C6",
       builtIn: true,
       createdAt: "2026-08-13T00:00:00.000Z",
@@ -2000,7 +2036,7 @@ function builtinTemplates() {
             position: { x: 430, y: 0 },
             data: {
               kind: "ai-modify",
-              label: "\u98CE\u683C\u8FC1\u79FB",
+              label: "\u4EBA\u7269\u573A\u666F\u8FC1\u79FB",
               status: "idle",
               prompt: "\u4E25\u683C\u6309\u7167\u8F93\u5165\u987A\u5E8F\u5904\u7406\uFF1A\u56FE1\u662F\u9700\u8981\u4FDD\u7559\u7684\u4EBA\u7269\u4E3B\u4F53\uFF0C\u56FE2\u662F\u76EE\u6807\u573A\u666F\u3002\u5C06\u56FE1\u4E2D\u7684\u540C\u4E00\u4EBA\u7269\u5B8C\u6574\u8FC1\u79FB\u5230\u56FE2\u7684\u80CC\u666F\u4E2D\uFF0C\u5E76\u8BA9\u4EBA\u7269\u81EA\u7136\u5750\u5728\u56FE2\u7684\u6905\u5B50\u4E0A\u3002\u4FDD\u6301\u56FE1\u4EBA\u7269\u7684\u8138\u90E8\u8EAB\u4EFD\u3001\u53D1\u578B\u3001\u4F53\u578B\u3001\u670D\u88C5\u6B3E\u5F0F\u3001\u989C\u8272\u4E0E\u6750\u8D28\u7EC6\u8282\u4E0D\u53D8\uFF1B\u4FDD\u6301\u56FE2\u7684\u80CC\u666F\u3001\u6905\u5B50\u3001\u6784\u56FE\u4E0E\u7A7A\u95F4\u9648\u8BBE\u4E0D\u53D8\u3002\u6839\u636E\u6905\u5B50\u7684\u671D\u5411\u548C\u9AD8\u5EA6\u8C03\u6574\u4EBA\u7269\u5750\u59FF\u3001\u80A2\u4F53\u906E\u6321\u3001\u6BD4\u4F8B\u4E0E\u900F\u89C6\uFF0C\u4F7F\u8EAB\u4F53\u4E0E\u6905\u9762\u6B63\u786E\u63A5\u89E6\uFF0C\u8865\u5145\u81EA\u7136\u7684\u63A5\u89E6\u9634\u5F71\uFF0C\u5E76\u7EDF\u4E00\u5149\u7EBF\u65B9\u5411\u3001\u8272\u6E29\u3001\u666F\u6DF1\u4E0E\u753B\u9762\u8D28\u611F\u3002\u4E0D\u8981\u590D\u5236\u56FE2\u4E2D\u7684\u4EBA\u7269\uFF0C\u4E0D\u8981\u6539\u53D8\u4EBA\u7269\u8EAB\u4EFD\uFF0C\u4E0D\u8981\u65B0\u589E\u591A\u4F59\u4EBA\u7269\u6216\u5BB6\u5177\u3002\u8F93\u51FA\u4E00\u5F20\u771F\u5B9E\u3001\u81EA\u7136\u3001\u65E0\u62FC\u8D34\u75D5\u8FF9\u7684\u5B8C\u6574\u56FE\u7247\u3002",
               aspectRatio: "3:4",
@@ -2027,10 +2063,77 @@ function builtinTemplates() {
           { id: "transfer-to-result", source: "transfer", target: "result" }
         ]
       }
+    },
+    {
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      id: "builtin-pattern-style-transfer",
+      name: "\u56FE\u6848\u98CE\u683C\u8FC1\u79FB\uFF08\u56FE\u6848\u2192\u53C2\u8003\u98CE\u683C\uFF09",
+      description: "\u4FDD\u7559\u56FE1\u7684\u4E3B\u9898\u4E0E\u6784\u56FE\uFF0C\u4F7F\u7528\u56FE2\u7684\u6750\u6599\u3001\u5DE5\u827A\u3001\u8272\u5F69\u548C\u89C6\u89C9\u8BED\u8A00\u91CD\u65B0\u6F14\u7ECE",
+      builtIn: true,
+      createdAt: "2026-08-13T00:00:00.000Z",
+      flow: {
+        schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        nodes: [
+          {
+            id: "pattern",
+            type: "image-input",
+            position: { x: 0, y: -170 },
+            data: {
+              kind: "image-input",
+              label: "\u56FE1 \xB7 \u539F\u59CB\u56FE\u6848",
+              status: "idle",
+              imageRole: "garment"
+            }
+          },
+          {
+            id: "style",
+            type: "image-input",
+            position: { x: 0, y: 190 },
+            data: {
+              kind: "image-input",
+              label: "\u56FE2 \xB7 \u98CE\u683C\u53C2\u8003",
+              status: "idle",
+              imageRole: "reference"
+            }
+          },
+          {
+            id: "transfer",
+            type: "ai-modify",
+            position: { x: 430, y: 0 },
+            data: {
+              kind: "ai-modify",
+              label: "\u56FE\u6848\u98CE\u683C\u8FC1\u79FB",
+              status: "idle",
+              prompt: "\u4E25\u683C\u6309\u7167\u8F93\u5165\u987A\u5E8F\u5904\u7406\uFF1A\u56FE1\u662F\u5FC5\u987B\u4FDD\u7559\u7684\u539F\u59CB\u56FE\u6848\uFF0C\u56FE2\u662F\u4EC5\u7528\u4E8E\u5B66\u4E60\u6750\u6599\u3001\u5DE5\u827A\u3001\u8272\u5F69\u548C\u89C6\u89C9\u8BED\u8A00\u7684\u98CE\u683C\u53C2\u8003\u3002\u4FDD\u7559\u56FE1\u7684\u4E3B\u9898\u5143\u7D20\u3001\u6570\u91CF\u3001\u6784\u56FE\u5E03\u5C40\u3001\u8F6E\u5ED3\u6BD4\u4F8B\u548C\u4E3B\u8981\u8BC6\u522B\u7279\u5F81\uFF0C\u5C06\u5B83\u4EEC\u91CD\u65B0\u6F14\u7ECE\u4E3A\u56FE2\u7684\u9762\u6599\u7EB9\u7406\u3001\u624B\u5DE5\u5DE5\u827A\u3001\u7B14\u89E6\u3001\u914D\u8272\u548C\u8D28\u611F\u3002\u4E0D\u8981\u590D\u5236\u56FE2\u7684\u4E3B\u4F53\u6216\u6784\u56FE\uFF0C\u4E0D\u8981\u4E22\u5931\u56FE1\u7684\u4E3B\u4F53\uFF0C\u4E0D\u8981\u65B0\u589E\u65E0\u5173\u6587\u5B57\u3001\u6C34\u5370\u6216\u5143\u7D20\u3002\u8F93\u51FA\u5B8C\u6574\u3001\u6E05\u6670\u3001\u53EF\u7528\u4E8E\u670D\u88C5\u5370\u82B1\u7684\u5355\u5F20\u56FE\u6848\u3002",
+              aspectRatio: "3:4",
+              batchSize: 1,
+              outputImages: []
+            }
+          },
+          {
+            id: "result",
+            type: "result",
+            position: { x: 860, y: 0 },
+            data: {
+              kind: "result",
+              label: "\u8FC1\u79FB\u7ED3\u679C",
+              status: "idle",
+              images: [],
+              note: "\u56FE\u6848\u4E3B\u9898\u6765\u81EA\u56FE1\uFF0C\u6750\u6599\u3001\u5DE5\u827A\u4E0E\u89C6\u89C9\u98CE\u683C\u6765\u81EA\u56FE2"
+            }
+          }
+        ],
+        edges: [
+          { id: "pattern-to-transfer", source: "pattern", target: "transfer" },
+          { id: "style-to-transfer", source: "style", target: "transfer" },
+          { id: "transfer-to-result", source: "transfer", target: "result" }
+        ]
+      }
     }
   ];
 }
 function ensureBuiltinTemplates() {
+  fs6.rmSync(templatePath("builtin", "builtin-style-transfer"), { force: true });
   for (const tpl of builtinTemplates()) {
     const filePath = templatePath("builtin", tpl.id);
     if (!fs6.existsSync(filePath)) writeJsonAtomicSync(filePath, tpl);

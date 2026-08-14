@@ -52,6 +52,7 @@ export function PrintExtractNode({ id, data, selected }: NodeProps<Node<PrintExt
             placeholder='可选：如"只要胸前那朵花"'
             className={`${inputClass} resize-none`}
           />
+          <span className="text-[9px] text-neutral-600">可连接 1–8 张参考图，按连线顺序传入</span>
         </label>
         <RunButton running={running} onClick={() => void runNode(id)} label="提取印花" />
         {running && <Developing />}

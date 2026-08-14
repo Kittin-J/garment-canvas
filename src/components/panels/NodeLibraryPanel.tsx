@@ -68,7 +68,7 @@ function NodeList() {
               e.dataTransfer.setData(DND_MIME, kind);
               e.dataTransfer.effectAllowed = "move";
             }}
-            className="cursor-grab select-none rounded-lg border border-[#262626] bg-[#1a1a1a] p-2.5 transition-colors hover:border-gold/60 active:cursor-grabbing"
+            className="gc-node-library-card cursor-grab select-none rounded-lg border border-[#262626] bg-[#1a1a1a] p-2.5 transition-colors hover:border-gold/60 active:cursor-grabbing"
           >
             <div className="text-xs font-medium text-neutral-200">{spec.title}</div>
             <div className="mt-1 text-[10px] leading-relaxed text-neutral-500">
@@ -208,4 +208,3 @@ function AssetList() {
     </div>
   );
 }
-

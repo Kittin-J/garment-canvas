@@ -29,6 +29,7 @@ export function SketchToRenderNode({
             placeholder="如：写实摄影风，柔和自然光，白底服装效果图"
             className={`${inputClass} resize-none`}
           />
+          <span className="text-[9px] text-neutral-600">可连接 0–8 张参考图，按连线顺序传入</span>
         </label>
         <div className="grid grid-cols-2 gap-2">
           <label className="block space-y-1">

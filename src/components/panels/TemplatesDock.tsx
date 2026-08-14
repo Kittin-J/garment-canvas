@@ -51,16 +51,8 @@ export function TemplatesDock() {
   }, [open]);
 
   const applyTemplate = (tpl: WorkflowTemplate) => {
-    const { dirty } = useFlowStore.getState();
-    if (
-      dirty &&
-      !window.confirm("当前画布有未保存修改。从模板新建将丢失这些修改，是否继续？")
-    ) {
-      return;
-    }
-    // 从模板新建 = 新项目：新 projectId + 新名称，保存不会覆盖原项目
-    // 跨项目的「最近生成」记录保留，不清空
-    useFlowStore.getState().loadFlow({
+    // 从模板新建独立项目页签，当前画布及其后台生成状态保持不变。
+    useFlowStore.getState().openFlowTab({
       projectId: nanoid(10),
       projectName: `${tpl.name} - 副本`,
       nodes: tpl.flow.nodes as FlowNode[],

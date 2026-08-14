@@ -4,6 +4,7 @@ import { nanoid } from "nanoid";
 import { useFlowStore, type FlowNode } from "@/store/flowStore";
 import { CanvasFlow } from "@/components/CanvasFlow";
 import { TopBar } from "@/components/panels/TopBar";
+import { ProjectTabs } from "@/components/panels/ProjectTabs";
 import { NodeLibraryPanel } from "@/components/panels/NodeLibraryPanel";
 import { InspectorPanel } from "@/components/panels/InspectorPanel";
 import { ResultsPanel } from "@/components/panels/ResultsPanel";
@@ -81,11 +82,13 @@ function useGlobalShortcuts() {
 
 export default function App() {
   useGlobalShortcuts();
+  const activeTabId = useFlowStore((state) => state.activeTabId);
 
   return (
-    <ReactFlowProvider>
-      <div className="flex h-full flex-col bg-ink text-neutral-200">
-        <TopBar />
+    <div className="flex h-full flex-col bg-ink text-neutral-200">
+      <TopBar />
+      <ProjectTabs />
+      <ReactFlowProvider key={activeTabId}>
         <div className="flex min-h-0 flex-1">
           <NodeLibraryPanel />
           <div className="relative flex min-w-0 flex-1 flex-col">
@@ -97,7 +100,7 @@ export default function App() {
         </div>
         <CompareOverlay />
         <ImageViewer />
-      </div>
-    </ReactFlowProvider>
+      </ReactFlowProvider>
+    </div>
   );
 }

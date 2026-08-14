@@ -17,8 +17,7 @@ function ProjectPicker() {
   const rootRef = useRef<HTMLDivElement>(null);
   const openRequestIdRef = useRef(0);
   const currentId = useFlowStore((s) => s.projectId);
-  const dirty = useFlowStore((s) => s.dirty);
-  const loadFlow = useFlowStore((s) => s.loadFlow);
+  const openFlowTab = useFlowStore((s) => s.openFlowTab);
 
   useEffect(() => {
     if (!open) return;
@@ -45,18 +44,13 @@ function ProjectPicker() {
   }, [open]);
 
   const openProject = async (id: string) => {
-    if (id === currentId && !dirty) {
+    const alreadyOpen = useFlowStore.getState().tabs.find((tab) => tab.projectId === id);
+    if (alreadyOpen) {
+      useFlowStore.getState().switchTab(alreadyOpen.id);
       setOpen(false);
       return;
     }
-    if (
-      dirty &&
-      !window.confirm("当前画布有未保存修改。打开其他项目将丢失这些修改，是否继续？")
-    ) {
-      return;
-    }
     const requestId = ++openRequestIdRef.current;
-    const startState = useFlowStore.getState();
     try {
       const res = await fetch(`/api/projects/${id}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -69,15 +63,7 @@ function ProjectPicker() {
         throw new Error("项目数据损坏或不兼容");
       }
       if (requestId !== openRequestIdRef.current) return;
-      const currentState = useFlowStore.getState();
-      if (currentState.documentEpoch !== startState.documentEpoch) return;
-      if (
-        currentState.revision !== startState.revision &&
-        !window.confirm("项目加载期间画布又发生了修改。继续打开将丢失这些新修改，是否继续？")
-      ) {
-        return;
-      }
-      loadFlow({
+      openFlowTab({
         projectId: p.id,
         projectName: p.name,
         nodes: p.flow.nodes as never,

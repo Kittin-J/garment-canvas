@@ -230,8 +230,8 @@ function builtinTemplates(): WorkflowTemplate[] {
     },
     {
       schemaVersion: WORKFLOW_SCHEMA_VERSION,
-      id: "builtin-style-transfer",
-      name: "风格迁移（人物→场景）",
+      id: "builtin-person-scene-transfer",
+      name: "人物场景迁移（人物→背景/座椅）",
       description: "上传图1人物与图2场景，将人物保真迁移到场景中并匹配座椅、姿态、光影与透视",
       builtIn: true,
       createdAt: "2026-08-13T00:00:00.000Z",
@@ -266,7 +266,7 @@ function builtinTemplates(): WorkflowTemplate[] {
             position: { x: 430, y: 0 },
             data: {
               kind: "ai-modify",
-              label: "风格迁移",
+              label: "人物场景迁移",
               status: "idle",
               prompt: "严格按照输入顺序处理：图1是需要保留的人物主体，图2是目标场景。将图1中的同一人物完整迁移到图2的背景中，并让人物自然坐在图2的椅子上。保持图1人物的脸部身份、发型、体型、服装款式、颜色与材质细节不变；保持图2的背景、椅子、构图与空间陈设不变。根据椅子的朝向和高度调整人物坐姿、肢体遮挡、比例与透视，使身体与椅面正确接触，补充自然的接触阴影，并统一光线方向、色温、景深与画面质感。不要复制图2中的人物，不要改变人物身份，不要新增多余人物或家具。输出一张真实、自然、无拼贴痕迹的完整图片。",
               aspectRatio: "3:4",
@@ -294,11 +294,79 @@ function builtinTemplates(): WorkflowTemplate[] {
         ],
       },
     },
+    {
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      id: "builtin-pattern-style-transfer",
+      name: "图案风格迁移（图案→参考风格）",
+      description: "保留图1的主题与构图，使用图2的材料、工艺、色彩和视觉语言重新演绎",
+      builtIn: true,
+      createdAt: "2026-08-13T00:00:00.000Z",
+      flow: {
+        schemaVersion: WORKFLOW_SCHEMA_VERSION,
+        nodes: [
+          {
+            id: "pattern",
+            type: "image-input",
+            position: { x: 0, y: -170 },
+            data: {
+              kind: "image-input",
+              label: "图1 · 原始图案",
+              status: "idle",
+              imageRole: "garment",
+            },
+          },
+          {
+            id: "style",
+            type: "image-input",
+            position: { x: 0, y: 190 },
+            data: {
+              kind: "image-input",
+              label: "图2 · 风格参考",
+              status: "idle",
+              imageRole: "reference",
+            },
+          },
+          {
+            id: "transfer",
+            type: "ai-modify",
+            position: { x: 430, y: 0 },
+            data: {
+              kind: "ai-modify",
+              label: "图案风格迁移",
+              status: "idle",
+              prompt: "严格按照输入顺序处理：图1是必须保留的原始图案，图2是仅用于学习材料、工艺、色彩和视觉语言的风格参考。保留图1的主题元素、数量、构图布局、轮廓比例和主要识别特征，将它们重新演绎为图2的面料纹理、手工工艺、笔触、配色和质感。不要复制图2的主体或构图，不要丢失图1的主体，不要新增无关文字、水印或元素。输出完整、清晰、可用于服装印花的单张图案。",
+              aspectRatio: "3:4",
+              batchSize: 1,
+              outputImages: [],
+            },
+          },
+          {
+            id: "result",
+            type: "result",
+            position: { x: 860, y: 0 },
+            data: {
+              kind: "result",
+              label: "迁移结果",
+              status: "idle",
+              images: [],
+              note: "图案主题来自图1，材料、工艺与视觉风格来自图2",
+            },
+          },
+        ],
+        edges: [
+          { id: "pattern-to-transfer", source: "pattern", target: "transfer" },
+          { id: "style-to-transfer", source: "style", target: "transfer" },
+          { id: "transfer-to-result", source: "transfer", target: "result" },
+        ],
+      },
+    },
   ];
 }
 
 /** 启动时逐个补齐新增的内置模板，不覆盖磁盘上已存在的同名模板。 */
 export function ensureBuiltinTemplates(): void {
+  // 旧版模板已拆分为两个明确模板；它是部署内置数据，不属于用户模板。
+  fs.rmSync(templatePath("builtin", "builtin-style-transfer"), { force: true });
   for (const tpl of builtinTemplates()) {
     const filePath = templatePath("builtin", tpl.id);
     if (!fs.existsSync(filePath)) writeJsonAtomicSync(filePath, tpl);

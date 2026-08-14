@@ -1,5 +1,7 @@
 import {
   WORKFLOW_SCHEMA_VERSION,
+  MAX_REFERENCE_IMAGES,
+  NODE_SPECS,
   type NodeKind,
   type PersistedWorkflow,
   type PersistedWorkflowEdge,
@@ -240,6 +242,18 @@ export function validateAndMigrateFlow(value: unknown): PersistedWorkflow {
     edgeIds.add(edge.id);
     if (!nodeIds.has(edge.source)) fail("flow.edges", `edge ${edge.id} source not found: ${edge.source}`);
     if (!nodeIds.has(edge.target)) fail("flow.edges", `edge ${edge.id} target not found: ${edge.target}`);
+  }
+  for (const node of nodes) {
+    const incomingCount = edges.filter((edge) => edge.target === node.id).length;
+    if (incomingCount > NODE_SPECS[node.type].inputs) {
+      fail(
+        "flow.edges",
+        `node ${node.id} accepts at most ${NODE_SPECS[node.type].inputs} incoming image connections`,
+      );
+    }
+    if (NODE_SPECS[node.type].providerId && incomingCount > MAX_REFERENCE_IMAGES) {
+      fail("flow.edges", `node ${node.id} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
+    }
   }
   return { schemaVersion: WORKFLOW_SCHEMA_VERSION, nodes, edges };
 }

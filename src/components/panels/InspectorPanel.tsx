@@ -35,6 +35,7 @@ function PropertyEditor({ nodeId }: { nodeId: string }) {
             rows={12}
             className={`${inputClass} resize-none`}
           />
+          <span className="text-[9px] text-neutral-600">可连接最多 8 张参考图，按连线顺序传入</span>
         </label>
       )}
 

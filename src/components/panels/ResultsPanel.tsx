@@ -1,10 +1,15 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useFlowStore } from "@/store/flowStore";
 import { OPEN_COMPARE_EVENT } from "@/components/CompareOverlay";
 
 /** 底部结果面板（可折叠）：最近生成 + 运行记录一体，点击条目右侧显示详情 */
 export function ResultsPanel() {
-  const recentResults = useFlowStore((s) => s.recentResults);
+  const allRecentResults = useFlowStore((s) => s.recentResults);
+  const projectId = useFlowStore((s) => s.projectId);
+  const recentResults = useMemo(
+    () => allRecentResults.filter((result) => result.projectId === projectId),
+    [allRecentResults, projectId],
+  );
   const selectedResultId = useFlowStore((s) => s.selectedResultId);
   const setSelectedResultId = useFlowStore((s) => s.setSelectedResultId);
   const compareIds = useFlowStore((s) => s.compareIds);

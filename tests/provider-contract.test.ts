@@ -89,7 +89,7 @@ async function main(): Promise<void> {
     }
   });
 
-  await test("nanobanana 图生图调用 multipart edits 契约", async () => {
+  await test("nanobanana 多参考图使用 image[] multipart edits 契约", async () => {
     const restoreBase = setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1");
     const restoreKey = setEnv("NANOBANANA_API_KEY", "nanobanana-test-key");
     const restoreRetries = setEnv("AI_MAX_RETRIES", "0");
@@ -105,14 +105,45 @@ async function main(): Promise<void> {
         prompt: "延伸款式",
         aspectRatio: "1:1",
         batchSize: 2,
-        referenceImages: ["data:image/png;base64,iVBORw0KGgo="],
+        referenceImages: [
+          "data:image/png;base64,iVBORw0KGgo=",
+          "data:image/png;base64,iVBORw0KGgo=",
+        ],
       });
       assert.equal(capturedUrl, "https://gateway.example/v1/images/edits");
       assert.equal(capturedForm?.get("model"), "gpt-image-2");
       assert.equal(capturedForm?.get("prompt"), "延伸款式");
       assert.equal(capturedForm?.get("n"), "2");
-      assert.ok(capturedForm?.get("image") instanceof Blob);
+      assert.equal(capturedForm?.get("image"), null);
+      assert.equal(capturedForm?.getAll("image[]").length, 2);
+      assert.ok(capturedForm?.getAll("image[]").every((value) => value instanceof Blob));
       assert.deepEqual(result.images, ["https://cdn.example/result.png"]);
+    } finally {
+      restoreFetch();
+      restoreRetries();
+      restoreKey();
+      restoreBase();
+    }
+  });
+
+  await test("image2 多参考图保持顺序并限制最多 8 图", async () => {
+    const restoreBase = setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1");
+    const restoreKey = setEnv("CHANGE2PRO_API_KEY", "image2-test-key");
+    const restoreRetries = setEnv("AI_MAX_RETRIES", "0");
+    let capturedForm: FormData | undefined;
+    const restoreFetch = installFetchMock((_input, init) => {
+      capturedForm = init?.body as FormData;
+      return Response.json({ data: [{ b64_json: "aW1hZ2U=" }] });
+    });
+    const refs = Array.from({ length: 8 }, () => "data:image/png;base64,iVBORw0KGgo=");
+    try {
+      await image2Provider.edit({ prompt: "多图融合", referenceImages: refs });
+      assert.equal(capturedForm?.get("image"), null);
+      assert.equal(capturedForm?.getAll("image[]").length, 8);
+      await assert.rejects(
+        () => image2Provider.edit({ prompt: "超量", referenceImages: [...refs, refs[0]] }),
+        /at most 8 reference images/,
+      );
     } finally {
       restoreFetch();
       restoreRetries();

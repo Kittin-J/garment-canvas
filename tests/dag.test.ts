@@ -131,6 +131,26 @@ async function main() {
     ]);
   });
 
+  await ok("带提示词的 AI 节点最多接受 8 张参考图", () => {
+    const inputs = Array.from({ length: 9 }, (_, index) =>
+      imgNode(`ref${index + 1}`, `/api/files/ref${index + 1}.png`),
+    );
+    const transfer = aiNode("transfer", "ai-modify");
+    const eightEdges = inputs.slice(0, 8).map((node) => edge(node.id, "transfer"));
+    const valid = buildExecutionPlan([...inputs.slice(0, 8), transfer], eightEdges, {
+      onlyNodeId: "transfer",
+      includeDownstream: false,
+    });
+    assert.doesNotThrow(() => assertPlanInputs(valid, eightEdges));
+
+    const nineEdges = inputs.map((node) => edge(node.id, "transfer"));
+    const invalid = buildExecutionPlan([...inputs, transfer], nineEdges, {
+      onlyNodeId: "transfer",
+      includeDownstream: false,
+    });
+    assert.throws(() => assertPlanInputs(invalid, nineEdges), /at most 8 reference images/);
+  });
+
   await ok("环检测：A↔B 抛 DagError", () => {
     assert.throws(
       () => buildExecutionPlan([aiNode("a"), aiNode("b")], [edge("a", "b"), edge("b", "a")]),

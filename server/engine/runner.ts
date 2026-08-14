@@ -6,6 +6,7 @@ import { EventEmitter } from "node:events";
 import { nanoid } from "nanoid";
 import {
   NODE_SPECS,
+  MAX_REFERENCE_IMAGES,
   type ExecutionPlan,
   type NodeExecution,
   type NodeRunStatus,
@@ -131,6 +132,14 @@ async function executeRun(run: Run): Promise<void> {
       (u) => outputs.get(u.nodeId) ?? u.images,
     );
 
+    if (NODE_SPECS[step.kind].providerId && inputImages.length > MAX_REFERENCE_IMAGES) {
+      const message = `Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`;
+      const finishedAt = Date.now();
+      emit(run, { type: "node-status", nodeId: step.nodeId, status: "error", error: message, finishedAt });
+      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      return;
+    }
+
     // 运行时最终门禁：即使静态计划中的上游节点实际未产图，也绝不退化成无参考图付费生成。
     if (NODE_SPECS[step.kind].providerId && step.kind !== "sketch-to-render" && inputImages.length === 0) {
       const message = `Node ${step.nodeId} requires an upstream image`;
@@ -216,6 +225,9 @@ async function executeStep(step: NodeExecution, inputImages: string[]): Promise<
       const fabricImageUrl = step.params.fabricImageUrl as string | undefined;
       if (step.kind === "fabric-recolor" && fabricImageUrl) {
         referenceImages.push(...(await resolveImageRefs([fabricImageUrl])));
+      }
+      if (referenceImages.length > MAX_REFERENCE_IMAGES) {
+        throw new Error(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
       }
 
       const extra = ((step.params.prompt as string) ?? "").trim();
