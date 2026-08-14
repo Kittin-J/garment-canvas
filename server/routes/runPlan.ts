@@ -10,11 +10,12 @@ import { assertPlanInputs, buildExecutionPlan, DagError } from "../engine/dag";
 import { createRun, getRun, type RunEvent } from "../engine/runner";
 import { validateAndMigrateFlow, WorkflowValidationError } from "../lib/workflowSchema";
 import { requestUser } from "../lib/auth";
-import { db } from "../lib/database";
+import { asyncHandler } from "../lib/asyncHandler";
+import { queryOne } from "../lib/database";
 
 export const runPlanRouter = Router();
 
-runPlanRouter.post("/", (req, res) => {
+runPlanRouter.post("/", asyncHandler(async (req, res) => {
   const { nodes, edges, onlyNodeId, includeDownstream, projectId, projectName } = req.body as {
     nodes?: unknown[];
     edges?: unknown[];
@@ -64,14 +65,16 @@ runPlanRouter.post("/", (req, res) => {
           : 1;
     const user = requestUser(req);
     if (typeof projectId === "string") {
-      const project = db().prepare("SELECT owner_id FROM projects WHERE id = ? AND deleted_at IS NULL")
-        .get(projectId) as { owner_id: string } | undefined;
+      const project = await queryOne<{ owner_id: string }>(
+        "SELECT owner_id FROM projects WHERE id = $1 AND deleted_at IS NULL",
+        [projectId],
+      );
       if (project && project.owner_id !== user.id) {
         res.status(403).json({ error: "管理员只能查看其他用户项目，不能运行或修改" });
         return;
       }
     }
-    const run = createRun(plan, {
+    const run = await createRun(plan, {
       userId: user.id,
       projectId: typeof projectId === "string" ? projectId : undefined,
       projectName: typeof projectName === "string" ? projectName : undefined,
@@ -91,7 +94,7 @@ runPlanRouter.post("/", (req, res) => {
       res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
     }
   }
-});
+}));
 
 runPlanRouter.get("/:id/events", (req, res) => {
   const run = getRun(req.params.id);

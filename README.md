@@ -1,22 +1,38 @@
 # Garment Canvas
 
-## 本地开发
+## Docker 启动（推荐）
 
-要求 Node.js 20 或更高版本。
+要求 Docker Desktop / Docker Engine + Compose。先复制 `.env.example` 为私有
+`.env`，至少替换 PostgreSQL 密码、AI 网关和首次管理员配置，然后执行：
 
 ```bash
+docker compose up -d --build --wait
+```
+
+网页默认为 `http://localhost:3002`。PostgreSQL 数据保存在 Docker 命名卷
+`garment-canvas_postgres_data`，上传和生成文件仍保存在 `data/`。
+
+如果 `data/garment-canvas.db` 存在且 PostgreSQL 还没有用户，首次启动会自动导入
+旧 SQLite 中的用户、会话、项目、素材、生成记录和消耗流水。导入成功后原
+SQLite 文件会保留，便于回退核对。
+
+## 本地开发
+
+要求 Node.js 20 或更高版本。先只启动 PostgreSQL，再启动开发服务：
+
+```bash
+docker compose up -d postgres --wait
 npm ci
-npm run check
 npm run dev
 ```
 
 前端开发服务器默认为 `http://localhost:5173`，API 默认为
-`http://localhost:3001`。
+`http://localhost:3001`，本机 Node 通过 `POSTGRES_HOST_PORT`（默认 54329）连接容器。
 
-`npm run test` 会同时运行 DAG/Run、工作流 Schema、图片、SSRF、AI Provider 与限流回归；
-测试数据只写入临时目录，不会污染 `data/`。
+`npm run test` 会自动启动隔离的临时 PostgreSQL 容器，运行全部回归后删除测试容器和卷；
+测试数据不会污染正式数据。
 
-## 生产构建与启动
+## 非 Docker 构建与启动
 
 ```bash
 npm ci
@@ -43,12 +59,11 @@ npm start
 运行状态接口：
 
 - `GET /api/health`：进程存活检查；
-- `GET /api/ready`：检查 `DATA_DIR` 是否可写，以及完整模式下前端构建是否存在。
+- `GET /api/ready`：检查 PostgreSQL、`DATA_DIR`、AI 配置和完整模式下的前端构建。
 
-持久化目录可通过 `DATA_DIR` 指定。用户、会话、项目、素材、生成记录和消耗流水
-保存在该目录内的 SQLite 数据库中，上传及生成图片也保存在该目录。当前部署方案使用
-本地磁盘，不自动备份；`DATABASE_FILE` 可自定义数据库文件名，默认是
-`garment-canvas.db`。
+用户、会话、项目、素材、生成记录和消耗流水保存在 Docker 内置 PostgreSQL；上传及
+生成图片保存在 `DATA_DIR`。当前部署使用本地磁盘，不自动备份，但 PostgreSQL 命名卷
+与文件目录已分离，可后续接入备份接口。
 
 首次启动前必须在私有 `.env` 中配置管理员临时凭据（不要提交 `.env`）：
 

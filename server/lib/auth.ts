@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { NextFunction, Request, Response } from "express";
-import { db } from "./database";
+import { query, queryOne, transaction } from "./database";
 
 export interface AuthUser {
   id: string;
@@ -31,17 +31,18 @@ function cookieValue(req: Request, name: string): string | undefined {
   return undefined;
 }
 
-export function createSession(userId: string): { token: string; expiresAt: string } {
+export async function createSession(userId: string): Promise<{ token: string; expiresAt: string }> {
   const token = randomBytes(32).toString("base64url");
   const now = new Date();
   const expiresAt = new Date(now.getTime() + SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
-  const database = db();
-  database.transaction(() => {
+  await transaction(async (client) => {
     // 单账号单设备：新登录成功后，旧设备会话立即失效。
-    database.prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
-    database.prepare("INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES (?, ?, ?, ?)")
-      .run(sessionHash(token), userId, now.toISOString(), expiresAt);
-  })();
+    await client.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
+    await client.query(
+      "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
+      [sessionHash(token), userId, now.toISOString(), expiresAt],
+    );
+  });
   return { token, expiresAt };
 }
 
@@ -60,26 +61,26 @@ export function clearSessionCookie(res: Response): void {
   res.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: "strict", path: "/" });
 }
 
-export function revokeRequestSession(req: Request): void {
+export async function revokeRequestSession(req: Request): Promise<void> {
   const token = cookieValue(req, SESSION_COOKIE);
-  if (token) db().prepare("DELETE FROM sessions WHERE token_hash = ?").run(sessionHash(token));
+  if (token) await query("DELETE FROM sessions WHERE token_hash = $1", [sessionHash(token)]);
 }
 
-export function revokeUserSessions(userId: string): void {
-  db().prepare("DELETE FROM sessions WHERE user_id = ?").run(userId);
+export async function revokeUserSessions(userId: string): Promise<void> {
+  await query("DELETE FROM sessions WHERE user_id = $1", [userId]);
 }
 
-export function authenticatedUser(req: Request): AuthUser | undefined {
+export async function authenticatedUser(req: Request): Promise<AuthUser | undefined> {
   const token = cookieValue(req, SESSION_COOKIE);
   if (!token) return undefined;
   const now = new Date().toISOString();
-  const row = db().prepare(`
+  const row = await queryOne<{
+    id: string; account_id: string; display_name: string; role: "admin" | "user"; must_change_password: number;
+  }>(`
     SELECT u.id, u.account_id, u.display_name, u.role, u.must_change_password
     FROM sessions s JOIN users u ON u.id = s.user_id
-    WHERE s.token_hash = ? AND s.expires_at > ? AND u.active = 1 AND u.deleted_at IS NULL
-  `).get(sessionHash(token), now) as {
-    id: string; account_id: string; display_name: string; role: "admin" | "user"; must_change_password: number;
-  } | undefined;
+    WHERE s.token_hash = $1 AND s.expires_at > $2 AND u.active = 1 AND u.deleted_at IS NULL
+  `, [sessionHash(token), now]);
   if (!row) return undefined;
   return {
     id: row.id,
@@ -91,14 +92,15 @@ export function authenticatedUser(req: Request): AuthUser | undefined {
 }
 
 export function requireAuth(req: Request, res: Response, next: NextFunction): void {
-  const user = authenticatedUser(req);
-  if (!user) {
-    clearSessionCookie(res);
-    res.status(401).json({ error: "请先登录", code: "UNAUTHENTICATED" });
-    return;
-  }
-  (req as AuthenticatedRequest).authUser = user;
-  next();
+  void authenticatedUser(req).then((user) => {
+    if (!user) {
+      clearSessionCookie(res);
+      res.status(401).json({ error: "请先登录", code: "UNAUTHENTICATED" });
+      return;
+    }
+    (req as AuthenticatedRequest).authUser = user;
+    next();
+  }).catch(next);
 }
 
 export function requirePasswordChanged(req: Request, res: Response, next: NextFunction): void {
@@ -123,6 +125,6 @@ export function requestUser(req: Request): AuthUser {
   return (req as AuthenticatedRequest).authUser;
 }
 
-export function pruneExpiredSessions(): void {
-  db().prepare("DELETE FROM sessions WHERE expires_at <= ?").run(new Date().toISOString());
+export async function pruneExpiredSessions(): Promise<void> {
+  await query("DELETE FROM sessions WHERE expires_at <= $1", [new Date().toISOString()]);
 }

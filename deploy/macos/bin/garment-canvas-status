@@ -4,6 +4,7 @@ set -euo pipefail
 LABEL="${GARMENT_CANVAS_LABEL:-com.garmentcanvas.server}"
 DOMAIN="gui/$(id -u)"
 ENV_FILE="$HOME/Library/Application Support/GarmentCanvas/config/service.env"
+POSTGRES_CONTAINER="${GARMENT_CANVAS_POSTGRES_CONTAINER:-garment-canvas-postgres}"
 
 read_port() {
   local line value
@@ -17,6 +18,12 @@ read_port() {
 }
 
 PORT="${PORT:-$(read_port)}"
+
+if command -v docker >/dev/null 2>&1 && [[ "$(docker container inspect -f '{{.State.Running}}' "$POSTGRES_CONTAINER" 2>/dev/null || true)" == "true" ]]; then
+  print "PostgreSQL: running"
+else
+  print -u2 "PostgreSQL: not running"
+fi
 
 if /bin/launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
   print "Service: loaded"

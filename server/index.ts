@@ -16,16 +16,14 @@ import { authRouter } from "./routes/auth";
 import { historyRouter } from "./routes/history";
 import { usageRouter } from "./routes/usage";
 import { requireAuth, requirePasswordChanged, pruneExpiredSessions } from "./lib/auth";
-import { db, hasUsers } from "./lib/database";
+import { databaseReady, hasUsers, initializeDatabase } from "./lib/database";
 import { migrateLegacyData } from "./lib/legacyMigration";
+import { asyncHandler } from "./lib/asyncHandler";
+import type { ErrorRequestHandler } from "express";
 
 const app = express();
 
 app.use(express.json({ limit: "50mb" }));
-
-db();
-pruneExpiredSessions();
-migrateLegacyData();
 
 const aiRateLimit = createRateLimitMiddleware();
 const loginRateLimit = createRateLimitMiddleware({ windowMs: 60_000, maxRequests: 10 });
@@ -65,20 +63,21 @@ function dataDirWritable(): boolean {
   return writable;
 }
 
-function readiness() {
+async function readiness() {
   const checks = {
     dataDirWritable: dataDirWritable(),
     frontend: !isProduction || apiOnly || fs.existsSync(distIndex),
     aiConfigured: config.aiConfigReady(),
-    usersConfigured: hasUsers(),
+    database: await databaseReady(),
+    usersConfigured: await hasUsers(),
   };
   return { ok: Object.values(checks).every(Boolean), checks, mode: apiOnly ? "api-only" : "full" };
 }
 
-app.get("/api/ready", (_req, res) => {
-  const ready = readiness();
+app.get("/api/ready", asyncHandler(async (_req, res) => {
+  const ready = await readiness();
   res.status(ready.ok ? 200 : 503).json(ready);
-});
+}));
 
 app.use("/api/auth/login", loginRateLimit);
 app.use("/api/auth", authRouter);
@@ -92,6 +91,12 @@ app.use("/api/assets", assetsRouter);
 app.use("/api/history", historyRouter);
 app.use("/api/usage", usageRouter);
 
+const apiErrorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
+  console.error("[garment-canvas] request failed", error);
+  if (!res.headersSent) res.status(500).json({ error: "服务器暂时无法处理请求" });
+};
+app.use(apiErrorHandler);
+
 // 生产模式：完整模式必须有前端构建；API_ONLY=true 可显式跳过前端托管。
 if (isProduction && !apiOnly) {
   if (!fs.existsSync(distIndex)) {
@@ -104,10 +109,15 @@ if (isProduction && !apiOnly) {
 }
 
 const port = config.port();
-const initialReadiness = readiness();
-if (!initialReadiness.ok) {
-  throw new Error(`Server is not ready: ${JSON.stringify(initialReadiness.checks)}`);
+async function start(): Promise<void> {
+  await initializeDatabase();
+  await pruneExpiredSessions();
+  await migrateLegacyData();
+  const initialReadiness = await readiness();
+  if (!initialReadiness.ok) throw new Error(`Server is not ready: ${JSON.stringify(initialReadiness.checks)}`);
+  app.listen(port, () => {
+    console.log(`[garment-canvas] server listening on http://localhost:${port} (${initialReadiness.mode})`);
+  });
 }
-app.listen(port, () => {
-  console.log(`[garment-canvas] server listening on http://localhost:${port} (${initialReadiness.mode})`);
-});
+
+await start();

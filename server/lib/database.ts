@@ -1,32 +1,86 @@
-import fs from "node:fs";
-import path from "node:path";
-import Database from "better-sqlite3";
+import pg, { type PoolClient, type QueryResultRow } from "pg";
 import { nanoid } from "nanoid";
 import { config } from "../config";
 import { hashPassword, validatePassword } from "./password";
+import { importSqliteIfNeeded } from "./sqliteImport";
 
-let instance: Database.Database | undefined;
+const { Pool, types } = pg;
+types.setTypeParser(20, Number);
 
-export function db(): Database.Database {
-  if (instance) return instance;
-  const file = config.databasePath();
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  instance = new Database(file);
-  instance.pragma("journal_mode = WAL");
-  instance.pragma("foreign_keys = ON");
-  instance.pragma("busy_timeout = 5000");
-  migrate(instance);
-  bootstrapInitialAdmin(instance);
-  return instance;
+let pool: pg.Pool | undefined;
+let initialization: Promise<void> | undefined;
+
+export function db(): pg.Pool {
+  if (!pool) {
+    const connectionString = config.databaseUrl();
+    pool = new Pool({
+      ...(connectionString
+        ? { connectionString }
+        : {
+            host: config.databaseHost(),
+            port: config.databasePort(),
+            database: config.databaseName(),
+            user: config.databaseUser(),
+            password: config.databasePassword(),
+          }),
+      max: config.databasePoolSize(),
+      connectionTimeoutMillis: 10_000,
+      idleTimeoutMillis: 30_000,
+    });
+    pool.on("error", (error) => console.error("[garment-canvas] PostgreSQL idle client error", error));
+  }
+  return pool;
 }
 
-export function closeDatabaseForTests(): void {
-  instance?.close();
-  instance = undefined;
+export async function query<T extends QueryResultRow = QueryResultRow>(
+  text: string,
+  values: unknown[] = [],
+  client: pg.Pool | PoolClient = db(),
+): Promise<T[]> {
+  return (await client.query<T>(text, values)).rows;
 }
 
-function migrate(database: Database.Database): void {
-  database.exec(`
+export async function queryOne<T extends QueryResultRow = QueryResultRow>(
+  text: string,
+  values: unknown[] = [],
+  client: pg.Pool | PoolClient = db(),
+): Promise<T | undefined> {
+  return (await client.query<T>(text, values)).rows[0];
+}
+
+export async function transaction<T>(fn: (client: PoolClient) => Promise<T>): Promise<T> {
+  const client = await db().connect();
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function initializeDatabase(): Promise<void> {
+  initialization ??= (async () => {
+    await migrate();
+    await importSqliteIfNeeded();
+    await bootstrapInitialAdmin();
+  })();
+  return initialization;
+}
+
+export async function closeDatabaseForTests(): Promise<void> {
+  const current = pool;
+  pool = undefined;
+  initialization = undefined;
+  if (current) await current.end();
+}
+
+async function migrate(): Promise<void> {
+  await db().query(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       account_id TEXT NOT NULL UNIQUE,
@@ -108,8 +162,8 @@ function migrate(database: Database.Database): void {
       provider_requests INTEGER NOT NULL DEFAULT 0,
       status TEXT NOT NULL CHECK (status IN ('queued','running','success','error')),
       error TEXT,
-      started_at INTEGER NOT NULL,
-      finished_at INTEGER
+      started_at BIGINT NOT NULL,
+      finished_at BIGINT
     );
     CREATE INDEX IF NOT EXISTS generation_runs_owner_idx ON generation_runs(owner_id, started_at DESC);
 
@@ -120,7 +174,7 @@ function migrate(database: Database.Database): void {
       prompt TEXT,
       status TEXT NOT NULL CHECK (status IN ('success','error')),
       error TEXT,
-      created_at INTEGER NOT NULL
+      created_at BIGINT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS generation_outputs_run_idx ON generation_outputs(run_id, created_at);
 
@@ -140,24 +194,32 @@ function migrate(database: Database.Database): void {
   `);
 }
 
-function bootstrapInitialAdmin(database: Database.Database): void {
-  const count = database.prepare("SELECT COUNT(*) AS count FROM users").get() as { count: number };
-  if (count.count > 0) return;
+async function bootstrapInitialAdmin(): Promise<void> {
+  const row = await queryOne<{ count: number }>("SELECT COUNT(*)::int AS count FROM users");
+  if ((row?.count ?? 0) > 0) return;
   const accountId = config.initialAdminAccountId();
   const password = config.initialAdminPassword();
   if (!accountId || !password) return;
   const passwordError = validatePassword(password);
-  if (passwordError) {
-    throw new Error(`INITIAL_ADMIN_PASSWORD 不符合要求：${passwordError}`);
-  }
+  if (passwordError) throw new Error(`INITIAL_ADMIN_PASSWORD 不符合要求：${passwordError}`);
   const now = new Date().toISOString();
-  database.prepare(`
+  await db().query(`
     INSERT INTO users (id, account_id, display_name, role, password_hash, must_change_password, active, created_at, updated_at)
-    VALUES (?, ?, ?, 'admin', ?, 1, 1, ?, ?)
-  `).run(nanoid(12), accountId, "管理员", hashPassword(password), now, now);
+    VALUES ($1, $2, $3, 'admin', $4, 1, 1, $5, $5)
+    ON CONFLICT (account_id) DO NOTHING
+  `, [nanoid(12), accountId, "管理员", hashPassword(password), now]);
 }
 
-export function hasUsers(): boolean {
-  const row = db().prepare("SELECT EXISTS(SELECT 1 FROM users) AS ok").get() as { ok: number };
-  return row.ok === 1;
+export async function hasUsers(): Promise<boolean> {
+  const row = await queryOne<{ ok: boolean }>("SELECT EXISTS(SELECT 1 FROM users) AS ok");
+  return row?.ok === true;
+}
+
+export async function databaseReady(): Promise<boolean> {
+  try {
+    await db().query("SELECT 1");
+    return true;
+  } catch {
+    return false;
+  }
 }
