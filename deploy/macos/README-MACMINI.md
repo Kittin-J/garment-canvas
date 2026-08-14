@@ -33,6 +33,9 @@
    open -e "$HOME/Library/Application Support/GarmentCanvas/config/service.env"
    ```
 
+   首次部署必须填写 `INITIAL_ADMIN_ACCOUNT_ID` 和 `INITIAL_ADMIN_PASSWORD`。
+   初始密码只在数据库没有用户时使用，首次登录后会强制修改；请勿把实际密码写回安装包或提交到 Git。
+
 5. 双击 `start.command`。启动成功后访问：
 
    <http://127.0.0.1:3001/>

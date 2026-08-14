@@ -40,6 +40,13 @@ export interface RecentResult {
   finishedAt?: number;
   status: "queued" | "running" | "success" | "error";
   error?: string;
+  ownerId?: string;
+  ownerName?: string;
+  requestedCount?: number;
+  successfulCount?: number;
+  providerRequests?: number;
+  parameters?: Record<string, unknown>;
+  referenceImages?: string[];
 }
 
 type SaveState = "idle" | "saving" | "saved" | "error";
@@ -48,6 +55,7 @@ export interface ProjectTab {
   id: string;
   projectId: string;
   projectName: string;
+  readOnly: boolean;
   nodes: FlowNode[];
   edges: Edge[];
   selectedNodeId: string | null;
@@ -66,6 +74,7 @@ interface FlowState {
   activeTabId: string;
   projectId: string;
   projectName: string;
+  readOnly: boolean;
   nodes: FlowNode[];
   edges: Edge[];
   selectedNodeId: string | null;
@@ -95,6 +104,7 @@ interface FlowState {
     nodes: FlowNode[];
     edges: Edge[];
     markDirty?: boolean;
+    readOnly?: boolean;
   }) => void;
   createBlankTab: () => void;
   setProjectName: (name: string) => void;
@@ -238,6 +248,7 @@ type ActiveDocumentState = Pick<
   FlowState,
   | "projectId"
   | "projectName"
+  | "readOnly"
   | "nodes"
   | "edges"
   | "selectedNodeId"
@@ -255,6 +266,7 @@ function snapshotActiveTab(state: FlowState): ProjectTab {
     id: state.activeTabId,
     projectId: state.projectId,
     projectName: state.projectName,
+    readOnly: state.readOnly,
     nodes: state.nodes,
     edges: state.edges,
     selectedNodeId: state.selectedNodeId,
@@ -272,6 +284,7 @@ function activeFields(tab: ProjectTab): ActiveDocumentState {
   return {
     projectId: tab.projectId,
     projectName: tab.projectName,
+    readOnly: tab.readOnly,
     nodes: tab.nodes,
     edges: tab.edges,
     selectedNodeId: tab.selectedNodeId,
@@ -316,12 +329,14 @@ function newTab(opts?: {
   nodes?: FlowNode[];
   edges?: Edge[];
   markDirty?: boolean;
+  readOnly?: boolean;
 }): ProjectTab {
   const markDirty = opts?.markDirty ?? false;
   return {
     id: nanoid(10),
     projectId: opts?.projectId ?? nanoid(10),
     projectName: opts?.projectName ?? "未命名设计项目",
+    readOnly: opts?.readOnly ?? false,
     nodes: opts?.nodes ?? [makeStarterNode()],
     edges: opts?.edges ?? [],
     selectedNodeId: null,
@@ -378,6 +393,7 @@ function loadTabSession(): { tabs: ProjectTab[]; activeTabId: string } | undefin
       if (!valid) return [];
       return [{
         ...(tab as ProjectTab),
+        readOnly: tab.readOnly === true,
         // 页面刷新会中断原保存请求，不能恢复一个已不存在的 in-flight 状态。
         saveState:
           tab.saveState === "saved" || tab.saveState === "error"
@@ -603,7 +619,8 @@ export const useFlowStore = create<FlowState>()(
       tabs: restored?.tabs ?? [initialTab],
       activeTabId: initialTab.id,
       ...activeFields(initialTab),
-      recentResults: typeof window === "undefined" ? [] : loadRecentResults(),
+      // 服务端历史在登录成功后注入；不能从浏览器本地缓存恢复其他账号的记录。
+      recentResults: [],
       viewer: null,
 
       switchTab: (tabId) => {
@@ -641,7 +658,7 @@ export const useFlowStore = create<FlowState>()(
         });
         useFlowStore.temporal.getState().clear();
       },
-      openFlowTab: ({ projectId, projectName, nodes, edges, markDirty = false }) => {
+      openFlowTab: ({ projectId, projectName, nodes, edges, markDirty = false, readOnly = false }) => {
         const state = get();
         const current = snapshotActiveTab(state);
         const syncedTabs = replaceTab(state.tabs, current);
@@ -654,7 +671,7 @@ export const useFlowStore = create<FlowState>()(
             viewer: null,
           });
         } else {
-          const tab = newTab({ projectId, projectName, nodes, edges, markDirty });
+          const tab = newTab({ projectId, projectName, nodes, edges, markDirty, readOnly });
           set({
             tabs: [...syncedTabs, tab],
             activeTabId: tab.id,
@@ -677,6 +694,7 @@ export const useFlowStore = create<FlowState>()(
       },
 
       setProjectName: (name) => {
+        if (get().readOnly) return;
         if (name === get().projectName) return;
         markDocumentChanged(set, { projectName: name });
       },
@@ -695,18 +713,20 @@ export const useFlowStore = create<FlowState>()(
       closeViewer: () => set({ viewer: null }),
 
       onNodesChange: (changes) => {
-        const nodes = applyNodeChanges(changes, get().nodes);
+        const allowed = get().readOnly ? changes.filter((change) => change.type === "select" || change.type === "dimensions") : changes;
+        const nodes = applyNodeChanges(allowed, get().nodes);
         if (nodes === get().nodes) return;
-        const changesDocument = changes.some(
+        const changesDocument = allowed.some(
           (change) => change.type !== "select" && change.type !== "dimensions",
         );
         if (changesDocument) markDocumentChanged(set, { nodes });
         else withoutTemporalTracking(() => set({ nodes }));
       },
       onEdgesChange: (changes) => {
-        const edges = applyEdgeChanges(changes, get().edges);
+        const allowed = get().readOnly ? changes.filter((change) => change.type === "select") : changes;
+        const edges = applyEdgeChanges(allowed, get().edges);
         if (edges === get().edges) return;
-        const changesDocument = changes.some((change) => change.type !== "select");
+        const changesDocument = allowed.some((change) => change.type !== "select");
         if (changesDocument) markDocumentChanged(set, { edges });
         else withoutTemporalTracking(() => set({ edges }));
       },
@@ -725,11 +745,13 @@ export const useFlowStore = create<FlowState>()(
       },
 
       onConnect: (conn) => {
+        if (get().readOnly) return;
         if (!get().isValidConnection(conn)) return;
         markDocumentChanged(set, { edges: addEdge(conn, get().edges) });
       },
 
       addNode: (kind, position) => {
+        if (get().readOnly) return;
         const node: FlowNode = {
           id: nanoid(8),
           type: kind,
@@ -740,10 +762,12 @@ export const useFlowStore = create<FlowState>()(
       },
 
       addExistingNode: (node) => {
+        if (get().readOnly) return;
         markDocumentChanged(set, { nodes: [...get().nodes, node], selectedNodeId: node.id });
       },
 
       updateNodeData: (id, patch) => {
+        if (get().readOnly) return;
         if (!get().nodes.some((n) => n.id === id)) return;
         markDocumentChanged(set, {
           nodes: get().nodes.map((n) =>
@@ -752,6 +776,7 @@ export const useFlowStore = create<FlowState>()(
         });
       },
       updateNodeDataInTab: (tabId, id, patch) => {
+        if (documentForTab(get(), tabId)?.readOnly) return;
         updateTabNodes(
           set,
           tabId,
@@ -780,6 +805,7 @@ export const useFlowStore = create<FlowState>()(
 
       runNode: async (id) => {
         const initialState = get();
+        if (initialState.readOnly) return;
         const node = initialState.nodes.find((n) => n.id === id);
         if (!node || node.data.status === "running" || node.data.status === "queued") return;
         const kind = node.data.kind;
@@ -831,6 +857,8 @@ export const useFlowStore = create<FlowState>()(
               edges: edgesSnapshot,
               onlyNodeId: id,
               includeDownstream: false,
+              projectId: initialState.projectId,
+              projectName: initialState.projectName,
             }),
           });
           const payload = (await response.json().catch(() => ({}))) as {
@@ -912,6 +940,7 @@ export const useFlowStore = create<FlowState>()(
       },
 
       saveProject: async () => {
+        if (get().readOnly) return;
         const tabId = get().activeTabId;
         const existing = saveQueueByTab.get(tabId);
         if (existing) {
@@ -1036,6 +1065,7 @@ export const useFlowStore = create<FlowState>()(
           ...snapshotActiveTab(state),
           projectId,
           projectName,
+          readOnly: false,
           nodes,
           edges,
           selectedNodeId: null,
@@ -1064,16 +1094,7 @@ export const useFlowStore = create<FlowState>()(
   ),
 );
 
-// 最近生成变化时写入 localStorage（仅在该字段引用变化时）
 if (typeof window !== "undefined") {
-  let lastRecent = useFlowStore.getState().recentResults;
-  useFlowStore.subscribe((state) => {
-    if (state.recentResults !== lastRecent) {
-      lastRecent = state.recentResults;
-      persistRecentResults(lastRecent);
-    }
-  });
-
   let lastTabSessionJson = "";
   useFlowStore.subscribe((state) => {
     const current = snapshotActiveTab(state);
@@ -1095,6 +1116,7 @@ if (typeof window !== "undefined") {
       snapshot.id !== lastActiveSnapshot.id ||
       snapshot.projectId !== lastActiveSnapshot.projectId ||
       snapshot.projectName !== lastActiveSnapshot.projectName ||
+      snapshot.readOnly !== lastActiveSnapshot.readOnly ||
       snapshot.nodes !== lastActiveSnapshot.nodes ||
       snapshot.edges !== lastActiveSnapshot.edges ||
       snapshot.selectedNodeId !== lastActiveSnapshot.selectedNodeId ||
@@ -1113,8 +1135,11 @@ if (typeof window !== "undefined") {
       }
     }
   });
+}
 
-  const resumable = lastRecent.filter(
+/** 登录后以服务器历史为准，恢复仍在当前服务进程中执行的任务。 */
+export function resumeRecentResults(records: RecentResult[]): void {
+  const resumable = records.filter(
     (record) =>
       (record.status === "queued" || record.status === "running") && Boolean(record.runId),
   );

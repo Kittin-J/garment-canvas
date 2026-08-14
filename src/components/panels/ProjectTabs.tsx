@@ -27,7 +27,7 @@ export function ProjectTabs() {
   return (
     <nav
       aria-label="项目画布页签"
-      className="flex h-9 shrink-0 items-end gap-1 overflow-x-auto border-b border-[#262626] bg-[#101010] px-2 pt-1"
+      className="gc-panel flex h-9 shrink-0 items-end gap-1 overflow-x-auto border-b border-[#262626] bg-[#101010] px-2 pt-1"
     >
       {tabs.map((tab) => {
         const active = tab.id === activeTabId;

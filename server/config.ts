@@ -54,6 +54,9 @@ export const config = {
 
   port: () => Number(process.env.PORT ?? 3001),
   dataDir: () => path.resolve(ROOT_DIR, process.env.DATA_DIR ?? "./data"),
+  databasePath: () => path.resolve(config.dataDir(), process.env.DATABASE_FILE ?? "garment-canvas.db"),
+  initialAdminAccountId: () => process.env.INITIAL_ADMIN_ACCOUNT_ID?.trim() ?? "",
+  initialAdminPassword: () => process.env.INITIAL_ADMIN_PASSWORD ?? "",
   /** 生产模式是否只提供 API；true 时不要求或托管前端 dist。 */
   apiOnly: () => process.env.API_ONLY === "true",
 

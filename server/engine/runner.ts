@@ -12,8 +12,17 @@ import {
   type NodeRunStatus,
 } from "../../src/types/workflow";
 import { getProvider } from "../providers";
+import { generateExactImages } from "../providers/exact";
 import { normalizeImageRef, persistImageRef } from "../lib/fileStore";
 import { buildRecolorPrompt } from "../../src/lib/colors";
+import {
+  completeGenerationRecord,
+  createGenerationRecord,
+  failGenerationRecord,
+  markGenerationRunning,
+  registerGeneratedFiles,
+  type GenerationRecordContext,
+} from "../lib/generationRecords";
 
 export interface RunFailure {
   prompt?: string;
@@ -41,6 +50,7 @@ interface StepResult {
   model?: string;
   prompts?: string[];
   failures?: RunFailure[];
+  providerRequests: number;
 }
 
 const DEFAULT_PROMPTS: Partial<Record<NodeExecution["kind"], string>> = {
@@ -56,6 +66,7 @@ interface Run {
   events: RunEvent[]; // 已完成事件（供 SSE 重放）
   finished: boolean;
   createdAt: number;
+  recordContext?: GenerationRecordContext;
 }
 
 const runs = new Map<string, Run>();
@@ -91,7 +102,7 @@ export function getRun(id: string): Run | undefined {
   return runs.get(id);
 }
 
-export function createRun(plan: ExecutionPlan): Run {
+export function createRun(plan: ExecutionPlan, recordContext?: GenerationRecordContext): Run {
   pruneRuns();
   const run: Run = {
     id: nanoid(10),
@@ -100,12 +111,15 @@ export function createRun(plan: ExecutionPlan): Run {
     events: [],
     finished: false,
     createdAt: Date.now(),
+    recordContext,
   };
   run.emitter.setMaxListeners(50);
   runs.set(run.id, run);
+  if (recordContext) createGenerationRecord(run.id, recordContext, run.createdAt);
   // 异步启动，调用方先拿到 runId 再订阅事件
   setImmediate(() => {
     executeRun(run).catch((err) => {
+      if (run.recordContext) failGenerationRecord(run.id, err instanceof Error ? err.message : String(err), Date.now());
       emit(run, { type: "run-error", error: err instanceof Error ? err.message : String(err) });
     });
   });
@@ -156,13 +170,29 @@ async function executeRun(run: Run): Promise<void> {
     }
 
     const startedAt = Date.now();
+    if (run.recordContext?.nodeId === step.nodeId) markGenerationRunning(run.id, startedAt);
     emit(run, { type: "node-status", nodeId: step.nodeId, status: "running", startedAt });
     try {
       const result = await executeStep(step, inputImages);
       // 产出统一落盘为 /api/files/:id，避免 base64 大图驻留事件与内存
       const persisted = await persistOutputImages(result.images);
+      if (run.recordContext) {
+        registerGeneratedFiles(run.recordContext, run.id, step.nodeId, persisted, Date.now());
+      }
       outputs.set(step.nodeId, persisted);
       const finishedAt = Date.now();
+      if (run.recordContext?.nodeId === step.nodeId) {
+        completeGenerationRecord({
+          runId: run.id,
+          images: persisted,
+          prompts: result.prompts,
+          failures: result.failures,
+          model: result.model,
+          providerRequests: result.providerRequests,
+          startedAt,
+          finishedAt,
+        });
+      }
       const partialWarning = result.failures?.length
         ? `${result.failures.length} 个生成任务失败`
         : undefined;
@@ -181,6 +211,7 @@ async function executeRun(run: Run): Promise<void> {
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       const finishedAt = Date.now();
+      if (run.recordContext?.nodeId === step.nodeId) failGenerationRecord(run.id, message, finishedAt);
       emit(run, {
         type: "node-status",
         nodeId: step.nodeId,
@@ -205,11 +236,11 @@ async function executeStep(step: NodeExecution, inputImages: string[]): Promise<
   switch (step.kind) {
     case "image-input": {
       const imageUrl = step.params.imageUrl as string | undefined;
-      return { images: imageUrl ? [imageUrl] : [] };
+      return { images: imageUrl ? [imageUrl] : [], providerRequests: 0 };
     }
     case "result": {
       // 结果节点：汇总上游本次运行的真实产出
-      return { images: inputImages };
+      return { images: inputImages, providerRequests: 0 };
     }
     case "sketch-to-render":
     case "ai-modify":
@@ -242,12 +273,12 @@ async function executeStep(step: NodeExecution, inputImages: string[]): Promise<
           const prompts: string[] = [];
           const failures: RunFailure[] = [];
           let model: string | undefined;
+          let providerRequests = 0;
           for (const color of colors) {
             const prompt = buildRecolorPrompt([color]);
             try {
-              const result = referenceImages.length
-                ? await provider.edit({ prompt, referenceImages, batchSize: 1 })
-                : await provider.generate({ prompt, batchSize: 1 });
+              const result = await generateExactImages(provider, { prompt, referenceImages }, 1);
+              providerRequests += result.providerRequests;
               model = result.model;
               for (const image of result.images) {
                 images.push(image);
@@ -263,7 +294,7 @@ async function executeStep(step: NodeExecution, inputImages: string[]): Promise<
           if (images.length === 0) {
             throw new Error(failures[0]?.error ?? "全部配色生成失败");
           }
-          return { images, prompts, model, failures: failures.length ? failures : undefined };
+          return { images, prompts, model, providerRequests, failures: failures.length ? failures : undefined };
         }
       }
 
@@ -273,34 +304,15 @@ async function executeStep(step: NodeExecution, inputImages: string[]): Promise<
         const prompt =
           "基于这张印花图案生成风格一致的新变体：保持原有配色体系、艺术风格与笔触质感，重新编排元素的构图与组合方式，纯白背景，适合作为印花素材复用" +
           (extra ? `。补充要求：${extra}` : "");
-        const all: string[] = [];
-        const prompts: string[] = [];
-        const failures: RunFailure[] = [];
-        let model: string | undefined;
-        let attempts = 0;
-        while (all.length < count && attempts < count + 3) {
-          attempts++;
-          const n = Math.min(4, count - all.length);
-          try {
-            const result = referenceImages.length
-              ? await provider.edit({ prompt, referenceImages, batchSize: n })
-              : await provider.generate({ prompt, batchSize: n });
-            model = result.model;
-            const accepted = result.images.slice(0, count - all.length);
-            all.push(...accepted);
-            prompts.push(...accepted.map(() => prompt));
-          } catch (err) {
-            failures.push({
-              prompt,
-              error: err instanceof Error ? err.message : String(err),
-            });
-          }
-        }
-        if (all.length === 0) throw new Error(failures[0]?.error ?? "印花裂变失败");
-        if (all.length < count && failures.length === 0) {
-          failures.push({ prompt, error: `只生成了 ${all.length}/${count} 张图片` });
-        }
-        return { images: all, prompts, model, failures: failures.length ? failures : undefined };
+        const result = await generateExactImages(provider, { prompt, referenceImages }, count);
+        const failures = result.failures.map((error) => ({ prompt, error }));
+        return {
+          images: result.images,
+          prompts: result.images.map(() => prompt),
+          model: result.model,
+          providerRequests: result.providerRequests,
+          failures: failures.length ? failures : undefined,
+        };
       }
 
       const prompt =
@@ -317,13 +329,16 @@ async function executeStep(step: NodeExecution, inputImages: string[]): Promise<
         batchSize: step.params.batchSize as number | undefined,
         imageSize: step.kind === "upscale" ? (step.params.imageSize as string) : undefined,
       };
-      const result = referenceImages.length
-        ? await provider.edit(request)
-        : await provider.generate(request);
+      const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify"
+        ? Math.max(1, Math.min(4, Number(step.params.batchSize) || 1))
+        : 1;
+      const result = await generateExactImages(provider, request, requestedCount);
       return {
         images: result.images,
         model: result.model,
         prompts: result.images.map(() => prompt),
+        providerRequests: result.providerRequests,
+        failures: result.failures.length ? result.failures.map((error) => ({ prompt, error })) : undefined,
       };
     }
   }

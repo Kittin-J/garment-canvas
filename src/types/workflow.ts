@@ -200,6 +200,10 @@ export interface WorkflowTemplate {
 // ---------- 素材库（印花提取等产出的可复用素材）----------
 export interface Asset {
   id: string;
+  ownerId?: string | null;
+  ownerName?: string | null;
+  scope?: "global" | "private" | "shared";
+  canManage?: boolean;
   name: string;
   /** 素材类型：print=印花 / fabric=面料 / reference=参考图 */
   category: "print" | "fabric" | "reference";
@@ -208,6 +212,8 @@ export interface Asset {
   /** 来源说明（如来自哪个节点/项目） */
   sourceNote?: string;
   createdAt: string;
+  deletedAt?: string | null;
+  purgeAfter?: string | null;
 }
 
 // ---------- API 契约（前端 ↔ Express）----------

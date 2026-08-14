@@ -33,6 +33,7 @@ export function CanvasFlow() {
   const isValidConnection = useFlowStore((s) => s.isValidConnection);
   const addNode = useFlowStore((s) => s.addNode);
   const setSelectedNodeId = useFlowStore((s) => s.setSelectedNodeId);
+  const readOnly = useFlowStore((s) => s.readOnly);
   const { screenToFlowPosition } = useReactFlow();
   const [theme] = useTheme();
   const minimap = MINIMAP_COLORS[theme];
@@ -41,10 +42,10 @@ export function CanvasFlow() {
     (e: React.DragEvent) => {
       e.preventDefault();
       const kind = e.dataTransfer.getData(DND_MIME) as NodeKind | "";
-      if (!kind) return;
+      if (!kind || readOnly) return;
       addNode(kind, screenToFlowPosition({ x: e.clientX, y: e.clientY }));
     },
-    [addNode, screenToFlowPosition],
+    [addNode, screenToFlowPosition, readOnly],
   );
 
   const onNodeClick: NodeMouseHandler = useCallback(
@@ -69,7 +70,9 @@ export function CanvasFlow() {
         }}
         onNodeClick={onNodeClick}
         onPaneClick={() => setSelectedNodeId(null)}
-        deleteKeyCode={["Delete", "Backspace"]}
+        deleteKeyCode={readOnly ? null : ["Delete", "Backspace"]}
+        nodesDraggable={!readOnly}
+        nodesConnectable={!readOnly}
         selectionOnDrag
         panOnDrag={[1, 2]}
         defaultViewport={{ x: 100, y: 200, zoom: 1 }}

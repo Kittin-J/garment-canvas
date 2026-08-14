@@ -9,6 +9,8 @@ import path from "node:path";
 import { isSupportedImageFile, mimeOfFile, saveDataUrl, uploadsDir } from "../lib/fileStore";
 import { ProviderError } from "../providers/base";
 import { ImageValidationError } from "../lib/imageValidation";
+import { requestUser } from "../lib/auth";
+import { db } from "../lib/database";
 
 export const filesRouter = Router();
 
@@ -19,7 +21,11 @@ filesRouter.post("/", (req, res) => {
     return;
   }
   try {
-    res.json(saveDataUrl(dataUrl));
+    const saved = saveDataUrl(dataUrl);
+    db().prepare(`
+      INSERT INTO files (id, owner_id, source_type, created_at) VALUES (?, ?, 'upload', ?)
+    `).run(saved.id, requestUser(req).id, new Date().toISOString());
+    res.json(saved);
   } catch (err) {
     if (err instanceof ProviderError || err instanceof ImageValidationError) {
       res.status(400).json({ error: err.message });
@@ -38,6 +44,16 @@ filesRouter.get("/:id", (req, res) => {
   const filePath = path.join(uploadsDir(), id);
   if (!fs.existsSync(filePath)) {
     res.status(404).json({ error: "file not found" });
+    return;
+  }
+  const user = requestUser(req);
+  const access = db().prepare(`
+    SELECT f.owner_id,
+      EXISTS(SELECT 1 FROM assets a WHERE a.image = ? AND a.deleted_at IS NULL AND a.scope IN ('global','shared')) AS shared
+    FROM files f WHERE f.id = ?
+  `).get(`/api/files/${id}`, id) as { owner_id: string | null; shared: number } | undefined;
+  if (access && access.owner_id !== null && access.owner_id !== user.id && user.role !== "admin" && access.shared !== 1) {
+    res.status(403).json({ error: "无权访问此文件" });
     return;
   }
   res.setHeader("Content-Type", mimeOfFile(id));

@@ -18,6 +18,8 @@ data/projects/
 data/assets/
 data/templates/user/
 data/quarantine/
+data/*.db
+data/*.db-*
 
 # OS
 .DS_Store

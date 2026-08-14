@@ -1,61 +1,57 @@
-/**
- * 项目持久化（JSON 文件存储）：
- *   POST /api/projects       { id?, name, flow } → { ok, id }（无 id 则新建）
- *   GET  /api/projects/:id   → { id, name, flow, updatedAt }
- *   GET  /api/projects       → [{ id, name, updatedAt }]
- */
 import { Router } from "express";
-import fs from "node:fs";
-import path from "node:path";
 import { nanoid } from "nanoid";
-import { config } from "../config";
-import { writeJsonAtomicSync } from "../lib/atomicJson";
+import { db } from "../lib/database";
+import { requestUser } from "../lib/auth";
 import { validateAndMigrateFlow, WorkflowValidationError } from "../lib/workflowSchema";
 import type { PersistedWorkflow } from "../../src/types/workflow";
 
 export const projectsRouter = Router();
 
-interface ProjectFile {
-  schemaVersion: 1;
+interface ProjectRow {
   id: string;
+  owner_id: string;
+  owner_name: string;
   name: string;
-  flow: PersistedWorkflow;
-  updatedAt: string;
+  flow_json: string;
+  updated_at: string;
 }
 
-function readProjectFile(filePath: string): ProjectFile {
-  const raw = JSON.parse(fs.readFileSync(filePath, "utf-8")) as Record<string, unknown>;
-  if (raw.schemaVersion !== undefined && raw.schemaVersion !== 1) {
-    throw new WorkflowValidationError(`unsupported project schemaVersion: ${String(raw.schemaVersion)}`);
-  }
-  if (typeof raw.id !== "string" || !raw.id || typeof raw.name !== "string" || !raw.name) {
-    throw new WorkflowValidationError("project id and name must be non-empty strings");
-  }
-  if (typeof raw.updatedAt !== "string" || !Number.isFinite(Date.parse(raw.updatedAt))) {
-    throw new WorkflowValidationError("project updatedAt must be a valid date");
-  }
-  return {
-    schemaVersion: 1,
-    id: raw.id,
-    name: raw.name,
-    flow: validateAndMigrateFlow(raw.flow),
-    updatedAt: raw.updatedAt,
-  };
+function imageRefs(value: unknown, output = new Set<string>()): Set<string> {
+  if (typeof value === "string" && value.startsWith("/api/files/")) output.add(value);
+  else if (Array.isArray(value)) value.forEach((item) => imageRefs(item, output));
+  else if (value && typeof value === "object") Object.values(value).forEach((item) => imageRefs(item, output));
+  return output;
 }
 
-function projectsDir(): string {
-  const dir = path.join(config.dataDir(), "projects");
-  fs.mkdirSync(dir, { recursive: true });
-  return dir;
+function syncAssetRefs(projectId: string, flow: PersistedWorkflow): void {
+  const refs = imageRefs(flow);
+  const database = db();
+  const assets = database.prepare("SELECT id, image FROM assets WHERE deleted_at IS NULL").all() as Array<{ id: string; image: string }>;
+  const wanted = assets.filter((asset) => refs.has(asset.image)).map((asset) => asset.id);
+  const now = new Date().toISOString();
+  database.transaction(() => {
+    database.prepare("DELETE FROM project_asset_refs WHERE project_id = ?").run(projectId);
+    const insert = database.prepare("INSERT INTO project_asset_refs (project_id, asset_id, created_at) VALUES (?, ?, ?)");
+    wanted.forEach((assetId) => insert.run(projectId, assetId, now));
+  })();
 }
 
-function projectPath(id: string): string {
-  return path.join(projectsDir(), `${path.basename(id)}.json`);
+function purgeExpiredProjects(): void {
+  const database = db();
+  const ids = database.prepare("SELECT id FROM projects WHERE purge_after IS NOT NULL AND purge_after <= ?")
+    .all(new Date().toISOString()) as Array<{ id: string }>;
+  database.transaction(() => {
+    ids.forEach(({ id }) => {
+      database.prepare("DELETE FROM project_asset_refs WHERE project_id = ?").run(id);
+      database.prepare("DELETE FROM projects WHERE id = ?").run(id);
+    });
+  })();
 }
 
 projectsRouter.post("/", (req, res) => {
+  const user = requestUser(req);
   const { id, name, flow } = req.body as { id?: string; name?: string; flow?: unknown };
-  if (typeof name !== "string" || name.trim().length === 0 || name.length > 200 || flow === undefined) {
+  if (typeof name !== "string" || !name.trim() || name.length > 200 || flow === undefined) {
     res.status(400).json({ error: "name and flow are required" });
     return;
   }
@@ -63,53 +59,69 @@ projectsRouter.post("/", (req, res) => {
     res.status(400).json({ error: "id must contain only letters, digits, underscore or hyphen" });
     return;
   }
-  const projectId = id || nanoid(10);
   try {
-    const project: ProjectFile = {
-      schemaVersion: 1,
-      id: projectId,
-      name: name.trim(),
-      flow: validateAndMigrateFlow(flow),
-      updatedAt: new Date().toISOString(),
-    };
-    writeJsonAtomicSync(projectPath(projectId), project);
+    const normalized = validateAndMigrateFlow(flow);
+    const projectId = id || nanoid(10);
+    const existing = db().prepare("SELECT owner_id FROM projects WHERE id = ? AND deleted_at IS NULL")
+      .get(projectId) as { owner_id: string } | undefined;
+    if (existing && existing.owner_id !== user.id) {
+      res.status(403).json({ error: "管理员只能查看其他用户项目，不能修改" });
+      return;
+    }
+    const now = new Date().toISOString();
+    db().prepare(`
+      INSERT INTO projects (id, owner_id, name, flow_json, updated_at, created_at)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET name = excluded.name, flow_json = excluded.flow_json, updated_at = excluded.updated_at
+    `).run(projectId, user.id, name.trim(), JSON.stringify(normalized), now, now);
+    syncAssetRefs(projectId, normalized);
     res.json({ ok: true, id: projectId });
-  } catch (err) {
-    res.status(err instanceof WorkflowValidationError ? 400 : 500).json({ error: err instanceof Error ? err.message : String(err) });
+  } catch (error) {
+    res.status(error instanceof WorkflowValidationError ? 400 : 500)
+      .json({ error: error instanceof Error ? error.message : String(error) });
   }
 });
 
-projectsRouter.get("/", (_req, res) => {
-  try {
-    const list = fs
-      .readdirSync(projectsDir())
-      .filter((f) => f.endsWith(".json"))
-      .map((f) => {
-        try {
-          const p = readProjectFile(path.join(projectsDir(), f));
-          return { id: p.id, name: p.name, updatedAt: p.updatedAt };
-        } catch {
-          return null;
-        }
-      })
-      .filter((p): p is NonNullable<typeof p> => p !== null)
-      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
-    res.json(list);
-  } catch (err) {
-    res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
-  }
+projectsRouter.get("/", (req, res) => {
+  purgeExpiredProjects();
+  const user = requestUser(req);
+  const rows = db().prepare(`
+    SELECT p.id, p.owner_id, u.display_name AS owner_name, p.name, p.updated_at
+    FROM projects p JOIN users u ON u.id = p.owner_id
+    WHERE p.deleted_at IS NULL AND (? = 'admin' OR p.owner_id = ?)
+    ORDER BY p.updated_at DESC
+  `).all(user.role, user.id) as Array<Omit<ProjectRow, "flow_json">>;
+  res.json(rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    ownerId: row.owner_id,
+    ownerName: row.owner_name,
+    readOnly: row.owner_id !== user.id,
+    updatedAt: row.updated_at,
+  })));
 });
 
 projectsRouter.get("/:id", (req, res) => {
-  const filePath = projectPath(req.params.id);
-  if (!fs.existsSync(filePath)) {
+  const user = requestUser(req);
+  const row = db().prepare(`
+    SELECT p.id, p.owner_id, u.display_name AS owner_name, p.name, p.flow_json, p.updated_at
+    FROM projects p JOIN users u ON u.id = p.owner_id
+    WHERE p.id = ? AND p.deleted_at IS NULL
+  `).get(req.params.id) as ProjectRow | undefined;
+  if (!row) {
     res.status(404).json({ error: "project not found" });
     return;
   }
+  if (row.owner_id !== user.id && user.role !== "admin") {
+    res.status(403).json({ error: "无权查看此项目" });
+    return;
+  }
   try {
-    const project = readProjectFile(filePath);
-    res.json(project);
-  } catch (err) {
-    res.status(err instanceof WorkflowValidationError ? 422 : 500).json({ error: err instanceof Error ? err.message : String(err) });
+    res.json({
+      id: row.id, name: row.name, flow: JSON.parse(row.flow_json), updatedAt: row.updated_at,
+      ownerId: row.owner_id, ownerName: row.owner_name, readOnly: row.owner_id !== user.id,
+    });
+  } catch {
+    res.status(422).json({ error: "项目数据损坏" });
   }
 });

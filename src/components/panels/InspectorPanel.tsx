@@ -195,7 +195,7 @@ export function InspectorPanel() {
   const selectedResultId = useFlowStore((s) => s.selectedResultId);
 
   return (
-    <aside className="flex w-64 shrink-0 flex-col border-l border-[#262626] bg-[#141414]">
+    <aside className="gc-panel flex w-64 shrink-0 flex-col border-l border-[#262626] bg-[#141414]">
       <div className="border-b border-[#262626] px-3 py-2.5 text-[10px] font-medium uppercase tracking-widest text-neutral-500">
         {selectedResultId ? "生成记录" : "属性"}
       </div>

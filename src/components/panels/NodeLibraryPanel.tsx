@@ -20,7 +20,7 @@ export function NodeLibraryPanel() {
   const [tab, setTab] = useState<Tab>("nodes");
 
   return (
-    <aside className="flex w-52 shrink-0 flex-col border-r border-[#262626] bg-[#141414]">
+    <aside className="gc-panel flex w-52 shrink-0 flex-col border-r border-[#262626] bg-[#141414]">
       <div className="flex border-b border-[#262626]">
         {(
           [
@@ -112,13 +112,18 @@ function AssetList() {
 
   /** 点击素材：在最左侧节点左边新增一个 image-input 节点并灌入图片 */
   const addToCanvas = (asset: Asset) => {
-    const { nodes, addNode, updateNodeData } = useFlowStore.getState();
+    const { nodes, addNode, updateNodeData, projectId } = useFlowStore.getState();
     const minX = Math.min(0, ...nodes.map((n) => n.position.x));
     addNode("image-input", { x: minX - 320, y: nodes.length * 40 });
     const newId = useFlowStore.getState().selectedNodeId;
     if (newId) {
       updateNodeData(newId, { imageUrl: asset.image, status: "success", label: asset.name });
     }
+    void fetch(`/api/assets/${asset.id}/references`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ projectId }),
+    });
   };
 
   const removeAsset = async (asset: Asset) => {
@@ -126,6 +131,19 @@ function AssetList() {
       const res = await fetch(`/api/assets/${asset.id}`, { method: "DELETE" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setAssets((list) => list.filter((a) => a.id !== asset.id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const toggleShare = async (asset: Asset) => {
+    const scope = asset.scope === "shared" ? "private" : "shared";
+    try {
+      const res = await fetch(`/api/assets/${asset.id}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ scope }),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      setAssets((list) => list.map((item) => item.id === asset.id ? { ...item, scope } : item));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
@@ -182,6 +200,9 @@ function AssetList() {
               <span className={`shrink-0 rounded border px-1 py-px text-[9px] ${cat.className}`}>
                 {cat.label}
               </span>
+              <span className="shrink-0 text-[9px] text-neutral-600">
+                {asset.scope === "global" ? "通用" : asset.scope === "shared" ? "已共享" : "私有"}
+              </span>
             </div>
             {asset.sourceNote && (
               <div className="mt-1 truncate text-[10px] text-neutral-600">{asset.sourceNote}</div>
@@ -194,13 +215,18 @@ function AssetList() {
               >
                 添加到画布
               </button>
-              <button
-                type="button"
-                onClick={() => void removeAsset(asset)}
-                className="rounded border border-[#262626] px-1.5 py-1 text-[10px] text-neutral-500 transition-colors hover:border-red-900 hover:text-red-400"
-              >
-                删除
-              </button>
+              {asset.canManage && asset.scope !== "global" && (
+                <button type="button" onClick={() => void toggleShare(asset)}
+                  className="rounded border border-[#262626] px-1.5 py-1 text-[10px] text-neutral-500 hover:text-gold">
+                  {asset.scope === "shared" ? "取消共享" : "共享"}
+                </button>
+              )}
+              {asset.canManage && (
+                <button type="button" onClick={() => void removeAsset(asset)}
+                  className="rounded border border-[#262626] px-1.5 py-1 text-[10px] text-neutral-500 transition-colors hover:border-red-900 hover:text-red-400">
+                  删除
+                </button>
+              )}
             </div>
           </div>
         );
