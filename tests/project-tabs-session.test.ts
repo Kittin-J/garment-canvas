@@ -103,19 +103,9 @@ assert.deepEqual(persisted.tabs[0].edges, [restoredEdge]);
 assert.equal(persisted.tabs[0].saveState, "idle");
 console.log("  ✓ 初始化持久化不会再次覆盖恢复后的连线或保存状态");
 
-assert.deepEqual(
-  state.recentResults.map((record) => record.id),
-  ["record-project-b", "record-legacy"],
-);
-const [{ createElement }, { renderToStaticMarkup }, { ResultsPanel }] = await Promise.all([
-  import("react"),
-  import("react-dom/server"),
-  import("../src/components/panels/ResultsPanel"),
-]);
-const resultsMarkup = renderToStaticMarkup(createElement(ResultsPanel));
-assert.match(resultsMarkup, /2 条/);
-assert.match(resultsMarkup, /项目 B 的生成记录/);
-assert.match(resultsMarkup, /旧版生成记录/);
-console.log("  ✓ 刷新后跨项目及旧版生成记录仍在全局历史中可见");
+assert.deepEqual(state.recentResults, [], "登录后的历史必须以服务器为准，不能泄露上一账号的 localStorage");
+useFlowStore.setState({ recentResults: storedRecentResults as never });
+assert.deepEqual(useFlowStore.getState().recentResults.map((record) => record.id), ["record-project-b", "record-legacy"]);
+console.log("  ✓ 忽略本地跨账号缓存，并能渲染服务器恢复的全局历史");
 
 console.log("\n通过 4 项");

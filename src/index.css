@@ -268,13 +268,22 @@ body {
 /* ---- 节点语义主题：画布节点与节点库共用，和周边面板颜色解耦 ---- */
 :root,
 [data-theme="current"] {
-  --gc-node-main: #d5d7da;
-  --gc-node-header: #e2e3e5;
-  --gc-node-inner: #eef0f1;
-  --gc-node-inner-hover: #f6f7f8;
-  --gc-node-border: #aeb1b5;
-  --gc-node-text: #26282b;
-  --gc-node-muted: #666b70;
+  --gc-shell: #101214;
+  --gc-canvas: #0d0f11;
+  --gc-panel: #17191c;
+  --gc-panel-hover: #222529;
+  --gc-control: #0f1113;
+  --gc-text: #e5e7eb;
+  --gc-text-muted: #8b9198;
+  --gc-border: #2b2e32;
+  --gc-accent: #9a7333;
+  --gc-node-main: #f1f2f4;
+  --gc-node-header: #ffffff;
+  --gc-node-inner: #f8f9fa;
+  --gc-node-inner-hover: #ffffff;
+  --gc-node-border: #ccd0d5;
+  --gc-node-text: #25282c;
+  --gc-node-muted: #676c73;
   --gc-node-accent: #9a7333;
   --gc-handle-highlight: #f2ddb2;
   --gc-handle-mid: #b18745;
@@ -284,6 +293,15 @@ body {
 }
 
 [data-theme="white"] {
+  --gc-shell: #f6f5f2;
+  --gc-canvas: #eceae6;
+  --gc-panel: #fffefb;
+  --gc-panel-hover: #eceae6;
+  --gc-control: #f2f0ec;
+  --gc-text: #26282c;
+  --gc-text-muted: #696d73;
+  --gc-border: #d5d2cc;
+  --gc-accent: #dc7397;
   --gc-node-main: #34373b;
   --gc-node-header: #3f4247;
   --gc-node-inner: #4b4f55;
@@ -300,6 +318,15 @@ body {
 }
 
 [data-theme="eye"] {
+  --gc-shell: #d9e4d2;
+  --gc-canvas: #c8d8c0;
+  --gc-panel: #e5eedf;
+  --gc-panel-hover: #d1e0ca;
+  --gc-control: #edf3e9;
+  --gc-text: #183247;
+  --gc-text-muted: #48677e;
+  --gc-border: #a9bfa2;
+  --gc-accent: #173b63;
   --gc-node-main: #adc8dc;
   --gc-node-header: #bed3e3;
   --gc-node-inner: #d0e0eb;
@@ -321,6 +348,41 @@ body {
   border-color: var(--gc-node-border) !important;
   color: var(--gc-node-text) !important;
   box-shadow: 0 10px 28px rgba(8, 14, 22, 0.2) !important;
+}
+
+[data-theme] body,
+[data-theme] .gc-app-shell {
+  background-color: var(--gc-shell) !important;
+  color: var(--gc-text);
+}
+[data-theme] .react-flow {
+  background-color: var(--gc-canvas) !important;
+}
+[data-theme] .gc-panel {
+  background-color: var(--gc-panel) !important;
+  border-color: var(--gc-border) !important;
+  color: var(--gc-text);
+}
+
+/* 节点统一悬浮态：移动整个 React Flow 节点，连接珠与窗口保持同步。 */
+.react-flow__node {
+  transition: translate 175ms ease, filter 175ms ease;
+}
+.react-flow__node:not(.dragging):hover {
+  translate: 0 -4px;
+  z-index: 8 !important;
+}
+.react-flow__node:not(.dragging):hover .gc-node-card {
+  border-color: var(--gc-node-accent) !important;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--gc-node-accent) 58%, transparent),
+    0 18px 38px rgba(8, 14, 22, 0.34) !important;
+}
+.react-flow__node:not(.dragging):hover .react-flow__handle {
+  box-shadow:
+    0 0 0 2px var(--gc-handle-ring),
+    0 0 16px var(--gc-handle-glow),
+    0 4px 8px rgba(0, 0, 0, 0.38) !important;
 }
 
 [data-theme] .gc-node-card.border-gold,

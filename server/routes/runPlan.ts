@@ -9,15 +9,19 @@ import { WORKFLOW_SCHEMA_VERSION } from "../../src/types/workflow";
 import { assertPlanInputs, buildExecutionPlan, DagError } from "../engine/dag";
 import { createRun, getRun, type RunEvent } from "../engine/runner";
 import { validateAndMigrateFlow, WorkflowValidationError } from "../lib/workflowSchema";
+import { requestUser } from "../lib/auth";
+import { db } from "../lib/database";
 
 export const runPlanRouter = Router();
 
 runPlanRouter.post("/", (req, res) => {
-  const { nodes, edges, onlyNodeId, includeDownstream } = req.body as {
+  const { nodes, edges, onlyNodeId, includeDownstream, projectId, projectName } = req.body as {
     nodes?: unknown[];
     edges?: unknown[];
     onlyNodeId?: string;
     includeDownstream?: boolean;
+    projectId?: string;
+    projectName?: string;
   };
   if (!Array.isArray(nodes) || !Array.isArray(edges)) {
     res.status(400).json({ error: "nodes and edges arrays are required" });
@@ -48,7 +52,37 @@ runPlanRouter.post("/", (req, res) => {
       return;
     }
     assertPlanInputs(plan, flow.edges);
-    const run = createRun(plan);
+    const targetStep = plan.steps.find((step) => step.nodeId === onlyNodeId) ?? plan.steps[plan.steps.length - 1];
+    const targetNode = flow.nodes.find((node) => node.id === targetStep.nodeId);
+    const params = targetStep.params;
+    const requestedCount = targetStep.kind === "fabric-recolor"
+      ? Math.max(1, Array.isArray(params.colors) ? params.colors.length : 1)
+      : targetStep.kind === "print-mutate"
+        ? Math.max(1, Math.min(8, Number(params.count) || 1))
+        : targetStep.kind === "sketch-to-render" || targetStep.kind === "ai-modify"
+          ? Math.max(1, Math.min(4, Number(params.batchSize) || 1))
+          : 1;
+    const user = requestUser(req);
+    if (typeof projectId === "string") {
+      const project = db().prepare("SELECT owner_id FROM projects WHERE id = ? AND deleted_at IS NULL")
+        .get(projectId) as { owner_id: string } | undefined;
+      if (project && project.owner_id !== user.id) {
+        res.status(403).json({ error: "管理员只能查看其他用户项目，不能运行或修改" });
+        return;
+      }
+    }
+    const run = createRun(plan, {
+      userId: user.id,
+      projectId: typeof projectId === "string" ? projectId : undefined,
+      projectName: typeof projectName === "string" ? projectName : undefined,
+      nodeId: targetStep.nodeId,
+      nodeLabel: targetNode?.data.label ?? targetStep.kind,
+      kind: targetStep.kind,
+      prompt: typeof params.prompt === "string" ? params.prompt : undefined,
+      parameters: params,
+      referenceImages: targetStep.inputImages,
+      requestedCount,
+    });
     res.json({ runId: run.id });
   } catch (err) {
     if (err instanceof DagError || err instanceof WorkflowValidationError) {

@@ -4,7 +4,7 @@ import { useState } from "react";
 export type ThemeId = "current" | "white" | "eye";
 
 export const THEMES: { id: ThemeId; label: string; swatch: string; desc: string }[] = [
-  { id: "current", label: "经典暗金", swatch: "#B08A4A", desc: "灰白节点 + 暗金圆珠" },
+  { id: "current", label: "经典暗金", swatch: "#9A7333", desc: "简白节点 + 暗金圆珠" },
   { id: "white", label: "简白", swatch: "#E98FA8", desc: "高级灰黑节点 + 粉红圆珠" },
   { id: "eye", label: "护眼绿", swatch: "#173B63", desc: "浅蓝节点 + 藏蓝圆珠" },
 ];

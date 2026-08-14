@@ -14,7 +14,7 @@ export function ResultsPanel() {
   const [collapsed, setCollapsed] = useState(false);
 
   return (
-    <div className="shrink-0 border-t border-[#262626] bg-[#141414]">
+    <div className="gc-panel shrink-0 border-t border-[#262626] bg-[#141414]">
       <button
         type="button"
         onClick={() => setCollapsed((c) => !c)}
@@ -108,6 +108,7 @@ export function ResultsPanel() {
                       if (e.ctrlKey || e.metaKey) {
                         toggleCompareId(r.id);
                       } else {
+                        setSelectedResultId(r.id);
                         openViewer({
                           url: r.image,
                           title: r.nodeLabel,
@@ -116,7 +117,6 @@ export function ResultsPanel() {
                         });
                       }
                     }}
-                    onDoubleClick={() => setSelectedResultId(r.id)}
                     className={`group relative overflow-hidden rounded-md border bg-[#0f0f0f] ${
                       compareIds.includes(r.id)
                         ? "border-gold ring-2 ring-gold/70"

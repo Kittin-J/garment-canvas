@@ -93,7 +93,7 @@ export function TemplatesDock() {
 
       {/* 点击展开的完整浮窗（相对画布独立居中，不影响按钮位置） */}
       {open && (
-        <div className="pointer-events-auto mx-auto mt-2 w-[660px] max-w-[80vw] rounded-xl border border-[#333] bg-[#141414] shadow-2xl shadow-black/60">
+        <div className="gc-panel pointer-events-auto mx-auto mt-2 w-[660px] max-w-[80vw] rounded-xl border border-[#333] bg-[#141414] shadow-2xl shadow-black/60">
           <div className="flex items-center justify-between border-b border-[#262626] px-4 py-2.5">
             <span className="text-xs font-medium text-neutral-200">工作流模板</span>
             <div className="flex items-center gap-2">

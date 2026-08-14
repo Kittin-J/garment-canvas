@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useFlowStore } from "@/store/flowStore";
 import { THEMES, useTheme } from "@/lib/theme";
+import { AccountMenu } from "./AccountMenu";
 
 const SAVE_TEXT = {
   idle: "保存",
@@ -12,7 +13,7 @@ const SAVE_TEXT = {
 /** 打开项目：下拉列出已保存项目，加载恢复画布 */
 function ProjectPicker() {
   const [open, setOpen] = useState(false);
-  const [list, setList] = useState<{ id: string; name: string; updatedAt: string }[]>([]);
+  const [list, setList] = useState<{ id: string; name: string; ownerName?: string; readOnly?: boolean; updatedAt: string }[]>([]);
   const [error, setError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const openRequestIdRef = useRef(0);
@@ -57,6 +58,8 @@ function ProjectPicker() {
       const p = (await res.json()) as {
         id: string;
         name: string;
+        ownerName?: string;
+        readOnly?: boolean;
         flow?: { nodes?: unknown; edges?: unknown };
       };
       if (!Array.isArray(p.flow?.nodes) || !Array.isArray(p.flow?.edges)) {
@@ -68,6 +71,7 @@ function ProjectPicker() {
         projectName: p.name,
         nodes: p.flow.nodes as never,
         edges: p.flow.edges as never,
+        readOnly: p.readOnly ?? false,
       });
       setOpen(false);
     } catch (err) {
@@ -114,6 +118,7 @@ function ProjectPicker() {
                       {p.name}
                     </span>
                     <span className="block text-[9px] text-neutral-600">
+                      {p.readOnly && p.ownerName ? `${p.ownerName} · 只读 · ` : ""}
                       {new Date(p.updatedAt).toLocaleString("zh-CN", {
                         month: "2-digit",
                         day: "2-digit",
@@ -159,7 +164,7 @@ function ThemeSwitcher() {
   }, [open]);
 
   return (
-    <div ref={rootRef} className="relative ml-auto">
+    <div ref={rootRef} className="relative">
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
@@ -217,10 +222,11 @@ export function TopBar() {
   const setProjectName = useFlowStore((s) => s.setProjectName);
   const saveState = useFlowStore((s) => s.saveState);
   const dirty = useFlowStore((s) => s.dirty);
+  const readOnly = useFlowStore((s) => s.readOnly);
   const saveProject = useFlowStore((s) => s.saveProject);
 
   return (
-    <header className="relative flex h-11 shrink-0 items-center gap-3 border-b border-[#262626] bg-[#141414] px-4">
+    <header className="gc-panel relative flex h-11 shrink-0 items-center gap-3 border-b border-[#262626] bg-[#141414] px-4">
       {/* 左：品牌 + 项目名 */}
       <span className="text-xs font-semibold tracking-widest text-gold">GARMENT CANVAS</span>
       <span className="h-4 w-px bg-[#262626]" />
@@ -231,10 +237,11 @@ export function TopBar() {
         placeholder="项目名称"
       />
       {dirty && <span className="-ml-2 text-[10px] text-gold" title="有未保存修改">●</span>}
+      {readOnly && <span className="rounded border border-blue-400/40 px-2 py-0.5 text-[9px] text-blue-400">管理员只读</span>}
       <button
         type="button"
         onClick={() => void saveProject()}
-        disabled={saveState === "saving" || (!dirty && saveState === "saved")}
+        disabled={readOnly || saveState === "saving" || (!dirty && saveState === "saved")}
         className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
           saveState === "error"
             ? "bg-red-900/60 text-red-300 hover:bg-red-900"
@@ -252,8 +259,10 @@ export function TopBar() {
         <ProjectPicker />
       </div>
 
-      {/* 右：主题切换（悬浮下拉） */}
-      <ThemeSwitcher />
+      <div className="ml-auto flex items-center gap-2">
+        <ThemeSwitcher />
+        <AccountMenu />
+      </div>
     </header>
   );
 }

@@ -107,6 +107,7 @@ fi
 (
   cd "$STAGE_DIR"
   "$NODE_PATH" -e "import('express').then(() => process.exit(0)).catch(() => process.exit(1))"
+  "$NODE_PATH" -e "import('better-sqlite3').then(m => { const db = new m.default(':memory:'); db.close(); }).catch(() => process.exit(1))"
 )
 
 /bin/mv "$STAGE_DIR" "$RELEASE_DIR"

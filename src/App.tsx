@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { ReactFlowProvider } from "@xyflow/react";
 import { nanoid } from "nanoid";
-import { useFlowStore, type FlowNode } from "@/store/flowStore";
+import { resumeRecentResults, useFlowStore, type FlowNode } from "@/store/flowStore";
 import { CanvasFlow } from "@/components/CanvasFlow";
 import { TopBar } from "@/components/panels/TopBar";
 import { ProjectTabs } from "@/components/panels/ProjectTabs";
@@ -11,6 +11,8 @@ import { ResultsPanel } from "@/components/panels/ResultsPanel";
 import { TemplatesDock } from "@/components/panels/TemplatesDock";
 import { CompareOverlay } from "@/components/CompareOverlay";
 import { ImageViewer } from "@/components/ImageViewer";
+import { useAuth } from "@/auth/AuthContext";
+import { ChangePasswordPage, LoginPage } from "@/auth/LoginPage";
 
 /** 剪贴板里的节点快照（仅内存，跨项目/刷新不保留） */
 let nodeClipboard: { data: FlowNode["data"]; type: string } | null = null;
@@ -81,11 +83,38 @@ function useGlobalShortcuts() {
 }
 
 export default function App() {
+  const { user, loading } = useAuth();
+  if (loading) {
+    return <div className="flex h-full items-center justify-center bg-[#101214] text-xs text-neutral-500">正在验证登录状态…</div>;
+  }
+  if (!user) return <LoginPage />;
+  if (user.mustChangePassword) return <ChangePasswordPage />;
+  return <Workspace />;
+}
+
+function Workspace() {
   useGlobalShortcuts();
   const activeTabId = useFlowStore((state) => state.activeTabId);
 
+  useEffect(() => {
+    let active = true;
+    fetch("/api/history?limit=100")
+      .then(async (response) => {
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        return await response.json();
+      })
+      .then((records) => {
+        if (active && Array.isArray(records)) {
+          useFlowStore.setState({ recentResults: records as never });
+          resumeRecentResults(records as never);
+        }
+      })
+      .catch(() => undefined);
+    return () => { active = false; };
+  }, []);
+
   return (
-    <div className="flex h-full flex-col bg-ink text-neutral-200">
+    <div className="gc-app-shell flex h-full flex-col bg-ink text-neutral-200">
       <TopBar />
       <ProjectTabs />
       <ReactFlowProvider key={activeTabId}>
