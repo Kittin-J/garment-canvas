@@ -800,6 +800,33 @@ function recordPrompt(data: WorkflowNodeData): string | undefined {
   return undefined;
 }
 
+export function requestedResultCount(data: WorkflowNodeData): number {
+  switch (data.kind) {
+    case "sketch-to-render":
+    case "ai-modify":
+      return Math.max(1, Math.min(4, Number(data.batchSize) || 1));
+    case "print-mutate":
+      return Math.max(1, Math.min(8, Number(data.count) || 1));
+    case "fabric-recolor":
+      return Math.max(1, Math.min(8, data.colors.length || 1));
+    default:
+      return 1;
+  }
+}
+
+function pendingResultCardId(recordId: string, index: number): string {
+  return `${recordId}:pending:${index}`;
+}
+
+export function createQueuedResultCards(initial: RecentResult, count: number): RecentResult[] {
+  const requestedCount = Math.max(1, Math.min(8, Math.floor(count) || 1));
+  return Array.from({ length: requestedCount }, (_, index) => ({
+    ...initial,
+    id: index === 0 ? initial.id : pendingResultCardId(initial.id, index),
+    requestedCount,
+  }));
+}
+
 function terminalResultCardId(recordId: string, kind: "image" | "failure", index: number): string {
   return `${recordId}:terminal:${kind}:${index}`;
 }
@@ -813,10 +840,17 @@ export function applyRunEventToRecentResults(
   if (event.type !== "node-status") return records;
   const current = records.find((record) => record.id === recordId);
   if (!current) return records;
+  const pendingPrefix = `${recordId}:pending:`;
+  const terminalPrefix = `${recordId}:terminal:`;
+  const isBatchSibling = (record: RecentResult) =>
+    record.id === recordId ||
+    record.id.startsWith(pendingPrefix) ||
+    record.id.startsWith(terminalPrefix) ||
+    (Boolean(current.runId) && record.runId === current.runId);
   if (event.status === "queued" || event.status === "running") {
     const status = event.status;
     return records.map((record) =>
-      record.id === recordId
+      isBatchSibling(record)
         ? {
             ...record,
             status,
@@ -839,63 +873,45 @@ export function applyRunEventToRecentResults(
   };
   const images = event.images ?? [];
   const failures = event.failures ?? [];
-  let primary: RecentResult;
-  const additions: RecentResult[] = [];
+  const targetCount = Math.max(1, Math.min(8,
+    current.requestedCount ?? Math.max(images.length + failures.length, 1),
+  ));
+  const terminalCards: RecentResult[] = [];
 
-  if (images.length > 0) {
-    primary = {
+  for (let index = 0; index < Math.min(images.length, targetCount); index += 1) {
+    terminalCards.push({
       ...base,
-      image: images[0],
+      id: index === 0 ? recordId : terminalResultCardId(recordId, "image", index),
+      image: images[index],
       thumbnail: undefined,
-      prompt: event.prompts?.[0] ?? current.prompt,
+      prompt: event.prompts?.[index] ?? current.prompt,
       status: "success",
       error: undefined,
-    };
-    for (let index = 1; index < images.length; index += 1) {
-      additions.push({
-        ...base,
-        id: terminalResultCardId(recordId, "image", index),
-        image: images[index],
-        thumbnail: undefined,
-        prompt: event.prompts?.[index] ?? current.prompt,
-        status: "success",
-        error: undefined,
-      });
-    }
-  } else {
-    primary = {
-      ...base,
-      image: "",
-      thumbnail: undefined,
-      prompt: failures[0]?.prompt ?? current.prompt,
-      status: "error",
-      error: event.error || failures[0]?.error || "运行完成但未返回图片",
-    };
+    });
   }
 
-  const firstAdditionalFailure = images.length > 0 ? 0 : 1;
-  for (let index = firstAdditionalFailure; index < failures.length; index += 1) {
-    const failure = failures[index];
-    additions.push({
+  let failureIndex = 0;
+  while (terminalCards.length < targetCount) {
+    const failure = failures[failureIndex];
+    const cardIndex = terminalCards.length;
+    terminalCards.push({
       ...base,
-      id: terminalResultCardId(recordId, "failure", index),
+      id: cardIndex === 0 ? recordId : terminalResultCardId(recordId, "failure", failureIndex),
       image: "",
       thumbnail: undefined,
-      prompt: failure.prompt ?? current.prompt,
+      prompt: failure?.prompt ?? current.prompt,
       status: "error",
-      error: failure.error,
+      error: failure?.error || event.error || (images.length > 0 ? "未返回图片" : "运行完成但未返回图片"),
     });
+    failureIndex += 1;
   }
 
   const next: RecentResult[] = [];
   let inserted = false;
-  const terminalPrefix = `${recordId}:terminal:`;
   for (const record of records) {
-    const sameRunSibling = Boolean(current.runId) && record.runId === current.runId;
-    const generatedSibling = record.id.startsWith(terminalPrefix);
-    if (record.id === recordId || sameRunSibling || generatedSibling) {
+    if (isBatchSibling(record)) {
       if (!inserted) {
-        next.push(primary, ...additions);
+        next.push(...terminalCards);
         inserted = true;
       }
       continue;
@@ -1179,6 +1195,7 @@ export const useFlowStore = create<FlowState>()(
         const tabId = initialState.activeTabId;
         const localStartedAt = Date.now();
         const recordId = nanoid(8);
+        const requestedCount = requestedResultCount(node.data);
         const releaseNonUndoableRun = beginNonUndoableRun(`run:${id}`);
         let terminalRecorded = false;
 
@@ -1194,10 +1211,12 @@ export const useFlowStore = create<FlowState>()(
           prompt: recordPrompt(node.data),
           startedAt: localStartedAt,
           status: "queued",
+          requestedCount,
         };
+        const queuedRecords = createQueuedResultCards(initialRecord, requestedCount);
         set({
           recentResults: [
-            initialRecord,
+            ...queuedRecords,
             ...initialState.recentResults,
           ].slice(0, 100),
           selectedResultId: recordId,
@@ -1233,7 +1252,9 @@ export const useFlowStore = create<FlowState>()(
 
           set((state) => ({
             recentResults: state.recentResults.map((record) =>
-              record.id === recordId ? { ...record, runId: payload.runId } : record,
+              record.id === recordId || record.id.startsWith(`${recordId}:pending:`)
+                ? { ...record, runId: payload.runId }
+                : record,
             ),
           }));
 
