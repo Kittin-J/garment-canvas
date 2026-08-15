@@ -1,0 +1,20 @@
+{
+  "worktree": {
+    "baseRef": "head",
+    "symlinkDirectories": ["node_modules"]
+  },
+  "permissions": {
+    "deny": [
+      "Bash(git push *)",
+      "Bash(gh pr create *)",
+      "Bash(git merge *)",
+      "Bash(git rebase *)",
+      "Bash(git cherry-pick *)",
+      "Bash(git reset --hard *)",
+      "Bash(git clean *)",
+      "Read(./.env)",
+      "Read(./.env.local)",
+      "Read(./.secrets/**)"
+    ]
+  }
+}
