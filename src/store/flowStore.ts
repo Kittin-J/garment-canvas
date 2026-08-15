@@ -27,6 +27,8 @@ export interface RecentResult {
   id: string;
   /** 生成图 URL；失败记录为空字符串 */
   image: string;
+  /** 列表预览图；打开详情和继续生成仍使用 image 原图。 */
+  thumbnail?: string;
   nodeId: string;
   nodeLabel: string;
   kind: NodeKind;
@@ -150,6 +152,9 @@ interface TabSaveQueue {
 
 /** 每个页签独立串行保存；切页不会使旧页签的保存响应失效。 */
 const saveQueueByTab = new Map<string, TabSaveQueue>();
+
+/** 历史分页可能重叠；同一后端 Run 同一时刻只允许一条恢复连接。 */
+const resumingRecentRunIds = new Set<string>();
 
 /** 仅屏蔽这一小段运行态/UI 写入，不暂停用户在异步任务期间产生的文档历史。 */
 function withoutTemporalTracking(run: () => void): void {
@@ -374,35 +379,204 @@ type FlowTemporalState = Pick<FlowState, "nodes" | "edges">;
 /** 最近生成持久化（localStorage）：刷新/重开浏览器不丢 */
 const RECENT_STORAGE_KEY = "garment-canvas-recent-results";
 const TAB_SESSION_STORAGE_KEY = "garment-canvas-project-tabs";
+export const TAB_SESSION_SCHEMA_VERSION = 1 as const;
+
+interface PersistedTabSession {
+  schemaVersion: typeof TAB_SESSION_SCHEMA_VERSION;
+  tabs: ProjectTab[];
+  activeTabId: string;
+}
+
+const NODE_KINDS = new Set<NodeKind>(Object.keys(NODE_SPECS) as NodeKind[]);
+const NODE_STATUSES = new Set<NodeRunStatus>(["idle", "queued", "running", "success", "error"]);
+
+function finiteNonNegative(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
+}
+
+function stringList(value: unknown, max = 100): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.length > 0).slice(0, max)
+    : [];
+}
+
+/**
+ * 会话缓存属于浏览器易失数据：逐节点容错迁移，坏节点/悬空边单独丢弃，
+ * 不让一个历史字段缺失导致所有项目页签都无法恢复。
+ */
+function normalizeSessionNode(value: unknown): FlowNode | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    typeof raw.id !== "string" ||
+    !raw.id ||
+    typeof raw.type !== "string" ||
+    !NODE_KINDS.has(raw.type as NodeKind) ||
+    !raw.position ||
+    typeof raw.position !== "object" ||
+    !raw.data ||
+    typeof raw.data !== "object"
+  ) return undefined;
+  const position = raw.position as Record<string, unknown>;
+  if (
+    typeof position.x !== "number" || !Number.isFinite(position.x) ||
+    typeof position.y !== "number" || !Number.isFinite(position.y)
+  ) return undefined;
+
+  const kind = raw.type as NodeKind;
+  const input = raw.data as Record<string, unknown>;
+  const defaults = defaultNodeData(kind) as unknown as Record<string, unknown>;
+  const status = typeof input.status === "string" && NODE_STATUSES.has(input.status as NodeRunStatus)
+    ? input.status as NodeRunStatus
+    : "idle";
+  const data: Record<string, unknown> = {
+    ...defaults,
+    ...input,
+    kind,
+    label: typeof input.label === "string" && input.label.trim() ? input.label : defaults.label,
+    status,
+  };
+  if (typeof input.error !== "string") delete data.error;
+
+  switch (kind) {
+    case "image-input":
+      data.imageRole = typeof input.imageRole === "string" && ["default", "sketch", "garment", "fabric", "reference"].includes(input.imageRole)
+        ? input.imageRole
+        : "default";
+      if (typeof input.imageUrl !== "string") delete data.imageUrl;
+      break;
+    case "sketch-to-render":
+    case "ai-modify":
+      data.prompt = typeof input.prompt === "string" ? input.prompt : "";
+      data.aspectRatio = typeof input.aspectRatio === "string" && ["1:1", "3:4", "4:3", "9:16", "16:9"].includes(input.aspectRatio)
+        ? input.aspectRatio
+        : kind === "sketch-to-render" ? "3:4" : "1:1";
+      data.batchSize = [1, 2, 4].includes(Number(input.batchSize)) ? Number(input.batchSize) : 1;
+      data.outputImages = stringList(input.outputImages);
+      break;
+    case "fabric-recolor":
+      data.colors = stringList(input.colors, 8).filter((color) => /^#[0-9a-fA-F]{6}$/.test(color));
+      data.prompt = typeof input.prompt === "string" ? input.prompt : "";
+      data.outputImages = stringList(input.outputImages);
+      if (typeof input.fabricImageUrl !== "string") delete data.fabricImageUrl;
+      break;
+    case "upscale":
+      data.imageSize = input.imageSize === "4K" ? "4K" : "2K";
+      data.outputImages = stringList(input.outputImages);
+      break;
+    case "print-extract":
+      data.prompt = typeof input.prompt === "string" ? input.prompt : "";
+      data.outputImages = stringList(input.outputImages);
+      data.savedAsAssets = stringList(input.savedAsAssets);
+      break;
+    case "print-mutate":
+      data.prompt = typeof input.prompt === "string" ? input.prompt : "";
+      data.count = Number.isInteger(input.count) && Number(input.count) >= 1 && Number(input.count) <= 8
+        ? input.count
+        : 4;
+      data.outputImages = stringList(input.outputImages);
+      break;
+    case "result":
+      data.images = stringList(input.images);
+      if (typeof input.note !== "string") delete data.note;
+      break;
+  }
+
+  return {
+    ...raw,
+    id: raw.id,
+    type: kind,
+    position: { x: position.x, y: position.y },
+    data: data as unknown as WorkflowNodeData,
+  } as FlowNode;
+}
+
+function normalizeSessionEdge(value: unknown, nodeIds: Set<string>): Edge | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Record<string, unknown>;
+  if (
+    typeof raw.id !== "string" || !raw.id ||
+    typeof raw.source !== "string" || !nodeIds.has(raw.source) ||
+    typeof raw.target !== "string" || !nodeIds.has(raw.target)
+  ) return undefined;
+  return { ...raw, id: raw.id, source: raw.source, target: raw.target } as Edge;
+}
+
+function normalizeSessionTab(value: unknown): ProjectTab | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as Partial<ProjectTab>;
+  if (
+    typeof raw.id !== "string" || !raw.id ||
+    typeof raw.projectId !== "string" || !raw.projectId ||
+    typeof raw.projectName !== "string" ||
+    !Array.isArray(raw.nodes) || !Array.isArray(raw.edges)
+  ) return undefined;
+
+  const seenNodeIds = new Set<string>();
+  const nodes = raw.nodes.flatMap((node): FlowNode[] => {
+    const normalized = normalizeSessionNode(node);
+    if (!normalized || seenNodeIds.has(normalized.id)) return [];
+    seenNodeIds.add(normalized.id);
+    return [normalized];
+  });
+  // 一个原本非空的页签若没有任何节点能迁移，说明其结构整体不可恢复。
+  if (raw.nodes.length > 0 && nodes.length === 0) return undefined;
+  const seenEdgeIds = new Set<string>();
+  const edges = raw.edges.flatMap((edge): Edge[] => {
+    const normalized = normalizeSessionEdge(edge, seenNodeIds);
+    if (!normalized || seenEdgeIds.has(normalized.id)) return [];
+    seenEdgeIds.add(normalized.id);
+    return [normalized];
+  });
+  const revision = finiteNonNegative(raw.revision, 0);
+  const wasSaving = raw.saveState === "saving";
+  const dirty = wasSaving || raw.dirty === true;
+  const savedRevision = Math.min(finiteNonNegative(raw.savedRevision, 0), revision);
+
+  return {
+    id: raw.id,
+    projectId: raw.projectId,
+    projectName: raw.projectName,
+    readOnly: raw.readOnly === true,
+    nodes,
+    edges,
+    selectedNodeId: typeof raw.selectedNodeId === "string" && seenNodeIds.has(raw.selectedNodeId)
+      ? raw.selectedNodeId
+      : null,
+    selectedResultId: typeof raw.selectedResultId === "string" ? raw.selectedResultId : null,
+    compareIds: stringList(raw.compareIds, 4),
+    // 刷新会中断 in-flight 请求；必须恢复成可再次保存，同时保守地视为未保存。
+    saveState: raw.saveState === "saved" || raw.saveState === "error" ? raw.saveState : "idle",
+    revision,
+    savedRevision,
+    dirty,
+    documentEpoch: finiteNonNegative(raw.documentEpoch, 0),
+  };
+}
+
+export function normalizeTabSessionValue(value: unknown): PersistedTabSession | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const raw = value as { schemaVersion?: unknown; tabs?: unknown; activeTabId?: unknown };
+  if (
+    raw.schemaVersion !== undefined &&
+    raw.schemaVersion !== 0 &&
+    raw.schemaVersion !== TAB_SESSION_SCHEMA_VERSION
+  ) return undefined;
+  if (!Array.isArray(raw.tabs) || typeof raw.activeTabId !== "string") return undefined;
+  const tabs = raw.tabs.flatMap((tab): ProjectTab[] => {
+    const normalized = normalizeSessionTab(tab);
+    return normalized ? [normalized] : [];
+  });
+  if (tabs.length === 0) return undefined;
+  const activeTabId = tabs.some((tab) => tab.id === raw.activeTabId) ? raw.activeTabId : tabs[0].id;
+  return { schemaVersion: TAB_SESSION_SCHEMA_VERSION, tabs, activeTabId };
+}
 
 function loadTabSession(): { tabs: ProjectTab[]; activeTabId: string } | undefined {
   try {
     const raw = window.sessionStorage.getItem(TAB_SESSION_STORAGE_KEY);
     if (!raw) return undefined;
-    const parsed = JSON.parse(raw) as { tabs?: unknown; activeTabId?: unknown };
-    if (!Array.isArray(parsed.tabs) || typeof parsed.activeTabId !== "string") return undefined;
-    const tabs = parsed.tabs.flatMap((value): ProjectTab[] => {
-      if (!value || typeof value !== "object") return [];
-      const tab = value as Partial<ProjectTab>;
-      const valid =
-        typeof tab.id === "string" &&
-        typeof tab.projectId === "string" &&
-        typeof tab.projectName === "string" &&
-        Array.isArray(tab.nodes) &&
-        Array.isArray(tab.edges);
-      if (!valid) return [];
-      return [{
-        ...(tab as ProjectTab),
-        readOnly: tab.readOnly === true,
-        // 页面刷新会中断原保存请求，不能恢复一个已不存在的 in-flight 状态。
-        saveState:
-          tab.saveState === "saved" || tab.saveState === "error"
-            ? tab.saveState
-            : "idle",
-      }];
-    });
-    if (tabs.length === 0 || !tabs.some((tab) => tab.id === parsed.activeTabId)) return undefined;
-    return { tabs, activeTabId: parsed.activeTabId };
+    return normalizeTabSessionValue(JSON.parse(raw));
   } catch {
     return undefined;
   }
@@ -411,12 +585,54 @@ function loadTabSession(): { tabs: ProjectTab[]; activeTabId: string } | undefin
 function persistTabSession(state: FlowState): void {
   try {
     const current = snapshotActiveTab(state);
+    const normalized = normalizeTabSessionValue({
+      schemaVersion: TAB_SESSION_SCHEMA_VERSION,
+      tabs: replaceTab(state.tabs, current),
+      activeTabId: state.activeTabId,
+    });
+    if (!normalized) return;
     window.sessionStorage.setItem(
       TAB_SESSION_STORAGE_KEY,
-      JSON.stringify({ tabs: replaceTab(state.tabs, current), activeTabId: state.activeTabId }),
+      JSON.stringify(normalized),
     );
   } catch {
     // 浏览器会话存储不可用或容量不足时退化为仅本次页面生命周期可用。
+  }
+}
+
+/** 错误边界恢复：只丢弃当前损坏页签，其他页签与服务端项目都不受影响。 */
+export function discardActiveTabSession(): void {
+  if (typeof window === "undefined") return;
+  try {
+    const raw = window.sessionStorage.getItem(TAB_SESSION_STORAGE_KEY);
+    if (!raw) return;
+    const parsed = JSON.parse(raw) as { tabs?: unknown; activeTabId?: unknown };
+    if (!Array.isArray(parsed.tabs) || typeof parsed.activeTabId !== "string") {
+      window.sessionStorage.removeItem(TAB_SESSION_STORAGE_KEY);
+      return;
+    }
+    const activeIndex = parsed.tabs.findIndex(
+      (value) => Boolean(value && typeof value === "object" && (value as { id?: unknown }).id === parsed.activeTabId),
+    );
+    const remaining = parsed.tabs.filter(
+      (value) => !(value && typeof value === "object" && (value as { id?: unknown }).id === parsed.activeTabId),
+    );
+    if (remaining.length === 0) {
+      window.sessionStorage.removeItem(TAB_SESSION_STORAGE_KEY);
+      return;
+    }
+    const fallbackIndex = Math.max(0, Math.min(activeIndex, remaining.length - 1));
+    const fallback = remaining[fallbackIndex] as { id?: unknown };
+    if (typeof fallback.id !== "string") {
+      window.sessionStorage.removeItem(TAB_SESSION_STORAGE_KEY);
+      return;
+    }
+    window.sessionStorage.setItem(
+      TAB_SESSION_STORAGE_KEY,
+      JSON.stringify({ tabs: remaining, activeTabId: fallback.id }),
+    );
+  } catch {
+    window.sessionStorage.removeItem(TAB_SESSION_STORAGE_KEY);
   }
 }
 
@@ -455,18 +671,126 @@ interface RunFailure {
   error: string;
 }
 
-export interface RunEvent {
+interface RunEventMeta {
   seq?: number;
-  type: "node-status" | "done" | "run-error";
-  nodeId?: string;
-  status?: NodeRunStatus;
-  images?: string[];
   error?: string;
   model?: string;
   prompts?: string[];
   failures?: RunFailure[];
   startedAt?: number;
   finishedAt?: number;
+}
+
+export type NodeStatusRunEvent =
+  | (RunEventMeta & {
+      type: "node-status";
+      nodeId: string;
+      status: "queued" | "running";
+      images?: never;
+    })
+  | (RunEventMeta & {
+      type: "node-status";
+      nodeId: string;
+      status: "success";
+      /** 成功事件在客户端归一化后始终包含数组。 */
+      images: string[];
+    })
+  | (Omit<RunEventMeta, "error"> & {
+      type: "node-status";
+      nodeId: string;
+      status: "error";
+      error: string;
+      images?: never;
+    });
+
+export type RunEvent =
+  | NodeStatusRunEvent
+  | { seq?: number; type: "done" }
+  | { seq?: number; type: "run-error"; nodeId?: string; error: string; finishedAt?: number };
+
+function optionalFiniteNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function stringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+function runFailures(value: unknown): RunFailure[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const failures = value.flatMap((item): RunFailure[] => {
+    if (!item || typeof item !== "object") return [];
+    const candidate = item as { prompt?: unknown; error?: unknown };
+    const error = optionalString(candidate.error);
+    if (!error) return [];
+    return [{ error, ...(optionalString(candidate.prompt) ? { prompt: optionalString(candidate.prompt) } : {}) }];
+  });
+  return failures.length ? failures : undefined;
+}
+
+/** SSE 数据不可信：在进入状态层前归一为判别联合，缺失图片永远不会写成 undefined。 */
+export function normalizeRunEvent(value: unknown): RunEvent {
+  if (!value || typeof value !== "object") throw new Error("运行事件格式无效");
+  const raw = value as Record<string, unknown>;
+  const seq = optionalFiniteNumber(raw.seq);
+  if (raw.type === "done") return { type: "done", ...(seq !== undefined ? { seq } : {}) };
+  if (raw.type === "run-error") {
+    return {
+      type: "run-error",
+      error: optionalString(raw.error) ?? "运行失败",
+      ...(optionalString(raw.nodeId) ? { nodeId: optionalString(raw.nodeId) } : {}),
+      ...(optionalFiniteNumber(raw.finishedAt) !== undefined ? { finishedAt: optionalFiniteNumber(raw.finishedAt) } : {}),
+      ...(seq !== undefined ? { seq } : {}),
+    };
+  }
+  if (raw.type !== "node-status") throw new Error("运行事件类型无效");
+  const nodeId = optionalString(raw.nodeId);
+  if (!nodeId) throw new Error("运行事件缺少节点标识");
+  const common: RunEventMeta = {
+    ...(seq !== undefined ? { seq } : {}),
+    ...(optionalString(raw.error) ? { error: optionalString(raw.error) } : {}),
+    ...(optionalString(raw.model) ? { model: optionalString(raw.model) } : {}),
+    ...(stringArray(raw.prompts) ? { prompts: stringArray(raw.prompts) } : {}),
+    ...(runFailures(raw.failures) ? { failures: runFailures(raw.failures) } : {}),
+    ...(optionalFiniteNumber(raw.startedAt) !== undefined ? { startedAt: optionalFiniteNumber(raw.startedAt) } : {}),
+    ...(optionalFiniteNumber(raw.finishedAt) !== undefined ? { finishedAt: optionalFiniteNumber(raw.finishedAt) } : {}),
+  };
+  if (raw.status === "success") {
+    return { ...common, type: "node-status", nodeId, status: "success", images: stringArray(raw.images) ?? [] };
+  }
+  if (raw.status === "error") {
+    const { error: commonError, ...meta } = common;
+    return { ...meta, type: "node-status", nodeId, status: "error", error: commonError ?? "生成失败" };
+  }
+  if (raw.status === "queued" || raw.status === "running") {
+    return { ...common, type: "node-status", nodeId, status: raw.status };
+  }
+  throw new Error("运行事件状态无效");
+}
+
+/** 单一节点回写规则：失败保留旧图片，只有成功事件可以替换 outputImages。 */
+export function applyRunEventToNode(
+  data: WorkflowNodeData,
+  event: NodeStatusRunEvent,
+): WorkflowNodeData {
+  if (event.status === "success") {
+    return {
+      ...data,
+      ...(data.kind !== "image-input" && data.kind !== "result" ? { outputImages: event.images } : {}),
+      status: "success",
+      error: event.error,
+    } as WorkflowNodeData;
+  }
+  return {
+    ...data,
+    status: event.status,
+    error: event.error,
+  } as WorkflowNodeData;
 }
 
 function recordPrompt(data: WorkflowNodeData): string | undefined {
@@ -476,12 +800,17 @@ function recordPrompt(data: WorkflowNodeData): string | undefined {
   return undefined;
 }
 
+function terminalResultCardId(recordId: string, kind: "image" | "failure", index: number): string {
+  return `${recordId}:terminal:${kind}:${index}`;
+}
+
 /** 用一次后端事件更新点击时创建的主卡片，并为额外图片/部分失败追加卡片。 */
 export function applyRunEventToRecentResults(
   records: RecentResult[],
   recordId: string,
   event: RunEvent,
 ): RecentResult[] {
+  if (event.type !== "node-status") return records;
   const current = records.find((record) => record.id === recordId);
   if (!current) return records;
   if (event.status === "queued" || event.status === "running") {
@@ -517,6 +846,7 @@ export function applyRunEventToRecentResults(
     primary = {
       ...base,
       image: images[0],
+      thumbnail: undefined,
       prompt: event.prompts?.[0] ?? current.prompt,
       status: "success",
       error: undefined,
@@ -524,8 +854,9 @@ export function applyRunEventToRecentResults(
     for (let index = 1; index < images.length; index += 1) {
       additions.push({
         ...base,
-        id: nanoid(8),
+        id: terminalResultCardId(recordId, "image", index),
         image: images[index],
+        thumbnail: undefined,
         prompt: event.prompts?.[index] ?? current.prompt,
         status: "success",
         error: undefined,
@@ -535,17 +866,21 @@ export function applyRunEventToRecentResults(
     primary = {
       ...base,
       image: "",
+      thumbnail: undefined,
       prompt: failures[0]?.prompt ?? current.prompt,
       status: "error",
       error: event.error || failures[0]?.error || "运行完成但未返回图片",
     };
   }
 
-  for (const failure of failures.slice(images.length > 0 ? 0 : 1)) {
+  const firstAdditionalFailure = images.length > 0 ? 0 : 1;
+  for (let index = firstAdditionalFailure; index < failures.length; index += 1) {
+    const failure = failures[index];
     additions.push({
       ...base,
-      id: nanoid(8),
+      id: terminalResultCardId(recordId, "failure", index),
       image: "",
+      thumbnail: undefined,
       prompt: failure.prompt ?? current.prompt,
       status: "error",
       error: failure.error,
@@ -553,9 +888,19 @@ export function applyRunEventToRecentResults(
   }
 
   const next: RecentResult[] = [];
+  let inserted = false;
+  const terminalPrefix = `${recordId}:terminal:`;
   for (const record of records) {
-    if (record.id === recordId) next.push(primary, ...additions);
-    else next.push(record);
+    const sameRunSibling = Boolean(current.runId) && record.runId === current.runId;
+    const generatedSibling = record.id.startsWith(terminalPrefix);
+    if (record.id === recordId || sameRunSibling || generatedSibling) {
+      if (!inserted) {
+        next.push(primary, ...additions);
+        inserted = true;
+      }
+      continue;
+    }
+    next.push(record);
   }
   return next.slice(0, 100);
 }
@@ -594,7 +939,7 @@ function consumeRunEvents(
       try {
         if (message.lastEventId && seenEvents.has(message.lastEventId)) return;
         if (message.lastEventId) seenEvents.add(message.lastEventId);
-        const event = JSON.parse(message.data) as RunEvent;
+        const event = normalizeRunEvent(JSON.parse(message.data) as unknown);
         onEvent(event);
         if (event.type === "done") finish();
         if (event.type === "run-error") finish(new Error(event.error || "运行失败"));
@@ -607,6 +952,23 @@ function consumeRunEvents(
       // 超过总等待时限才失败，避免瞬时断网导致用户重复发起付费任务。
     };
   });
+}
+
+function updateTabFromRunEvent(
+  set: (partial: Partial<FlowState> | ((state: FlowState) => Partial<FlowState>)) => unknown,
+  tabId: string,
+  nodeId: string,
+  event: NodeStatusRunEvent,
+): void {
+  updateTabNodes(
+    set,
+    tabId,
+    (nodes) =>
+      nodes.map((node) =>
+        node.id === nodeId ? { ...node, data: applyRunEventToNode(node.data, event) } : node,
+      ),
+    { markDirty: event.status === "success" && event.images.length > 0 },
+  );
 }
 
 export const useFlowStore = create<FlowState>()(
@@ -880,37 +1242,8 @@ export const useFlowStore = create<FlowState>()(
             set((state) => ({
               recentResults: applyRunEventToRecentResults(state.recentResults, recordId, event),
             }));
-            if (event.status === "running" || event.status === "queued") {
-              updateTabNodes(set, tabId, (nodes) =>
-                nodes.map((candidate) =>
-                  candidate.id === id
-                    ? { ...candidate, data: { ...candidate.data, status: event.status!, error: event.error } }
-                    : candidate,
-                ),
-              );
-              return;
-            }
-            if (event.status !== "success" && event.status !== "error") return;
-            terminalRecorded = true;
-            updateTabNodes(
-              set,
-              tabId,
-              (nodes) =>
-                nodes.map((candidate) =>
-                  candidate.id === id
-                    ? {
-                        ...candidate,
-                        data: {
-                          ...candidate.data,
-                          outputImages: event.images,
-                          status: event.status,
-                          error: event.error,
-                        } as WorkflowNodeData,
-                      }
-                    : candidate,
-                ),
-              { markDirty: Boolean(event.images?.length) },
-            );
+            updateTabFromRunEvent(set, tabId, id, event);
+            if (event.status === "success" || event.status === "error") terminalRecorded = true;
           });
         } catch (err) {
           if (!terminalRecorded) {
@@ -926,13 +1259,7 @@ export const useFlowStore = create<FlowState>()(
             set((state) => ({
               recentResults: applyRunEventToRecentResults(state.recentResults, recordId, event),
             }));
-            updateTabNodes(set, tabId, (nodes) =>
-              nodes.map((candidate) =>
-                candidate.id === id
-                  ? { ...candidate, data: { ...candidate.data, status: "error", error: message } }
-                  : candidate,
-              ),
-            );
+            updateTabFromRunEvent(set, tabId, id, event);
           }
         } finally {
           releaseNonUndoableRun();
@@ -1144,10 +1471,13 @@ export function resumeRecentResults(records: RecentResult[]): void {
       (record.status === "queued" || record.status === "running") && Boolean(record.runId),
   );
   for (const record of resumable) {
+    const runId = record.runId!;
+    if (resumingRecentRunIds.has(runId)) continue;
+    resumingRecentRunIds.add(runId);
     void (async () => {
       let terminalRecorded = false;
       try {
-        const response = await fetch(`/api/run-plan/${encodeURIComponent(record.runId!)}`);
+        const response = await fetch(`/api/run-plan/${encodeURIComponent(runId)}`);
         if (!response.ok) {
           throw new Error(
             response.status === 404
@@ -1155,7 +1485,7 @@ export function resumeRecentResults(records: RecentResult[]): void {
               : `恢复任务失败（HTTP ${response.status}）`,
           );
         }
-        await consumeRunEvents(record.runId!, (event) => {
+        await consumeRunEvents(runId, (event) => {
           if (event.type !== "node-status" || event.nodeId !== record.nodeId) return;
           useFlowStore.setState((state) => ({
             recentResults: applyRunEventToRecentResults(state.recentResults, record.id, event),
@@ -1164,25 +1494,7 @@ export function resumeRecentResults(records: RecentResult[]): void {
             .getState()
             .tabs.find((tab) => tab.projectId === record.projectId)?.id;
           if (tabId && event.status) {
-            updateTabNodes(
-              useFlowStore.setState,
-              tabId,
-              (nodes) =>
-                nodes.map((node) =>
-                  node.id === record.nodeId
-                    ? {
-                        ...node,
-                        data: {
-                          ...node.data,
-                          ...(event.images?.length ? { outputImages: event.images } : {}),
-                          status: event.status!,
-                          error: event.error,
-                        } as WorkflowNodeData,
-                      }
-                    : node,
-                ),
-              { markDirty: event.status === "success" && Boolean(event.images?.length) },
-            );
+            updateTabFromRunEvent(useFlowStore.setState, tabId, record.nodeId, event);
           }
           if (event.status === "success" || event.status === "error") terminalRecorded = true;
         });
@@ -1203,17 +1515,30 @@ export function resumeRecentResults(records: RecentResult[]): void {
           .getState()
           .tabs.find((tab) => tab.projectId === record.projectId)?.id;
         if (tabId) {
-          updateTabNodes(useFlowStore.setState, tabId, (nodes) =>
-            nodes.map((node) =>
-              node.id === record.nodeId
-                ? { ...node, data: { ...node.data, status: "error", error: message } }
-                : node,
-            ),
-          );
+          updateTabFromRunEvent(useFlowStore.setState, tabId, record.nodeId, {
+            type: "node-status",
+            nodeId: record.nodeId,
+            status: "error",
+            error: message,
+            startedAt: record.startedAt,
+            finishedAt: Date.now(),
+          });
         }
+      } finally {
+        // 成功、后端失败、恢复查询失败都必须释放，允许后续重试。
+        resumingRecentRunIds.delete(runId);
       }
     })();
   }
+}
+
+/** 测试与外部恢复入口也必须复用同一套节点回写规则。 */
+export function applyRunEventToTab(
+  tabId: string,
+  nodeId: string,
+  event: NodeStatusRunEvent,
+): void {
+  updateTabFromRunEvent(useFlowStore.setState, tabId, nodeId, event);
 }
 
 /** 读取 result 节点聚合的上游图片（直接上游） */

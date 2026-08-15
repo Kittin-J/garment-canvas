@@ -1,9 +1,16 @@
 import { useState } from "react";
 import { useFlowStore } from "@/store/flowStore";
 import { OPEN_COMPARE_EVENT } from "@/components/CompareOverlay";
+import { thumbnailImageUrl } from "@/lib/images";
+
+interface ResultsPanelProps {
+  hasMore?: boolean;
+  loadingMore?: boolean;
+  onLoadMore?: () => void;
+}
 
 /** 底部结果面板（可折叠）：最近生成 + 运行记录一体，点击条目右侧显示详情 */
-export function ResultsPanel() {
+export function ResultsPanel({ hasMore = false, loadingMore = false, onLoadMore }: ResultsPanelProps) {
   // 生成历史是跨项目的全局记录；即使项目页签未恢复，也必须能在刷新后找回。
   const recentResults = useFlowStore((s) => s.recentResults);
   const selectedResultId = useFlowStore((s) => s.selectedResultId);
@@ -126,8 +133,10 @@ export function ResultsPanel() {
                     }`}
                   >
                     <img
-                      src={r.image}
+                      src={r.thumbnail ?? thumbnailImageUrl(r.image)}
                       alt={r.nodeLabel}
+                      loading="lazy"
+                      decoding="async"
                       className="h-24 w-24 object-cover transition-transform group-hover:scale-105"
                     />
                     {compareIds.includes(r.id) && (
@@ -137,6 +146,16 @@ export function ResultsPanel() {
                     )}
                   </button>
                 ),
+              )}
+              {hasMore && onLoadMore && (
+                <button
+                  type="button"
+                  onClick={onLoadMore}
+                  disabled={loadingMore}
+                  className="h-24 w-24 rounded-md border border-dashed border-[var(--gc-border)] text-[10px] text-[var(--gc-text-muted)] hover:border-[var(--gc-accent)] hover:text-[var(--gc-accent)] disabled:opacity-50"
+                >
+                  {loadingMore ? "加载中…" : "加载更多"}
+                </button>
               )}
             </div>
           )}

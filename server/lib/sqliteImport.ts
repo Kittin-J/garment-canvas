@@ -2,7 +2,6 @@ import fs from "node:fs";
 import Database from "better-sqlite3";
 import type { PoolClient } from "pg";
 import { config } from "../config";
-import { db, queryOne } from "./database";
 
 const TABLES: Array<{ name: string; columns: string[] }> = [
   { name: "users", columns: ["id", "account_id", "display_name", "role", "password_hash", "must_change_password", "active", "deleted_at", "created_at", "updated_at"] },
@@ -27,35 +26,35 @@ async function importTable(source: Database.Database, client: PoolClient, name: 
   const columnSql = columns.map((column) => `"${column}"`).join(", ");
   const placeholders = columns.map((_, index) => `$${index + 1}`).join(", ");
   for (const row of rows) {
+    const valuesSql = name === "project_asset_refs"
+      ? `SELECT ${placeholders}
+         WHERE EXISTS (SELECT 1 FROM projects WHERE id = $1)
+           AND EXISTS (SELECT 1 FROM assets WHERE id = $2)`
+      : `VALUES (${placeholders})`;
     await client.query(
-      `INSERT INTO "${name}" (${columnSql}) VALUES (${placeholders}) ON CONFLICT DO NOTHING`,
+      `INSERT INTO "${name}" (${columnSql}) ${valuesSql} ON CONFLICT DO NOTHING`,
       columns.map((column) => row[column] ?? null),
     );
   }
   return rows.length;
 }
 
-/** PostgreSQL 首次初始化时，自动导入升级前的 SQLite 数据库；原文件只读保留。 */
-export async function importSqliteIfNeeded(): Promise<void> {
-  const target = await queryOne<{ count: number }>("SELECT COUNT(*)::int AS count FROM users");
-  if ((target?.count ?? 0) > 0) return;
+/** PostgreSQL 首次初始化事务内导入升级前的 SQLite 数据库；原文件只读保留。 */
+export async function importSqliteIfNeeded(client: PoolClient): Promise<number | undefined> {
+  const target = (await client.query<{ count: number }>("SELECT COUNT(*)::int AS count FROM users")).rows[0];
+  if ((target?.count ?? 0) > 0) return undefined;
   const sourcePath = config.sqliteImportPath();
-  if (!fs.existsSync(sourcePath) || fs.statSync(sourcePath).size === 0) return;
+  if (!fs.existsSync(sourcePath) || fs.statSync(sourcePath).size === 0) return undefined;
 
   const source = new Database(sourcePath, { readonly: true, fileMustExist: true });
-  const client = await db().connect();
   try {
-    if (!sqliteTableExists(source, "users")) return;
-    await client.query("BEGIN");
+    if (!sqliteTableExists(source, "users")) return undefined;
     let imported = 0;
     for (const table of TABLES) imported += await importTable(source, client, table.name, table.columns);
-    await client.query("COMMIT");
-    console.log(`[garment-canvas] imported ${imported} rows from SQLite into PostgreSQL`);
+    return imported;
   } catch (error) {
-    await client.query("ROLLBACK");
     throw new Error(`SQLite 数据迁移到 PostgreSQL 失败：${error instanceof Error ? error.message : String(error)}`);
   } finally {
     source.close();
-    client.release();
   }
 }

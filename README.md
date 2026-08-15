@@ -9,8 +9,11 @@
 docker compose up -d --build --wait
 ```
 
-网页默认为 `http://localhost:3002`。PostgreSQL 数据保存在 Docker 命名卷
+网页默认为 `http://localhost:3002`。PostgreSQL 18 数据保存在 Docker 命名卷
 `garment-canvas_postgres_data`，上传和生成文件仍保存在 `data/`。
+
+PostgreSQL 18 官方镜像的卷挂载点是 `/var/lib/postgresql`。从 17 升级时不能直接
+复用 17 的数据目录，必须先用 `pg_dump` 导出，再在新建的 18 卷中恢复。
 
 如果 `data/garment-canvas.db` 存在且 PostgreSQL 还没有用户，首次启动会自动导入
 旧 SQLite 中的用户、会话、项目、素材、生成记录和消耗流水。导入成功后原
@@ -18,7 +21,7 @@ SQLite 文件会保留，便于回退核对。
 
 ## 本地开发
 
-要求 Node.js 20 或更高版本。先只启动 PostgreSQL，再启动开发服务：
+要求 Node.js 20.9.0 或更高版本。先只启动 PostgreSQL，再启动开发服务：
 
 ```bash
 docker compose up -d postgres --wait
@@ -61,7 +64,7 @@ npm start
 - `GET /api/health`：进程存活检查；
 - `GET /api/ready`：检查 PostgreSQL、`DATA_DIR`、AI 配置和完整模式下的前端构建。
 
-用户、会话、项目、素材、生成记录和消耗流水保存在 Docker 内置 PostgreSQL；上传及
+用户、会话、项目、素材、生成记录和消耗流水保存在 Docker 内置 PostgreSQL 18；上传及
 生成图片保存在 `DATA_DIR`。当前部署使用本地磁盘，不自动备份，但 PostgreSQL 命名卷
 与文件目录已分离，可后续接入备份接口。
 
@@ -88,6 +91,11 @@ INITIAL_ADMIN_PASSWORD=your-temporary-password
 
 生成和工作流执行接口使用进程内限流：同一 IP 每分钟最多请求 5 次；服务重启后计数重置。
 
-带提示词的 AI 节点可按连线顺序接收最多 8 张参考图；多图编辑通过
-Images Edit `image[]` multipart 字段提交。内置模板将“人物场景迁移”与
-“图案风格迁移”分开，避免人物/座椅语义污染印花图案处理。
+带提示词的 AI 节点可按连线顺序接收最多 8 张参考图。按照灵眸 GPT Image 2
+的单图编辑契约，多张参考图会在服务端按顺序合成为带编号的参考板，再通过
+Images Edit 的单数 `image` multipart 字段提交。模型返回的 `size` 不作为最终
+像素保证；画幅比例以及 2K/4K 会在服务端读取结果后无拉伸地处理到目标尺寸。
+本地接口基准见 [`docs/ai/gpt-image-2-lmu.md`](docs/ai/gpt-image-2-lmu.md)。
+
+内置模板将“人物场景迁移”与“图案风格迁移”分开，避免人物/座椅语义污染
+印花图案处理。

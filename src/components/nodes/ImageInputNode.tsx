@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import { useFlowStore } from "@/store/flowStore";
 import type { ImageInputNodeData } from "@/types/workflow";
+import { thumbnailImageUrl } from "@/lib/images";
 import { NodeFrame, inputClass } from "./NodeFrame";
 
 async function uploadFile(file: File): Promise<string> {
@@ -90,7 +91,9 @@ export function ImageInputNode({ id, data, selected }: NodeProps<Node<ImageInput
               onClick={() => openViewer({ url: data.imageUrl!, title: data.label })}
             >
               <img
-                src={data.imageUrl}
+                src={thumbnailImageUrl(data.imageUrl)}
+                loading="lazy"
+                decoding="async"
                 alt="已上传图片"
                 className="max-h-40 w-full object-contain bg-[#0f0f0f]"
               />

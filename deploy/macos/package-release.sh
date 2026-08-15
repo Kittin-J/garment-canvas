@@ -77,12 +77,12 @@ print "Installing production dependencies for the offline package..."
   cd "$OFFLINE_ROOT/app"
   npm ci --omit=dev --no-audit --no-fund
 )
-if ! docker image inspect postgres:17-alpine >/dev/null 2>&1; then
+if ! docker image inspect postgres:18-alpine >/dev/null 2>&1; then
   print "Downloading PostgreSQL for the offline package..."
-  docker pull postgres:17-alpine >/dev/null
+  docker pull postgres:18-alpine >/dev/null
 fi
 print "Bundling PostgreSQL for the offline package..."
-docker save -o "$OFFLINE_ROOT/postgres-17-alpine.tar" postgres:17-alpine
+docker save -o "$OFFLINE_ROOT/postgres-18-alpine.tar" postgres:18-alpine
 write_internal_checksums "$OFFLINE_ROOT"
 
 ONLINE_ARCHIVE="$OUTPUT_DIR/$ONLINE_NAME.tar.gz"

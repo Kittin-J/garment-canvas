@@ -2,14 +2,14 @@ name: garment-canvas
 
 services:
   postgres:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-garment_canvas}
       POSTGRES_USER: ${POSTGRES_USER:-garment_canvas}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在私有 .env 中设置 POSTGRES_PASSWORD}
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql
     ports:
       - "127.0.0.1:${POSTGRES_HOST_PORT:-54329}:5432"
     healthcheck:

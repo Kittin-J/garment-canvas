@@ -14,6 +14,7 @@ import { config } from "../config";
 import { writeJsonAtomicSync } from "../lib/atomicJson";
 import { validateAndMigrateFlow, WorkflowValidationError } from "../lib/workflowSchema";
 import { isLocalImageReference } from "../lib/imageValidation";
+import { thumbnailUrlForImage } from "../lib/fileStore";
 import { WORKFLOW_SCHEMA_VERSION, type WorkflowTemplate } from "../../src/types/workflow";
 
 export const templatesRouter = Router();
@@ -409,11 +410,17 @@ function readTemplateFile(filePath: string): WorkflowTemplate {
   return { ...raw, schemaVersion: WORKFLOW_SCHEMA_VERSION, flow } as unknown as WorkflowTemplate;
 }
 
+function templateForResponse(template: WorkflowTemplate): WorkflowTemplate {
+  return template.thumbnail
+    ? { ...template, thumbnail: thumbnailUrlForImage(template.thumbnail) }
+    : template;
+}
+
 templatesRouter.get("/", (_req, res) => {
   try {
     const builtin = readTemplates("builtin");
     const user = readTemplates("user").sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    res.json([...builtin, ...user]);
+    res.json([...builtin, ...user].map(templateForResponse));
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -429,7 +436,7 @@ templatesRouter.get("/:id", (req, res) => {
     return;
   }
   try {
-    res.json(readTemplateFile(filePath));
+    res.json(templateForResponse(readTemplateFile(filePath)));
   } catch (err) {
     res.status(err instanceof WorkflowValidationError ? 422 : 500).json({ error: err instanceof Error ? err.message : String(err) });
   }

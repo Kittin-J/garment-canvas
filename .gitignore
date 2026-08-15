@@ -14,12 +14,14 @@ releases/
 
 # Runtime data (built-in templates remain versioned)
 data/uploads/
+data/thumbnails/
 data/projects/
 data/assets/
 data/templates/user/
 data/quarantine/
 data/*.db
 data/*.db-*
+data/*.dump
 
 # OS
 .DS_Store

@@ -9,10 +9,95 @@ export class ProviderError extends Error {
     message: string,
     public readonly status?: number,
     public readonly providerId?: string,
+    public readonly category: ProviderErrorCategory = "unknown",
+    /** 仅供服务端日志诊断，绝不返回浏览器或写入用户运行记录。 */
+    public readonly diagnostic?: string,
   ) {
     super(message);
     this.name = "ProviderError";
   }
+}
+
+export type ProviderErrorCategory =
+  | "content_refused"
+  | "model_unavailable"
+  | "gateway_authentication"
+  | "invalid_request"
+  | "rate_limited"
+  | "timeout"
+  | "gateway_unavailable"
+  | "empty_response"
+  | "invalid_response"
+  | "unknown";
+
+function classifyProviderMessage(status: number | undefined, rawMessage: string): {
+  category: ProviderErrorCategory;
+  publicMessage: string;
+} {
+  const message = rawMessage
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
+  if (status === 401 || status === 403) {
+    return {
+      category: "gateway_authentication",
+      publicMessage: "AI 网关鉴权失败，请联系管理员检查 API Key 或账号权限",
+    };
+  }
+  const contentRefused =
+    /content\s*(policy|filter)|content management policy|responsible\s*ai\s*policy\s*violation/i.test(message) ||
+    /(safety system|moderation).{0,50}(block|filter|reject|refus)/i.test(message) ||
+    /(block|filter|reject|refus).{0,50}(safety system|moderation|content management policy)/i.test(message) ||
+    /内容.{0,12}(安全|审核|政策|过滤).{0,12}(拦截|过滤|拒绝|违规)|内容.{0,10}(拒绝|违规)/i.test(message);
+  if (contentRefused) {
+    return {
+      category: "content_refused",
+      publicMessage: "本次请求未通过 AI 安全审核，请调整提示词或参考图片后重试",
+    };
+  }
+  if (/model.{0,40}(not found|does not exist|unsupported|not available|invalid)|unknown model|模型.{0,10}(不存在|不可用|不支持)/i.test(message)) {
+    return {
+      category: "model_unavailable",
+      publicMessage: "当前 AI 模型不可用，请联系管理员检查模型配置",
+    };
+  }
+  if (status === 429) {
+    return { category: "rate_limited", publicMessage: "AI 服务当前繁忙，请稍后重试" };
+  }
+  if (status !== undefined && status >= 400 && status < 500) {
+    return {
+      category: "invalid_request",
+      publicMessage: "AI 服务暂不支持当前参数或参考图组合，请调整后重试",
+    };
+  }
+  if (status !== undefined && status >= 500) {
+    return { category: "gateway_unavailable", publicMessage: "AI 服务暂时不可用，请稍后重试" };
+  }
+  return { category: "unknown", publicMessage: "AI 服务返回异常，请稍后重试" };
+}
+
+export function providerErrorFromResponse(status: number, responseBody: string, providerId?: string): ProviderError {
+  const classified = classifyProviderMessage(status, responseBody);
+  return new ProviderError(
+    classified.publicMessage,
+    status,
+    providerId,
+    classified.category,
+    `HTTP ${status}: ${responseBody.slice(0, 2_000)}`,
+  );
+}
+
+export function providerErrorFromMessage(message: string, providerId?: string, status?: number): ProviderError {
+  const classified = classifyProviderMessage(status, message);
+  return new ProviderError(classified.publicMessage, status, providerId, classified.category, message.slice(0, 2_000));
+}
+
+export function publicProviderErrorMessage(error: unknown): string {
+  if (error instanceof ProviderError) return error.message;
+  if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
+    return "AI 服务响应超时，请稍后重试";
+  }
+  return "AI 服务暂时不可用，请稍后重试";
 }
 
 export class NotImplementedError extends ProviderError {
@@ -44,19 +129,11 @@ export async function fetchWithRetry(
       if (res.status >= 400 && res.status < 500) {
         // 4xx：读取错误体后直接抛出，不重试
         const body = await res.text().catch(() => "");
-        throw new ProviderError(
-          `HTTP ${res.status}: ${body.slice(0, 500)}`,
-          res.status,
-          opts?.providerId,
-        );
+        throw providerErrorFromResponse(res.status, body, opts?.providerId);
       }
       if (res.status >= 500) {
         const body = await res.text().catch(() => "");
-        lastError = new ProviderError(
-          `HTTP ${res.status}: ${body.slice(0, 500)}`,
-          res.status,
-          opts?.providerId,
-        );
+        lastError = providerErrorFromResponse(res.status, body, opts?.providerId);
         continue; // 5xx 重试
       }
       return res;
@@ -67,9 +144,23 @@ export async function fetchWithRetry(
       lastError = err; // 网络错误 / 超时 / 5xx → 重试
     }
   }
-  throw lastError instanceof Error
-    ? lastError
-    : new ProviderError(String(lastError), undefined, opts?.providerId);
+  if (lastError instanceof ProviderError) throw lastError;
+  if (lastError instanceof Error && (lastError.name === "TimeoutError" || lastError.name === "AbortError")) {
+    throw new ProviderError(
+      "AI 服务响应超时，请稍后重试",
+      504,
+      opts?.providerId,
+      "timeout",
+      lastError.message,
+    );
+  }
+  throw new ProviderError(
+    "AI 服务暂时不可用，请稍后重试",
+    502,
+    opts?.providerId,
+    "gateway_unavailable",
+    lastError instanceof Error ? lastError.message : String(lastError),
+  );
 }
 
 function sleep(ms: number): Promise<void> {

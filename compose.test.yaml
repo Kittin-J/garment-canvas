@@ -2,7 +2,7 @@ name: garment-canvas-test
 
 services:
   postgres-test:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_DB: garment_canvas_test
       POSTGRES_USER: garment_test
@@ -10,7 +10,7 @@ services:
     ports:
       - "127.0.0.1:${POSTGRES_TEST_PORT:-55432}:5432"
     tmpfs:
-      - /var/lib/postgresql/data
+      - /var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U garment_test -d garment_canvas_test"]
       interval: 2s

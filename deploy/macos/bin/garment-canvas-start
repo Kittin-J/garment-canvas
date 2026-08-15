@@ -9,6 +9,7 @@ PLIST_PATH="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 POSTGRES_CONTAINER="${GARMENT_CANVAS_POSTGRES_CONTAINER:-garment-canvas-postgres}"
 POSTGRES_VOLUME="${GARMENT_CANVAS_POSTGRES_VOLUME:-garment-canvas-postgres-data}"
+POSTGRES_IMAGE="postgres:18-alpine"
 
 read_env() {
   local key="$1" fallback="$2" line value
@@ -87,6 +88,11 @@ if docker container inspect "$POSTGRES_CONTAINER" >/dev/null 2>&1; then
     print -u2 "Container name is already used by another service: $POSTGRES_CONTAINER"
     exit 1
   fi
+  EXISTING_IMAGE="$(docker container inspect -f '{{.Config.Image}}' "$POSTGRES_CONTAINER")"
+  if [[ "$EXISTING_IMAGE" != "$POSTGRES_IMAGE" ]]; then
+    print -u2 "PostgreSQL container uses $EXISTING_IMAGE; PostgreSQL 18 migration is required before startup."
+    exit 1
+  fi
   docker start "$POSTGRES_CONTAINER" >/dev/null
 else
   docker run -d \
@@ -97,8 +103,8 @@ else
     -e "POSTGRES_USER=$PGUSER" \
     -e "POSTGRES_PASSWORD=$PGPASSWORD" \
     -p "127.0.0.1:$PGPORT:5432" \
-    -v "$POSTGRES_VOLUME:/var/lib/postgresql/data" \
-    postgres:17-alpine >/dev/null
+    -v "$POSTGRES_VOLUME:/var/lib/postgresql" \
+    "$POSTGRES_IMAGE" >/dev/null
 fi
 
 for _ in {1..60}; do

@@ -2,6 +2,7 @@ import { Router } from "express";
 import { requestUser } from "../lib/auth";
 import { asyncHandler } from "../lib/asyncHandler";
 import { query, queryOne } from "../lib/database";
+import { thumbnailUrlForImage } from "../lib/fileStore";
 
 export const historyRouter = Router();
 
@@ -39,6 +40,7 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
     id: (row.output_id as string | null) ?? (row.id as string),
     runId: row.id,
     image: (row.image as string | null) ?? "",
+    thumbnail: row.image ? thumbnailUrlForImage(row.image as string) : "",
     nodeId: row.node_id,
     nodeLabel: row.node_label,
     kind: row.kind,

@@ -2,8 +2,8 @@ import { Router } from "express";
 import { nanoid } from "nanoid";
 import { requestUser } from "../lib/auth";
 import { asyncHandler } from "../lib/asyncHandler";
-import { query, queryOne } from "../lib/database";
-import { saveDataUrl } from "../lib/fileStore";
+import { query, queryOne, transaction } from "../lib/database";
+import { saveDataUrl, thumbnailUrlForImage } from "../lib/fileStore";
 import { ImageValidationError, isLocalImageReference } from "../lib/imageValidation";
 import type { Asset } from "../../src/types/workflow";
 
@@ -26,6 +26,7 @@ function mapAsset(row: AssetRow, currentUserId: string) {
     name: row.name,
     category: row.category,
     image: row.image,
+    thumbnail: thumbnailUrlForImage(row.image),
     ...(row.source_note ? { sourceNote: row.source_note } : {}),
     createdAt: row.created_at,
     deletedAt: row.deleted_at,
@@ -50,6 +51,8 @@ assetsRouter.get("/", asyncHandler(async (req, res) => {
     return;
   }
   const includeDeleted = req.query.deleted === "true";
+  const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 20));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
   const rows = await query<AssetRow>(`
     SELECT a.*, u.display_name AS owner_name
     FROM assets a LEFT JOIN users u ON u.id = a.owner_id
@@ -57,7 +60,8 @@ assetsRouter.get("/", asyncHandler(async (req, res) => {
       AND (${includeDeleted ? "a.deleted_at IS NOT NULL" : "a.deleted_at IS NULL"})
       AND ($2 = 'admin' OR a.scope IN ('global','shared') OR a.owner_id = $3)
     ORDER BY a.created_at DESC
-  `, [category ?? null, user.role, user.id]);
+    LIMIT $4 OFFSET $5
+  `, [category ?? null, user.role, user.id, limit, offset]);
   res.json(rows.map((row) => ({
     ...mapAsset(row, user.id),
     canManage: row.scope === "global" ? user.role === "admin" : row.owner_id === user.id,
@@ -144,18 +148,29 @@ assetsRouter.post("/:id/references", asyncHandler(async (req, res) => {
     res.status(400).json({ error: "projectId is required" });
     return;
   }
-  const asset = await queryOne<{ id: string }>(`
-    SELECT id FROM assets WHERE id = $1 AND deleted_at IS NULL
-      AND (scope IN ('global','shared') OR owner_id = $2 OR $3 = 'admin')
-  `, [req.params.id, user.id, user.role]);
-  if (!asset) {
-    res.status(404).json({ error: "asset not found" });
+  const linked = await transaction(async (client) => {
+    const project = await queryOne<{ id: string }>(`
+      SELECT id FROM projects
+      WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL
+      FOR UPDATE
+    `, [projectId, user.id], client);
+    if (!project) return false;
+    const asset = await queryOne<{ id: string }>(`
+      SELECT id FROM assets WHERE id = $1 AND deleted_at IS NULL
+        AND (scope IN ('global','shared') OR owner_id = $2)
+    `, [req.params.id, user.id], client);
+    if (!asset) return false;
+    await client.query(`
+      INSERT INTO project_asset_refs (project_id, asset_id, created_at) VALUES ($1, $2, $3)
+      ON CONFLICT (project_id, asset_id) DO NOTHING
+    `, [projectId, req.params.id, new Date().toISOString()]);
+    return true;
+  });
+  if (!linked) {
+    // 统一 404，避免泄露项目或私有素材是否存在。
+    res.status(404).json({ error: "project or asset not found" });
     return;
   }
-  await query(`
-    INSERT INTO project_asset_refs (project_id, asset_id, created_at) VALUES ($1, $2, $3)
-    ON CONFLICT (project_id, asset_id) DO NOTHING
-  `, [projectId, req.params.id, new Date().toISOString()]);
   res.json({ ok: true });
 }));
 

@@ -9,6 +9,7 @@ import { isIP } from "node:net";
 import http from "node:http";
 import https from "node:https";
 import { nanoid } from "nanoid";
+import sharp from "sharp";
 import { config } from "../config";
 import { toDataUrl } from "../providers/base";
 import { MAX_IMAGE_BYTES, detectImageMime, validateImageDataUrl } from "./imageValidation";
@@ -32,6 +33,47 @@ export function uploadsDir(): string {
   const dir = path.join(config.dataDir(), "uploads");
   fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+function thumbnailsDir(): string {
+  const dir = path.join(config.dataDir(), "thumbnails");
+  fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+const thumbnailJobs = new Map<string, Promise<string>>();
+
+/** 原图保持不可变；缩略图是可随时重建的 WebP 缓存，不写入业务数据库。 */
+export async function ensureThumbnail(id: string): Promise<string> {
+  if (!isSupportedImageFile(id) || path.basename(id) !== id) throw new Error("invalid file id");
+  const source = path.join(uploadsDir(), id);
+  if (!fs.existsSync(source)) throw new Error("file not found");
+  const target = path.join(thumbnailsDir(), `${id}.webp`);
+  const existing = thumbnailJobs.get(id);
+  if (existing) return existing;
+  const job = (async () => {
+    const sourceStat = fs.statSync(source);
+    if (fs.existsSync(target) && fs.statSync(target).mtimeMs >= sourceStat.mtimeMs) return target;
+    const temporary = path.join(thumbnailsDir(), `.${id}.${nanoid(6)}.tmp.webp`);
+    try {
+      await sharp(source, { animated: false, failOn: "error" })
+        .rotate()
+        .resize({ width: 384, height: 384, fit: "inside", withoutEnlargement: true })
+        .webp({ quality: 78, effort: 4 })
+        .toFile(temporary);
+      fs.renameSync(temporary, target);
+      return target;
+    } finally {
+      try { fs.rmSync(temporary, { force: true }); } catch { /* best-effort */ }
+    }
+  })().finally(() => thumbnailJobs.delete(id));
+  thumbnailJobs.set(id, job);
+  return job;
+}
+
+export function thumbnailUrlForImage(ref: string): string {
+  const match = /^\/api\/files\/([^/?#]+)$/.exec(ref);
+  return match ? `/api/files/${match[1]}/thumbnail` : ref;
 }
 
 /** dataURL 存盘，返回 { id, url } */

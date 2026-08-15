@@ -5,7 +5,7 @@
   "description": "Garment design collaboration SaaS - infinite canvas + node workflow (P0 MVP)",
   "type": "module",
   "engines": {
-    "node": ">=20"
+    "node": ">=20.9.0"
   },
   "scripts": {
     "dev": "concurrently -n server,web -c blue,green \"npm:dev:server\" \"npm:dev:web\"",
@@ -18,7 +18,7 @@
     "lint": "tsc --noEmit",
     "check": "npm run lint && npm run test",
     "test": "node scripts/test-with-postgres.mjs",
-    "test:suite": "tsx tests/dag.test.ts && tsx tests/workflow-schema.test.ts && tsx tests/provider-contract.test.ts && tsx tests/exact-generation.test.ts && tsx tests/sqlite-postgres-migration.test.ts && tsx tests/auth-storage.test.ts && tsx tests/recent-results.test.ts && tsx tests/project-tabs-session.test.ts && tsx tests/project-tabs.test.ts",
+    "test:suite": "tsx tests/dag.test.ts && tsx tests/workflow-schema.test.ts && tsx tests/provider-contract.test.ts && tsx tests/exact-generation.test.ts && tsx tests/static-frontend.test.ts && tsx tests/sqlite-postgres-migration.test.ts && tsx tests/auth-storage.test.ts && tsx tests/auth-client.test.ts && tsx tests/authorization.test.ts && tsx tests/schema-migrations.test.ts && tsx tests/recent-results.test.ts && tsx tests/project-tabs-session.test.ts && tsx tests/project-tabs.test.ts",
     "docker:up": "docker compose up -d --build --wait",
     "docker:down": "docker compose down",
     "docker:logs": "docker compose logs -f app postgres"
@@ -30,6 +30,7 @@
     "express": "^4.21.2",
     "nanoid": "^5.1.0",
     "pg": "^8.23.0",
+    "sharp": "^0.35.3",
     "zundo": "^2.2.0",
     "zustand": "^5.0.3"
   },

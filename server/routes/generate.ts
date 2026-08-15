@@ -1,17 +1,76 @@
 /**
- * POST /api/generate  { providerId, request: ImageGenRequest } → ImageGenResult
+ * POST /api/generate  { providerId, kind?, request: ImageGenRequest } → ImageGenResult
  * 有参考图调 provider.edit，无参考图调 provider.generate。
  */
 import { Router } from "express";
-import { MAX_REFERENCE_IMAGES, type ImageGenRequest } from "../../src/types/workflow";
-import { getProvider, ProviderError } from "../providers";
+import {
+  MAX_REFERENCE_IMAGES,
+  NODE_SPECS,
+  type ImageGenRequest,
+  type NodeKind,
+} from "../../src/types/workflow";
+import { postProcessGeneratedOutputImages } from "../engine/runner";
+import { getProvider, ProviderError, publicProviderErrorMessage } from "../providers";
 import { generateExactImages } from "../providers/exact";
 import { normalizeImageRef, persistImageRef } from "../lib/fileStore";
+import { EXACT_ASPECT_DIMENSIONS } from "../lib/imagePostProcessing";
 import { nanoid } from "nanoid";
 import { requestUser } from "../lib/auth";
 import { completeGenerationRecord, createGenerationRecord, failGenerationRecord, markGenerationRunning } from "../lib/generationRecords";
 
 export const generateRouter = Router();
+
+export type DirectGenerateKind = Exclude<NodeKind, "image-input" | "result">;
+
+export type DirectGenerateValidation =
+  | { ok: true; kind?: DirectGenerateKind }
+  | { ok: false; error: string };
+
+function isDirectGenerateKind(value: unknown): value is DirectGenerateKind {
+  if (typeof value !== "string" || !Object.prototype.hasOwnProperty.call(NODE_SPECS, value)) return false;
+  return Boolean(NODE_SPECS[value as NodeKind].providerId);
+}
+
+/** Validate the node contract before starting or recording a direct generation. */
+export function validateDirectGenerateRequest(
+  kind: unknown,
+  request: ImageGenRequest,
+): DirectGenerateValidation {
+  // Backward compatibility: legacy direct callers did not send a node kind.
+  if (kind === undefined) return { ok: true };
+  if (!isDirectGenerateKind(kind)) {
+    return { ok: false, error: "kind must identify a supported AI node" };
+  }
+  if (kind === "sketch-to-render" || kind === "ai-modify") {
+    if (
+      typeof request.aspectRatio !== "string"
+      || !Object.prototype.hasOwnProperty.call(EXACT_ASPECT_DIMENSIONS, request.aspectRatio)
+    ) {
+      return {
+        ok: false,
+        error: `request.aspectRatio must be one of ${Object.keys(EXACT_ASPECT_DIMENSIONS).join(", ")}`,
+      };
+    }
+  }
+  if (kind === "upscale" && request.imageSize !== "2K" && request.imageSize !== "4K") {
+    return { ok: false, error: "request.imageSize must be 2K or 4K" };
+  }
+  return { ok: true, kind };
+}
+
+/** Keep the direct endpoint on the same business output guarantees as the DAG runner. */
+export function postProcessDirectGenerateImages(
+  kind: DirectGenerateKind | undefined,
+  request: ImageGenRequest,
+  images: string[],
+): Promise<string[]> {
+  if (!kind) return Promise.resolve(images);
+  return postProcessGeneratedOutputImages(
+    kind,
+    request as unknown as Record<string, unknown>,
+    images,
+  );
+}
 
 generateRouter.post("/", async (req, res) => {
   const { providerId, request, projectId, projectName, nodeId, nodeLabel, kind } = req.body as {
@@ -27,6 +86,11 @@ generateRouter.post("/", async (req, res) => {
     res.status(400).json({ error: `referenceImages must contain at most ${MAX_REFERENCE_IMAGES} images` });
     return;
   }
+  const validation = validateDirectGenerateRequest(kind, request);
+  if (!validation.ok) {
+    res.status(400).json({ error: validation.error });
+    return;
+  }
   const runId = nanoid(10);
   const startedAt = Date.now();
   const requestedCount = Math.max(1, Math.min(8, Number(request.batchSize) || 1));
@@ -36,7 +100,7 @@ generateRouter.post("/", async (req, res) => {
     projectName,
     nodeId: nodeId ?? "direct-generate",
     nodeLabel: nodeLabel ?? "直接生成",
-    kind: kind ?? "sketch-to-render",
+    kind: validation.kind ?? "sketch-to-render",
     prompt: request.prompt,
     parameters: request as unknown as Record<string, unknown>,
     referenceImages: request.referenceImages,
@@ -54,8 +118,9 @@ generateRouter.post("/", async (req, res) => {
       mask: request.mask ? await normalizeImageRef(request.mask) : undefined,
     };
     const raw = await generateExactImages(provider, resolved, requestedCount);
+    const processedImages = await postProcessDirectGenerateImages(validation.kind, resolved, raw.images);
     // 结果统一落盘为 /api/files URL：dataURL 与第三方临时 URL 都不进项目 JSON
-    const images = await Promise.all(raw.images.map(persistImageRef));
+    const images = await Promise.all(processedImages.map(persistImageRef));
     const finishedAt = Date.now();
     const failures = raw.failures.map((error) => ({ prompt: request.prompt, error }));
     await completeGenerationRecord({
@@ -64,14 +129,18 @@ generateRouter.post("/", async (req, res) => {
     });
     res.json({ ...raw, images, runId });
   } catch (err) {
-    await failGenerationRecord(runId, err instanceof Error ? err.message : String(err), Date.now());
+    const message = err instanceof ProviderError
+      ? publicProviderErrorMessage(err)
+      : err instanceof Error ? err.message : String(err);
+    await failGenerationRecord(runId, message, Date.now());
     if (err instanceof ProviderError) {
       res.status(err.status && err.status >= 400 && err.status < 600 ? err.status : 502).json({
-        error: err.message,
+        error: message,
         providerId: err.providerId ?? providerId,
+        category: err.category,
       });
     } else {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      res.status(500).json({ error: message });
     }
   }
 });

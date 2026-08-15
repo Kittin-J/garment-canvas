@@ -15,10 +15,12 @@ import { createRateLimitMiddleware } from "./lib/rateLimit";
 import { authRouter } from "./routes/auth";
 import { historyRouter } from "./routes/history";
 import { usageRouter } from "./routes/usage";
+import { createAiDiagnosticsRouter } from "./routes/aiDiagnostics";
 import { requireAuth, requirePasswordChanged, pruneExpiredSessions } from "./lib/auth";
 import { databaseReady, hasUsers, initializeDatabase } from "./lib/database";
 import { migrateLegacyData } from "./lib/legacyMigration";
 import { asyncHandler } from "./lib/asyncHandler";
+import { mountProductionFrontend } from "./lib/staticFrontend";
 import type { ErrorRequestHandler } from "express";
 
 const app = express();
@@ -27,6 +29,7 @@ app.use(express.json({ limit: "50mb" }));
 
 const aiRateLimit = createRateLimitMiddleware();
 const loginRateLimit = createRateLimitMiddleware({ windowMs: 60_000, maxRequests: 10 });
+const aiDiagnosticsRouter = createAiDiagnosticsRouter(aiRateLimit);
 app.get("/api/health", (_req, res) => res.json({ ok: true, status: "alive" }));
 
 const isProduction = process.env.NODE_ENV === "production";
@@ -90,12 +93,8 @@ app.use("/api/templates", templatesRouter);
 app.use("/api/assets", assetsRouter);
 app.use("/api/history", historyRouter);
 app.use("/api/usage", usageRouter);
-
-const apiErrorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
-  console.error("[garment-canvas] request failed", error);
-  if (!res.headersSent) res.status(500).json({ error: "服务器暂时无法处理请求" });
-};
-app.use(apiErrorHandler);
+app.use("/api/ai-diagnostics", aiDiagnosticsRouter);
+app.use("/api", (_req, res) => res.status(404).json({ error: "API not found" }));
 
 // 生产模式：完整模式必须有前端构建；API_ONLY=true 可显式跳过前端托管。
 if (isProduction && !apiOnly) {
@@ -104,9 +103,15 @@ if (isProduction && !apiOnly) {
       `Production frontend is missing: ${distIndex}. Run npm run build, or set API_ONLY=true for an API-only deployment.`,
     );
   }
-  app.use(express.static(distDir));
-  app.get("*", (_req, res) => res.sendFile(distIndex));
+  mountProductionFrontend(app, distDir);
 }
+
+const apiErrorHandler: ErrorRequestHandler = (error, _req, res, _next) => {
+  console.error("[garment-canvas] request failed", error);
+  if (!res.headersSent) res.status(500).json({ error: "服务器暂时无法处理请求" });
+};
+// Express 错误中间件必须位于 API、静态文件和 SPA fallback 之后。
+app.use(apiErrorHandler);
 
 const port = config.port();
 async function start(): Promise<void> {

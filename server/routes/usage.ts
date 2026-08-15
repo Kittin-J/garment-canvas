@@ -24,10 +24,14 @@ async function queryRows(ownerId: string | null, from: string | null, to: string
 
 function csvCell(value: unknown): string {
   const text = value == null ? "" : String(value);
-  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+  // Excel/LibreOffice 即使看到带双引号的 CSV 字段，仍可能执行公式。
+  // 只对字符串做文本化，避免把合法的负数数值改变成字符串。
+  const safeText = typeof value === "string" && /^\s*[=+\-@]/u.test(text) ? `'${text}` : text;
+  return /[",\r\n]/.test(safeText) ? `"${safeText.replaceAll('"', '""')}"` : safeText;
 }
 
 usageRouter.get("/", asyncHandler(async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   const user = requestUser(req);
   const selected = typeof req.query.userId === "string" ? req.query.userId : undefined;
   if (selected && user.role !== "admin" && selected !== user.id) {
@@ -46,6 +50,7 @@ usageRouter.get("/", asyncHandler(async (req, res) => {
     ])].map((line) => line.map(csvCell).join(","));
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="usage-${new Date().toISOString().slice(0, 10)}.csv"`);
+    res.setHeader("X-Content-Type-Options", "nosniff");
     res.send(`\uFEFF${lines.join("\r\n")}`);
     return;
   }

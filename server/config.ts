@@ -39,6 +39,24 @@ function required(name: string): string {
   return v;
 }
 
+function booleanEnv(name: string, fallback: boolean): boolean {
+  const value = process.env[name]?.trim().toLowerCase();
+  if (value === undefined || value === "") return fallback;
+  return value === "true" || value === "1" || value === "yes";
+}
+
+function boundedIntegerEnv(name: string, fallback: number, min: number, max: number): number {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) ? Math.max(min, Math.min(max, value)) : fallback;
+}
+
+export interface ImageProviderCapabilities {
+  supportsBatchN: boolean;
+  maxBatchSize: number;
+  supportsMultiReference: boolean;
+  maxReferenceImages: number;
+}
+
 export const config = {
   /** change2pro 中转站 */
   change2proBaseUrl: () =>
@@ -49,8 +67,21 @@ export const config = {
   nanobananaApiKey: () =>
     process.env.NANOBANANA_API_KEY || required("CHANGE2PRO_API_KEY"),
 
-  nanobananaModel: () => process.env.NANOBANANA_MODEL ?? "gpt-image-2",
-  image2Model: () => process.env.IMAGE2_MODEL ?? "gpt-image-2",
+  // 不再假定任意 OpenAI 兼容网关都存在某个固定模型；部署必须明确声明模型 ID。
+  nanobananaModel: () => required("NANOBANANA_MODEL"),
+  image2Model: () => required("IMAGE2_MODEL"),
+  nanobananaCapabilities: (): ImageProviderCapabilities => ({
+    supportsBatchN: booleanEnv("NANOBANANA_SUPPORTS_N", false),
+    maxBatchSize: boundedIntegerEnv("NANOBANANA_MAX_BATCH", 1, 1, 4),
+    supportsMultiReference: booleanEnv("NANOBANANA_SUPPORTS_MULTI_REFERENCE", true),
+    maxReferenceImages: boundedIntegerEnv("NANOBANANA_MAX_REFERENCE_IMAGES", 8, 1, 8),
+  }),
+  image2Capabilities: (): ImageProviderCapabilities => ({
+    supportsBatchN: booleanEnv("IMAGE2_SUPPORTS_N", false),
+    maxBatchSize: boundedIntegerEnv("IMAGE2_MAX_BATCH", 1, 1, 4),
+    supportsMultiReference: booleanEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", true),
+    maxReferenceImages: boundedIntegerEnv("IMAGE2_MAX_REFERENCE_IMAGES", 8, 1, 8),
+  }),
 
   port: () => Number(process.env.PORT ?? 3001),
   dataDir: () => path.resolve(ROOT_DIR, process.env.DATA_DIR ?? "./data"),
@@ -76,7 +107,10 @@ export const config = {
   aiConfigReady: () => {
     const key = process.env.CHANGE2PRO_API_KEY || process.env.NANOBANANA_API_KEY;
     const baseUrl = process.env.CHANGE2PRO_BASE_URL ?? "";
-    if (!key || !baseUrl || /your-change2pro-host/i.test(baseUrl)) return false;
+    if (
+      !key || !baseUrl || /your-change2pro-host/i.test(baseUrl) ||
+      !process.env.IMAGE2_MODEL?.trim() || !process.env.NANOBANANA_MODEL?.trim()
+    ) return false;
     try {
       const url = new URL(baseUrl);
       return url.protocol === "https:";

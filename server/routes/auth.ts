@@ -4,6 +4,7 @@ import {
   clearSessionCookie,
   createSession,
   requireAuth,
+  requireAuthForSessionCheck,
   requireAdmin,
   requestUser,
   revokeRequestSession,
@@ -57,11 +58,15 @@ authRouter.post("/login", asyncHandler(async (req, res) => {
   res.json({ user: publicUser(row), expiresAt: session.expiresAt });
 }));
 
-authRouter.use(requireAuth);
-
-authRouter.get("/me", (req, res) => {
+authRouter.get("/me", (req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+  requireAuthForSessionCheck(req, res, next);
+}, (req, res) => {
   res.json({ user: requestUser(req) });
 });
+
+authRouter.use(requireAuth);
 
 authRouter.post("/logout", asyncHandler(async (req, res) => {
   await revokeRequestSession(req);

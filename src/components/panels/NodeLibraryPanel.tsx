@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { NODE_SPECS, type Asset, type NodeKind } from "@/types/workflow";
 import { useFlowStore } from "@/store/flowStore";
 import { DND_MIME } from "../CanvasFlow";
+import { thumbnailImageUrl } from "@/lib/images";
 
 const KIND_ORDER: NodeKind[] = [
   "image-input",
@@ -90,15 +91,24 @@ const CATEGORY_STYLE: Record<Asset["category"], { label: string; className: stri
 function AssetList() {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [loading, setLoading] = useState(true);
+  const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const pageSize = 20;
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (offset = 0) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetch("/api/assets");
+      const res = await fetch(`/api/assets?limit=${pageSize}&offset=${offset}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      setAssets((await res.json()) as Asset[]);
+      const page = (await res.json()) as Asset[];
+      if (!Array.isArray(page)) throw new Error("素材数据格式无效");
+      setAssets((current) => {
+        if (offset === 0) return page;
+        const ids = new Set(current.map((asset) => asset.id));
+        return [...current, ...page.filter((asset) => !ids.has(asset.id))];
+      });
+      setHasMore(page.length === pageSize);
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -107,23 +117,19 @@ function AssetList() {
   }, []);
 
   useEffect(() => {
-    void load();
+    void load(0);
   }, [load]);
 
   /** 点击素材：在最左侧节点左边新增一个 image-input 节点并灌入图片 */
   const addToCanvas = (asset: Asset) => {
-    const { nodes, addNode, updateNodeData, projectId } = useFlowStore.getState();
+    const { nodes, addNode, updateNodeData } = useFlowStore.getState();
     const minX = Math.min(0, ...nodes.map((n) => n.position.x));
     addNode("image-input", { x: minX - 320, y: nodes.length * 40 });
     const newId = useFlowStore.getState().selectedNodeId;
     if (newId) {
       updateNodeData(newId, { imageUrl: asset.image, status: "success", label: asset.name });
     }
-    void fetch(`/api/assets/${asset.id}/references`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ projectId }),
-    });
+    // 引用关系由项目保存时根据最终画布统一同步；未保存项目不提前占用素材。
   };
 
   const removeAsset = async (asset: Asset) => {
@@ -149,7 +155,7 @@ function AssetList() {
     }
   };
 
-  if (loading) {
+  if (loading && assets.length === 0) {
     return <p className="flex-1 py-4 text-center text-[10px] text-neutral-600">加载中…</p>;
   }
   if (error && assets.length === 0) {
@@ -158,7 +164,7 @@ function AssetList() {
         <p className="text-[10px] text-neutral-600">素材服务暂不可用（{error}）</p>
         <button
           type="button"
-          onClick={() => void load()}
+          onClick={() => void load(0)}
           className="mt-2 rounded border border-[#262626] px-2 py-1 text-[10px] text-neutral-400 hover:border-gold/50 hover:text-gold"
         >
           重试
@@ -190,8 +196,10 @@ function AssetList() {
               className="block w-full overflow-hidden rounded-md border border-[#262626] bg-[#0f0f0f] transition-colors hover:border-gold/60"
             >
               <img
-                src={asset.image}
+                src={asset.thumbnail ?? thumbnailImageUrl(asset.image)}
                 alt={asset.name}
+                loading="lazy"
+                decoding="async"
                 className="aspect-square w-full object-cover"
               />
             </button>
@@ -231,6 +239,16 @@ function AssetList() {
           </div>
         );
       })}
+      {hasMore && (
+        <button
+          type="button"
+          onClick={() => void load(assets.length)}
+          disabled={loading}
+          className="w-full rounded-md border border-dashed border-[var(--gc-border)] px-3 py-2 text-[10px] text-[var(--gc-text-muted)] hover:border-[var(--gc-accent)] hover:text-[var(--gc-accent)] disabled:opacity-50"
+        >
+          {loading ? "加载中…" : "加载更多素材"}
+        </button>
+      )}
     </div>
   );
 }

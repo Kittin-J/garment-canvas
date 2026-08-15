@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { ReactFlowProvider } from "@xyflow/react";
 import { nanoid } from "nanoid";
 import { resumeRecentResults, useFlowStore, type FlowNode } from "@/store/flowStore";
@@ -12,7 +12,7 @@ import { TemplatesDock } from "@/components/panels/TemplatesDock";
 import { CompareOverlay } from "@/components/CompareOverlay";
 import { ImageViewer } from "@/components/ImageViewer";
 import { useAuth } from "@/auth/AuthContext";
-import { ChangePasswordPage, LoginPage } from "@/auth/LoginPage";
+import { ChangePasswordPage, LoginPage, SessionEndedPage } from "@/auth/LoginPage";
 
 /** 剪贴板里的节点快照（仅内存，跨项目/刷新不保留） */
 let nodeClipboard: { data: FlowNode["data"]; type: string } | null = null;
@@ -83,9 +83,12 @@ function useGlobalShortcuts() {
 }
 
 export default function App() {
-  const { user, loading } = useAuth();
+  const { user, loading, sessionEndReason, acknowledgeSessionEnd } = useAuth();
   if (loading) {
     return <div className="flex h-full items-center justify-center bg-[#101214] text-xs text-neutral-500">正在验证登录状态…</div>;
+  }
+  if (sessionEndReason === "replaced") {
+    return <SessionEndedPage onContinue={acknowledgeSessionEnd} />;
   }
   if (!user) return <LoginPage />;
   if (user.mustChangePassword) return <ChangePasswordPage />;
@@ -95,10 +98,14 @@ export default function App() {
 function Workspace() {
   useGlobalShortcuts();
   const activeTabId = useFlowStore((state) => state.activeTabId);
+  const [historyOffset, setHistoryOffset] = useState(0);
+  const [historyHasMore, setHistoryHasMore] = useState(false);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const historyPageSize = 20;
 
   useEffect(() => {
     let active = true;
-    fetch("/api/history?limit=100")
+    fetch(`/api/history?limit=${historyPageSize}&offset=0`)
       .then(async (response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return await response.json();
@@ -107,29 +114,64 @@ function Workspace() {
         if (active && Array.isArray(records)) {
           useFlowStore.setState({ recentResults: records as never });
           resumeRecentResults(records as never);
+          setHistoryOffset(records.length);
+          setHistoryHasMore(records.length === historyPageSize);
         }
       })
       .catch(() => undefined);
     return () => { active = false; };
   }, []);
 
+  const loadMoreHistory = useCallback(async () => {
+    if (historyLoading || !historyHasMore) return;
+    setHistoryLoading(true);
+    try {
+      const response = await fetch(
+        `/api/history?limit=${historyPageSize}&offset=${historyOffset}`,
+      );
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const records = await response.json();
+      if (!Array.isArray(records)) throw new Error("历史记录格式无效");
+      useFlowStore.setState((state) => {
+        const existingIds = new Set(state.recentResults.map((record) => record.id));
+        return {
+          recentResults: [
+            ...state.recentResults,
+            ...records.filter((record) => !existingIds.has(record.id)),
+          ].slice(0, 200) as never,
+        };
+      });
+      resumeRecentResults(records as never);
+      setHistoryOffset((offset) => offset + records.length);
+      setHistoryHasMore(records.length === historyPageSize);
+    } catch {
+      // 保留“加载更多”入口，瞬时网络错误后用户可以再次重试。
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [historyHasMore, historyLoading, historyOffset]);
+
   return (
     <div className="gc-app-shell flex h-full flex-col bg-ink text-neutral-200">
       <TopBar />
       <ProjectTabs />
-      <ReactFlowProvider key={activeTabId}>
-        <div className="flex min-h-0 flex-1">
-          <NodeLibraryPanel />
-          <div className="relative flex min-w-0 flex-1 flex-col">
-            <TemplatesDock />
+      <div className="flex min-h-0 flex-1">
+        <NodeLibraryPanel />
+        <div className="relative flex min-w-0 flex-1 flex-col">
+          <TemplatesDock />
+          <ReactFlowProvider key={activeTabId}>
             <CanvasFlow />
-            <ResultsPanel />
-          </div>
-          <InspectorPanel />
+          </ReactFlowProvider>
+          <ResultsPanel
+            hasMore={historyHasMore}
+            loadingMore={historyLoading}
+            onLoadMore={() => void loadMoreHistory()}
+          />
         </div>
-        <CompareOverlay />
-        <ImageViewer />
-      </ReactFlowProvider>
+        <InspectorPanel />
+      </div>
+      <CompareOverlay />
+      <ImageViewer />
     </div>
   );
 }

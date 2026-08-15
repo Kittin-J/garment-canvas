@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import type { Edge } from "@xyflow/react";
-import { useFlowStore, type FlowNode } from "../src/store/flowStore";
+import { applyRunEventToTab, useFlowStore, type FlowNode } from "../src/store/flowStore";
 
 let passed = 0;
 
@@ -21,6 +21,23 @@ function imageNode(id: string, label: string): FlowNode {
     type: "image-input",
     position: { x: 0, y: 0 },
     data: { kind: "image-input", label, status: "idle", imageRole: "default" },
+  };
+}
+
+function aiNode(id: string, label: string): FlowNode {
+  return {
+    id,
+    type: "ai-modify",
+    position: { x: 320, y: 0 },
+    data: {
+      kind: "ai-modify",
+      label,
+      status: "success",
+      prompt: "修改衣领",
+      aspectRatio: "1:1",
+      batchSize: 1,
+      outputImages: ["/api/files/previous.png"],
+    },
   };
 }
 
@@ -75,6 +92,32 @@ await test("后台任务可定向回写非当前页签", () => {
   const node = useFlowStore.getState().nodes.find((candidate) => candidate.id === "b-node");
   assert.equal(node?.data.status, "success");
   assert.equal(node?.data.kind === "image-input" ? node.data.imageUrl : undefined, "/api/files/background-result.png");
+});
+
+await test("A 页签后台失败不影响 B 页签且保留 A 的上一版图片", () => {
+  useFlowStore.getState().switchTab(tabA);
+  useFlowStore.getState().addExistingNode(aiNode("a-ai-node", "A 后台改款"));
+  useFlowStore.getState().switchTab(tabB);
+  const beforeB = useFlowStore.getState().nodes;
+
+  applyRunEventToTab(tabA, "a-ai-node", {
+    type: "node-status",
+    nodeId: "a-ai-node",
+    status: "error",
+    error: "AI 网关暂不可用",
+  });
+
+  assert.equal(useFlowStore.getState().activeTabId, tabB);
+  assert.strictEqual(useFlowStore.getState().nodes, beforeB);
+  useFlowStore.getState().switchTab(tabA);
+  const failedNode = useFlowStore.getState().nodes.find((node) => node.id === "a-ai-node");
+  assert.equal(failedNode?.data.status, "error");
+  assert.equal(failedNode?.data.error, "AI 网关暂不可用");
+  assert.deepEqual(
+    failedNode?.data.kind === "ai-modify" ? failedNode.data.outputImages : undefined,
+    ["/api/files/previous.png"],
+  );
+  useFlowStore.getState().switchTab(tabB);
 });
 
 await test("关闭当前页签后切换到相邻页签，至少保留一个画布", () => {

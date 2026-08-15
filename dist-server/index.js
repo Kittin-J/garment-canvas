@@ -1,7 +1,7 @@
 // server/index.ts
-import express from "express";
+import express2 from "express";
 import fs8 from "node:fs";
-import path8 from "node:path";
+import path9 from "node:path";
 
 // server/config.ts
 import fs from "node:fs";
@@ -32,14 +32,36 @@ function required(name) {
   if (!v) throw new Error(`Missing required env var: ${name} (see .env.example)`);
   return v;
 }
+function booleanEnv(name, fallback) {
+  const value = process.env[name]?.trim().toLowerCase();
+  if (value === void 0 || value === "") return fallback;
+  return value === "true" || value === "1" || value === "yes";
+}
+function boundedIntegerEnv(name, fallback, min, max) {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) ? Math.max(min, Math.min(max, value)) : fallback;
+}
 var config = {
   /** change2pro 中转站 */
   change2proBaseUrl: () => (process.env.CHANGE2PRO_BASE_URL ?? "https://your-change2pro-host/v1").replace(/\/+$/, ""),
   change2proApiKey: () => required("CHANGE2PRO_API_KEY"),
   /** nanobanana 可用独立 Key（如中转站按平台分组发 Key），缺省回退主 Key */
   nanobananaApiKey: () => process.env.NANOBANANA_API_KEY || required("CHANGE2PRO_API_KEY"),
-  nanobananaModel: () => process.env.NANOBANANA_MODEL ?? "gpt-image-2",
-  image2Model: () => process.env.IMAGE2_MODEL ?? "gpt-image-2",
+  // 不再假定任意 OpenAI 兼容网关都存在某个固定模型；部署必须明确声明模型 ID。
+  nanobananaModel: () => required("NANOBANANA_MODEL"),
+  image2Model: () => required("IMAGE2_MODEL"),
+  nanobananaCapabilities: () => ({
+    supportsBatchN: booleanEnv("NANOBANANA_SUPPORTS_N", false),
+    maxBatchSize: boundedIntegerEnv("NANOBANANA_MAX_BATCH", 1, 1, 4),
+    supportsMultiReference: booleanEnv("NANOBANANA_SUPPORTS_MULTI_REFERENCE", true),
+    maxReferenceImages: boundedIntegerEnv("NANOBANANA_MAX_REFERENCE_IMAGES", 8, 1, 8)
+  }),
+  image2Capabilities: () => ({
+    supportsBatchN: booleanEnv("IMAGE2_SUPPORTS_N", false),
+    maxBatchSize: boundedIntegerEnv("IMAGE2_MAX_BATCH", 1, 1, 4),
+    supportsMultiReference: booleanEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", true),
+    maxReferenceImages: boundedIntegerEnv("IMAGE2_MAX_REFERENCE_IMAGES", 8, 1, 8)
+  }),
   port: () => Number(process.env.PORT ?? 3001),
   dataDir: () => path.resolve(ROOT_DIR, process.env.DATA_DIR ?? "./data"),
   databaseUrl: () => process.env.DATABASE_URL?.trim() || void 0,
@@ -62,7 +84,7 @@ var config = {
   aiConfigReady: () => {
     const key = process.env.CHANGE2PRO_API_KEY || process.env.NANOBANANA_API_KEY;
     const baseUrl = process.env.CHANGE2PRO_BASE_URL ?? "";
-    if (!key || !baseUrl || /your-change2pro-host/i.test(baseUrl)) return false;
+    if (!key || !baseUrl || /your-change2pro-host/i.test(baseUrl) || !process.env.IMAGE2_MODEL?.trim() || !process.env.NANOBANANA_MODEL?.trim()) return false;
     try {
       const url = new URL(baseUrl);
       return url.protocol === "https:";
@@ -143,17 +165,81 @@ var NODE_SPECS = {
   }
 };
 
+// server/engine/runner.ts
+import { EventEmitter } from "node:events";
+import { nanoid as nanoid4 } from "nanoid";
+
 // server/providers/base.ts
 var ProviderError = class extends Error {
-  constructor(message, status, providerId) {
+  constructor(message, status, providerId, category = "unknown", diagnostic) {
     super(message);
     this.status = status;
     this.providerId = providerId;
+    this.category = category;
+    this.diagnostic = diagnostic;
     this.name = "ProviderError";
   }
   status;
   providerId;
+  category;
+  diagnostic;
 };
+function classifyProviderMessage(status, rawMessage) {
+  const message = rawMessage.toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
+  if (status === 401 || status === 403) {
+    return {
+      category: "gateway_authentication",
+      publicMessage: "AI \u7F51\u5173\u9274\u6743\u5931\u8D25\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u68C0\u67E5 API Key \u6216\u8D26\u53F7\u6743\u9650"
+    };
+  }
+  const contentRefused = /content\s*(policy|filter)|content management policy|responsible\s*ai\s*policy\s*violation/i.test(message) || /(safety system|moderation).{0,50}(block|filter|reject|refus)/i.test(message) || /(block|filter|reject|refus).{0,50}(safety system|moderation|content management policy)/i.test(message) || /内容.{0,12}(安全|审核|政策|过滤).{0,12}(拦截|过滤|拒绝|违规)|内容.{0,10}(拒绝|违规)/i.test(message);
+  if (contentRefused) {
+    return {
+      category: "content_refused",
+      publicMessage: "\u672C\u6B21\u8BF7\u6C42\u672A\u901A\u8FC7 AI \u5B89\u5168\u5BA1\u6838\uFF0C\u8BF7\u8C03\u6574\u63D0\u793A\u8BCD\u6216\u53C2\u8003\u56FE\u7247\u540E\u91CD\u8BD5"
+    };
+  }
+  if (/model.{0,40}(not found|does not exist|unsupported|not available|invalid)|unknown model|模型.{0,10}(不存在|不可用|不支持)/i.test(message)) {
+    return {
+      category: "model_unavailable",
+      publicMessage: "\u5F53\u524D AI \u6A21\u578B\u4E0D\u53EF\u7528\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u68C0\u67E5\u6A21\u578B\u914D\u7F6E"
+    };
+  }
+  if (status === 429) {
+    return { category: "rate_limited", publicMessage: "AI \u670D\u52A1\u5F53\u524D\u7E41\u5FD9\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5" };
+  }
+  if (status !== void 0 && status >= 400 && status < 500) {
+    return {
+      category: "invalid_request",
+      publicMessage: "AI \u670D\u52A1\u6682\u4E0D\u652F\u6301\u5F53\u524D\u53C2\u6570\u6216\u53C2\u8003\u56FE\u7EC4\u5408\uFF0C\u8BF7\u8C03\u6574\u540E\u91CD\u8BD5"
+    };
+  }
+  if (status !== void 0 && status >= 500) {
+    return { category: "gateway_unavailable", publicMessage: "AI \u670D\u52A1\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5" };
+  }
+  return { category: "unknown", publicMessage: "AI \u670D\u52A1\u8FD4\u56DE\u5F02\u5E38\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5" };
+}
+function providerErrorFromResponse(status, responseBody, providerId) {
+  const classified = classifyProviderMessage(status, responseBody);
+  return new ProviderError(
+    classified.publicMessage,
+    status,
+    providerId,
+    classified.category,
+    `HTTP ${status}: ${responseBody.slice(0, 2e3)}`
+  );
+}
+function providerErrorFromMessage(message, providerId, status) {
+  const classified = classifyProviderMessage(status, message);
+  return new ProviderError(classified.publicMessage, status, providerId, classified.category, message.slice(0, 2e3));
+}
+function publicProviderErrorMessage(error) {
+  if (error instanceof ProviderError) return error.message;
+  if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
+    return "AI \u670D\u52A1\u54CD\u5E94\u8D85\u65F6\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5";
+  }
+  return "AI \u670D\u52A1\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5";
+}
 var NotImplementedError = class extends ProviderError {
   constructor(feature) {
     super(`Not implemented: ${feature}`);
@@ -175,19 +261,11 @@ async function fetchWithRetry(url, initFactory, opts) {
       });
       if (res.status >= 400 && res.status < 500) {
         const body = await res.text().catch(() => "");
-        throw new ProviderError(
-          `HTTP ${res.status}: ${body.slice(0, 500)}`,
-          res.status,
-          opts?.providerId
-        );
+        throw providerErrorFromResponse(res.status, body, opts?.providerId);
       }
       if (res.status >= 500) {
         const body = await res.text().catch(() => "");
-        lastError = new ProviderError(
-          `HTTP ${res.status}: ${body.slice(0, 500)}`,
-          res.status,
-          opts?.providerId
-        );
+        lastError = providerErrorFromResponse(res.status, body, opts?.providerId);
         continue;
       }
       return res;
@@ -198,7 +276,23 @@ async function fetchWithRetry(url, initFactory, opts) {
       lastError = err;
     }
   }
-  throw lastError instanceof Error ? lastError : new ProviderError(String(lastError), void 0, opts?.providerId);
+  if (lastError instanceof ProviderError) throw lastError;
+  if (lastError instanceof Error && (lastError.name === "TimeoutError" || lastError.name === "AbortError")) {
+    throw new ProviderError(
+      "AI \u670D\u52A1\u54CD\u5E94\u8D85\u65F6\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5",
+      504,
+      opts?.providerId,
+      "timeout",
+      lastError.message
+    );
+  }
+  throw new ProviderError(
+    "AI \u670D\u52A1\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5",
+    502,
+    opts?.providerId,
+    "gateway_unavailable",
+    lastError instanceof Error ? lastError.message : String(lastError)
+  );
 }
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -228,251 +322,39 @@ function aspectRatioToSize(aspectRatio) {
   }
 }
 
-// server/providers/nanobanana.ts
-var PROVIDER_ID = "nanobanana";
-async function generateOnce(req) {
-  const url = `${config.change2proBaseUrl()}/images/generations`;
-  const res = await fetchWithRetry(
-    url,
-    () => ({
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.nanobananaApiKey()}`
-      },
-      body: JSON.stringify({
-        model: config.nanobananaModel(),
-        prompt: req.prompt,
-        n: 1,
-        size: aspectRatioToSize(req.aspectRatio),
-        quality: "low",
-        output_format: "png"
-      })
-    }),
-    { providerId: PROVIDER_ID }
-  );
-  const json = await res.json();
-  if (json.error) {
-    throw new ProviderError(json.error.message ?? "images api error", json.error.code, PROVIDER_ID);
-  }
-  const images = [];
-  for (const item of json.data ?? []) {
-    if (item.b64_json) images.push(toDataUrl(item.b64_json));
-    else if (item.url) images.push(item.url);
-  }
-  if (images.length === 0) {
-    throw new ProviderError("nanobanana returned no image", void 0, PROVIDER_ID);
-  }
-  return images;
-}
-var nanobananaProvider = {
-  id: PROVIDER_ID,
-  /** 文生图；batchSize 通过多次调用实现 */
-  async generate(req) {
-    const n = Math.max(1, Math.min(req.batchSize ?? 1, 4));
-    const settled = await Promise.all(Array.from({ length: n }, () => generateOnce(req)));
-    return {
-      images: settled.flat(),
-      model: config.nanobananaModel()
-    };
-  },
-  /** 图生图：使用 /images/edits multipart 接口。 */
-  async edit(req) {
-    if (!req.referenceImages?.length) {
-      throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID);
-    }
-    if (req.referenceImages.length > MAX_REFERENCE_IMAGES) {
-      throw new ProviderError(`edit supports at most ${MAX_REFERENCE_IMAGES} reference images`, 400, PROVIDER_ID);
-    }
-    const url = `${config.change2proBaseUrl()}/images/edits`;
-    const res = await fetchWithRetry(
-      url,
-      () => {
-        const form = new FormData();
-        form.append("model", config.nanobananaModel());
-        form.append("prompt", req.prompt);
-        form.append("size", aspectRatioToSize(req.aspectRatio));
-        form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, 4))));
-        req.referenceImages.forEach((ref, index) => {
-          const { mime, buffer } = parseDataUrl(ref);
-          const ext = mime.split("/")[1] ?? "png";
-          form.append(
-            "image[]",
-            new Blob([new Uint8Array(buffer)], { type: mime }),
-            `ref-${index}.${ext}`
-          );
-        });
-        if (req.mask) {
-          const { mime, buffer } = parseDataUrl(req.mask);
-          form.append("mask", new Blob([new Uint8Array(buffer)], { type: mime }), "mask.png");
-        }
-        return {
-          method: "POST",
-          headers: { Authorization: `Bearer ${config.nanobananaApiKey()}` },
-          body: form
-        };
-      },
-      { providerId: PROVIDER_ID }
-    );
-    const json = await res.json();
-    if (json.error) {
-      throw new ProviderError(json.error.message ?? "images api error", json.error.code, PROVIDER_ID);
-    }
-    const images = [];
-    for (const item of json.data ?? []) {
-      if (item.b64_json) images.push(toDataUrl(item.b64_json));
-      else if (item.url) images.push(item.url);
-    }
-    if (images.length === 0) {
-      throw new ProviderError("nanobanana returned no image", void 0, PROVIDER_ID);
-    }
-    return { images, model: config.nanobananaModel() };
-  }
-};
+// server/providers/gptImagesResponse.ts
+import sharp from "sharp";
 
-// server/providers/image2.ts
-var PROVIDER_ID2 = "gpt-image-2";
-function parseImagesResponse(json) {
-  if (json.error) {
-    throw new ProviderError(json.error.message ?? "images api error", void 0, PROVIDER_ID2);
+// server/lib/imageProcessingLimit.ts
+var MAX_CONCURRENT_IMAGE_PROCESSING = 2;
+var active = 0;
+var waiters = [];
+async function acquireImageProcessingSlot() {
+  if (active < MAX_CONCURRENT_IMAGE_PROCESSING) {
+    active += 1;
+  } else {
+    await new Promise((resolve) => waiters.push(resolve));
   }
-  const images = [];
-  for (const item of json.data ?? []) {
-    if (item.b64_json) images.push(toDataUrl(item.b64_json));
-    else if (item.url) images.push(item.url);
-  }
-  if (images.length === 0) {
-    throw new ProviderError("gpt-image-2 returned no image", void 0, PROVIDER_ID2);
-  }
-  return images;
-}
-var image2Provider = {
-  id: PROVIDER_ID2,
-  /** 无参考图：/v1/images/generations */
-  async generate(req) {
-    const url = `${config.change2proBaseUrl()}/images/generations`;
-    const res = await fetchWithRetry(
-      url,
-      () => ({
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${config.change2proApiKey()}`
-        },
-        body: JSON.stringify({
-          model: config.image2Model(),
-          prompt: req.prompt,
-          n: Math.max(1, Math.min(req.batchSize ?? 1, 4)),
-          size: aspectRatioToSize(req.aspectRatio),
-          quality: "low",
-          output_format: "png"
-        })
-      }),
-      { providerId: PROVIDER_ID2 }
-    );
-    const json = await res.json();
-    return { images: parseImagesResponse(json), model: config.image2Model() };
-  },
-  /** 有参考图：/v1/images/edits，multipart form 上传 */
-  async edit(req) {
-    if (!req.referenceImages?.length) {
-      throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID2);
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = waiters.shift();
+    if (next) {
+      next();
+    } else {
+      active -= 1;
     }
-    if (req.referenceImages.length > MAX_REFERENCE_IMAGES) {
-      throw new ProviderError(`edit supports at most ${MAX_REFERENCE_IMAGES} reference images`, 400, PROVIDER_ID2);
-    }
-    const url = `${config.change2proBaseUrl()}/images/edits`;
-    const res = await fetchWithRetry(
-      url,
-      () => {
-        const form = new FormData();
-        form.append("model", config.image2Model());
-        form.append("prompt", req.prompt);
-        form.append("size", aspectRatioToSize(req.aspectRatio));
-        form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, 4))));
-        req.referenceImages.forEach((ref, i) => {
-          const { mime, buffer } = parseDataUrl(ref);
-          const ext = mime.split("/")[1] ?? "png";
-          form.append("image[]", new Blob([new Uint8Array(buffer)], { type: mime }), `ref-${i}.${ext}`);
-        });
-        if (req.mask) {
-          const { mime, buffer } = parseDataUrl(req.mask);
-          form.append("mask", new Blob([new Uint8Array(buffer)], { type: mime }), "mask.png");
-        }
-        return {
-          method: "POST",
-          headers: { Authorization: `Bearer ${config.change2proApiKey()}` },
-          body: form
-        };
-      },
-      { providerId: PROVIDER_ID2 }
-    );
-    const json = await res.json();
-    return { images: parseImagesResponse(json), model: config.image2Model() };
-  }
-};
-
-// server/providers/index.ts
-var comfyuiStub = {
-  id: "comfyui-local",
-  generate() {
-    throw new NotImplementedError("comfyui-local provider (reserved for P1)");
-  },
-  edit() {
-    throw new NotImplementedError("comfyui-local provider (reserved for P1)");
-  }
-};
-var providers = {
-  nanobanana: nanobananaProvider,
-  "gpt-image-2": image2Provider,
-  "comfyui-local": comfyuiStub
-};
-function getProvider(id) {
-  const p = providers[id];
-  if (!p) {
-    throw new ProviderError(`Unknown provider id: ${id}`, 400);
-  }
-  return p;
+  };
 }
-
-// server/providers/exact.ts
-async function generateExactImages(provider, request, requestedCount) {
-  const target = Math.max(1, Math.min(8, Math.floor(requestedCount) || 1));
-  const images = [];
-  const failures = [];
-  let model = provider.id;
-  let providerRequests = 0;
-  let firstError;
-  const maxAttempts = target + 3;
-  while (images.length < target && providerRequests < maxAttempts) {
-    const remaining = target - images.length;
-    const current = { ...request, batchSize: Math.min(4, remaining) };
-    providerRequests += 1;
-    try {
-      const result = current.referenceImages?.length ? await provider.edit(current) : await provider.generate(current);
-      model = result.model;
-      const accepted = result.images.filter(Boolean).slice(0, remaining);
-      images.push(...accepted);
-      if (accepted.length === 0) failures.push("\u6A21\u578B\u672A\u8FD4\u56DE\u56FE\u7247");
-    } catch (error) {
-      firstError ??= error;
-      failures.push(error instanceof Error ? error.message : String(error));
-      if (error instanceof ProviderError && error.status !== void 0 && error.status >= 400 && error.status < 500) break;
-    }
+async function withImageProcessingSlot(work) {
+  const release = await acquireImageProcessingSlot();
+  try {
+    return await work();
+  } finally {
+    release();
   }
-  if (images.length === 0) throw firstError instanceof Error ? firstError : new Error(failures[0] ?? "\u6A21\u578B\u672A\u8FD4\u56DE\u56FE\u7247");
-  if (images.length < target) failures.push(`\u53EA\u751F\u6210\u4E86 ${images.length}/${target} \u5F20\u56FE\u7247`);
-  return { images, model, providerRequests, failures };
 }
-
-// server/lib/fileStore.ts
-import fs2 from "node:fs";
-import path2 from "node:path";
-import dns from "node:dns/promises";
-import { isIP } from "node:net";
-import http from "node:http";
-import https from "node:https";
-import { nanoid } from "nanoid";
 
 // server/lib/imageValidation.ts
 var ALLOWED_IMAGE_MIMES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
@@ -536,7 +418,409 @@ function isLocalImageReference(value) {
   return /^\/api\/files\/[A-Za-z0-9_-]{1,128}\.(?:png|jpe?g|webp|gif)$/.test(value);
 }
 
+// server/providers/gptImagesResponse.ts
+var INVALID_IMAGE_RESPONSE_MESSAGE = "AI \u670D\u52A1\u8FD4\u56DE\u4E86\u65E0\u6548\u56FE\u7247\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\uFF1B\u5982\u6301\u7EED\u5931\u8D25\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458";
+var MAX_PROVIDER_RESPONSE_PIXELS = 4e7;
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function invalidImageResponse(providerId, location, reason) {
+  return new ProviderError(
+    INVALID_IMAGE_RESPONSE_MESSAGE,
+    502,
+    providerId,
+    "invalid_response",
+    `Images response ${location}: ${reason}`
+  );
+}
+async function parsePngBase64(value, providerId, index) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw invalidImageResponse(providerId, `item ${index}`, "b64_json must be a non-empty string");
+  }
+  try {
+    const validated = validateImageDataUrl(`data:image/png;base64,${value}`);
+    await withImageProcessingSlot(async () => {
+      await sharp(validated.buffer, {
+        animated: false,
+        failOn: "warning",
+        limitInputPixels: MAX_PROVIDER_RESPONSE_PIXELS
+      }).raw().toBuffer();
+    });
+    return `data:image/png;base64,${validated.buffer.toString("base64")}`;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "PNG validation failed";
+    throw invalidImageResponse(providerId, `item ${index}`, reason);
+  }
+}
+function parseImageUrl(value, providerId, index) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw invalidImageResponse(providerId, `item ${index}`, "url must be a non-empty string");
+  }
+  const normalized = value.trim();
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("unsupported protocol");
+  } catch {
+    throw invalidImageResponse(providerId, `item ${index}`, "url must be an absolute HTTP(S) URL");
+  }
+  return normalized;
+}
+async function parseGptImagesPngResponse(payload, providerId) {
+  if (!isRecord(payload)) {
+    throw invalidImageResponse(providerId, "body", "expected a JSON object");
+  }
+  if (payload.error !== void 0 && payload.error !== null) {
+    if (!isRecord(payload.error)) {
+      throw invalidImageResponse(providerId, "error", "expected an error object");
+    }
+    const code = payload.error.code;
+    const message = typeof payload.error.message === "string" ? payload.error.message : "images api error";
+    const rawMessage = typeof code === "string" ? `${code}: ${message}` : message;
+    const status = typeof code === "number" && Number.isInteger(code) && code >= 400 && code < 600 ? code : void 0;
+    throw providerErrorFromMessage(rawMessage, providerId, status);
+  }
+  if (!Array.isArray(payload.data) || payload.data.length === 0) {
+    throw new ProviderError("AI \u670D\u52A1\u672A\u8FD4\u56DE\u56FE\u7247\uFF0C\u8BF7\u91CD\u8BD5", 502, providerId, "empty_response");
+  }
+  const images = [];
+  for (let index = 0; index < payload.data.length; index += 1) {
+    const item = payload.data[index];
+    if (!isRecord(item)) {
+      throw invalidImageResponse(providerId, `item ${index}`, "expected an object");
+    }
+    if (Object.prototype.hasOwnProperty.call(item, "b64_json")) {
+      images.push(await parsePngBase64(item.b64_json, providerId, index));
+    } else if (Object.prototype.hasOwnProperty.call(item, "url")) {
+      images.push(parseImageUrl(item.url, providerId, index));
+    } else {
+      throw invalidImageResponse(providerId, `item ${index}`, "expected b64_json or url");
+    }
+  }
+  return images;
+}
+
+// server/providers/image2References.ts
+import sharp2 from "sharp";
+var IMAGE2_COLLAGE_LAYOUT = {
+  padding: 24,
+  gap: 16,
+  labelHeight: 48,
+  tileSize: 512,
+  maxColumns: 4
+};
+var MAX_REFERENCE_INPUT_PIXELS = 4e7;
+function extensionForMime(mime) {
+  switch (mime) {
+    case "image/jpeg":
+      return "jpg";
+    case "image/webp":
+      return "webp";
+    case "image/gif":
+      return "gif";
+    default:
+      return "png";
+  }
+}
+function referenceLabel(index) {
+  const { tileSize, labelHeight } = IMAGE2_COLLAGE_LAYOUT;
+  return Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${tileSize}" height="${labelHeight}"><rect width="100%" height="100%" fill="#171717"/><text x="16" y="32" fill="#ffffff" font-family="sans-serif" font-size="22" font-weight="700">Image ${index}</text></svg>`
+  );
+}
+async function prepareImage2ReferenceUpload(referenceImages) {
+  if (referenceImages.length === 1) {
+    const { buffer, mime } = parseDataUrl(referenceImages[0]);
+    return {
+      buffer,
+      filename: `reference-1.${extensionForMime(mime)}`,
+      mime
+    };
+  }
+  return withImageProcessingSlot(async () => {
+    const { padding, gap, labelHeight, tileSize, maxColumns } = IMAGE2_COLLAGE_LAYOUT;
+    const columns = Math.min(referenceImages.length, maxColumns);
+    const rows = Math.ceil(referenceImages.length / columns);
+    const width = padding * 2 + columns * tileSize + (columns - 1) * gap;
+    const height = padding * 2 + rows * (labelHeight + tileSize) + (rows - 1) * gap;
+    const tiles = [];
+    for (const referenceImage of referenceImages) {
+      const { buffer: buffer2 } = parseDataUrl(referenceImage);
+      const tile = await sharp2(buffer2, {
+        animated: false,
+        failOn: "warning",
+        limitInputPixels: MAX_REFERENCE_INPUT_PIXELS,
+        sequentialRead: true
+      }).rotate().resize(tileSize, tileSize, {
+        fit: "contain",
+        background: { r: 255, g: 255, b: 255, alpha: 1 }
+      }).flatten({ background: { r: 255, g: 255, b: 255 } }).png().toBuffer();
+      tiles.push(tile);
+    }
+    const inputs = [];
+    for (let index = 0; index < tiles.length; index += 1) {
+      const column = index % columns;
+      const row = Math.floor(index / columns);
+      const left = padding + column * (tileSize + gap);
+      const top = padding + row * (labelHeight + tileSize + gap);
+      inputs.push({ input: referenceLabel(index + 1), left, top });
+      inputs.push({ input: tiles[index], left, top: top + labelHeight });
+    }
+    const buffer = await sharp2({
+      create: {
+        width,
+        height,
+        channels: 3,
+        background: { r: 244, g: 244, b: 244 }
+      }
+    }).composite(inputs).png().toBuffer();
+    return {
+      buffer,
+      filename: "numbered-references.png",
+      mime: "image/png"
+    };
+  });
+}
+function promptWithImageLayout(prompt, referenceCount) {
+  if (referenceCount <= 1) return prompt;
+  return `Reference collage: Image 1..${referenceCount} are arranged row by row, left to right, then top to bottom.
+${prompt}`;
+}
+
+// server/providers/nanobanana.ts
+var PROVIDER_ID = "nanobanana";
+async function generateOnce(req) {
+  const capabilities = config.nanobananaCapabilities();
+  const url = `${config.change2proBaseUrl()}/images/generations`;
+  const res = await fetchWithRetry(
+    url,
+    () => ({
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${config.nanobananaApiKey()}`
+      },
+      body: JSON.stringify({
+        model: config.nanobananaModel(),
+        prompt: req.prompt,
+        ...capabilities.supportsBatchN ? { n: Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize)) } : {},
+        size: aspectRatioToSize(req.aspectRatio),
+        quality: "low",
+        output_format: "png"
+      })
+    }),
+    { providerId: PROVIDER_ID }
+  );
+  const json = await res.json();
+  return await parseGptImagesPngResponse(json, PROVIDER_ID);
+}
+var nanobananaProvider = {
+  id: PROVIDER_ID,
+  /** 文生图；不支持批量 n 的网关由 generateExactImages 在上层按缺口补发。 */
+  async generate(req) {
+    return {
+      images: await generateOnce(req),
+      model: config.nanobananaModel()
+    };
+  },
+  /** 图生图：使用 /images/edits multipart 接口。 */
+  async edit(req) {
+    if (!req.referenceImages?.length) {
+      throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID);
+    }
+    const capabilities = config.nanobananaCapabilities();
+    const maxReferences = Math.min(MAX_REFERENCE_IMAGES, capabilities.maxReferenceImages);
+    if (req.referenceImages.length > maxReferences) {
+      throw new ProviderError(`\u5F53\u524D AI \u670D\u52A1\u6700\u591A\u652F\u6301 ${maxReferences} \u5F20\u53C2\u8003\u56FE`, 400, PROVIDER_ID, "invalid_request");
+    }
+    if (req.referenceImages.length > 1 && !capabilities.supportsMultiReference) {
+      throw new ProviderError("\u5F53\u524D AI \u670D\u52A1\u672A\u5F00\u542F\u591A\u53C2\u8003\u56FE\uFF0C\u8BF7\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID, "invalid_request");
+    }
+    if (req.referenceImages.length > 1 && req.mask) {
+      throw new ProviderError("\u591A\u53C2\u8003\u56FE\u62FC\u56FE\u6682\u4E0D\u652F\u6301\u8499\u7248\uFF0C\u8BF7\u79FB\u9664\u8499\u7248\u6216\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID, "invalid_request");
+    }
+    const referenceUpload = await prepareImage2ReferenceUpload(req.referenceImages);
+    const prompt = promptWithImageLayout(req.prompt, req.referenceImages.length);
+    const url = `${config.change2proBaseUrl()}/images/edits`;
+    const res = await fetchWithRetry(
+      url,
+      () => {
+        const form = new FormData();
+        form.append("model", config.nanobananaModel());
+        form.append("prompt", prompt);
+        if (req.aspectRatio) form.append("size", aspectRatioToSize(req.aspectRatio));
+        form.append("quality", "low");
+        form.append("output_format", "png");
+        if (capabilities.supportsBatchN) {
+          form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize))));
+        }
+        form.append(
+          "image",
+          new Blob([new Uint8Array(referenceUpload.buffer)], { type: referenceUpload.mime }),
+          referenceUpload.filename
+        );
+        if (req.mask) {
+          const { mime, buffer } = parseDataUrl(req.mask);
+          form.append("mask", new Blob([new Uint8Array(buffer)], { type: mime }), "mask.png");
+        }
+        return {
+          method: "POST",
+          headers: { Authorization: `Bearer ${config.nanobananaApiKey()}` },
+          body: form
+        };
+      },
+      { providerId: PROVIDER_ID }
+    );
+    const json = await res.json();
+    const images = await parseGptImagesPngResponse(json, PROVIDER_ID);
+    return { images, model: config.nanobananaModel() };
+  }
+};
+
+// server/providers/image2.ts
+var PROVIDER_ID2 = "gpt-image-2";
+var image2Provider = {
+  id: PROVIDER_ID2,
+  /** 无参考图：/v1/images/generations */
+  async generate(req) {
+    const capabilities = config.image2Capabilities();
+    const url = `${config.change2proBaseUrl()}/images/generations`;
+    const res = await fetchWithRetry(
+      url,
+      () => ({
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${config.change2proApiKey()}`
+        },
+        body: JSON.stringify({
+          model: config.image2Model(),
+          prompt: req.prompt,
+          ...capabilities.supportsBatchN ? { n: Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize)) } : {},
+          size: aspectRatioToSize(req.aspectRatio),
+          quality: "low",
+          output_format: "png"
+        })
+      }),
+      { providerId: PROVIDER_ID2 }
+    );
+    const json = await res.json();
+    return { images: await parseGptImagesPngResponse(json, PROVIDER_ID2), model: config.image2Model() };
+  },
+  /** 有参考图：/v1/images/edits，multipart form 上传 */
+  async edit(req) {
+    if (!req.referenceImages?.length) {
+      throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID2);
+    }
+    const capabilities = config.image2Capabilities();
+    const maxReferences = Math.min(MAX_REFERENCE_IMAGES, capabilities.maxReferenceImages);
+    if (req.referenceImages.length > maxReferences) {
+      throw new ProviderError(`\u5F53\u524D AI \u670D\u52A1\u6700\u591A\u652F\u6301 ${maxReferences} \u5F20\u53C2\u8003\u56FE`, 400, PROVIDER_ID2, "invalid_request");
+    }
+    if (req.referenceImages.length > 1 && !capabilities.supportsMultiReference) {
+      throw new ProviderError("\u5F53\u524D AI \u670D\u52A1\u672A\u5F00\u542F\u591A\u53C2\u8003\u56FE\uFF0C\u8BF7\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID2, "invalid_request");
+    }
+    if (req.referenceImages.length > 1 && req.mask) {
+      throw new ProviderError("\u591A\u53C2\u8003\u56FE\u62FC\u56FE\u6682\u4E0D\u652F\u6301\u8499\u7248\uFF0C\u8BF7\u79FB\u9664\u8499\u7248\u6216\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID2, "invalid_request");
+    }
+    const referenceUpload = await prepareImage2ReferenceUpload(req.referenceImages);
+    const prompt = promptWithImageLayout(req.prompt, req.referenceImages.length);
+    const url = `${config.change2proBaseUrl()}/images/edits`;
+    const res = await fetchWithRetry(
+      url,
+      () => {
+        const form = new FormData();
+        form.append("model", config.image2Model());
+        form.append("prompt", prompt);
+        if (req.aspectRatio) form.append("size", aspectRatioToSize(req.aspectRatio));
+        form.append("quality", "low");
+        form.append("output_format", "png");
+        if (capabilities.supportsBatchN) {
+          form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize))));
+        }
+        form.append(
+          "image",
+          new Blob([new Uint8Array(referenceUpload.buffer)], { type: referenceUpload.mime }),
+          referenceUpload.filename
+        );
+        if (req.mask) {
+          const { mime, buffer } = parseDataUrl(req.mask);
+          form.append("mask", new Blob([new Uint8Array(buffer)], { type: mime }), "mask.png");
+        }
+        return {
+          method: "POST",
+          headers: { Authorization: `Bearer ${config.change2proApiKey()}` },
+          body: form
+        };
+      },
+      { providerId: PROVIDER_ID2 }
+    );
+    const json = await res.json();
+    return { images: await parseGptImagesPngResponse(json, PROVIDER_ID2), model: config.image2Model() };
+  }
+};
+
+// server/providers/index.ts
+var comfyuiStub = {
+  id: "comfyui-local",
+  generate() {
+    throw new NotImplementedError("comfyui-local provider (reserved for P1)");
+  },
+  edit() {
+    throw new NotImplementedError("comfyui-local provider (reserved for P1)");
+  }
+};
+var providers = {
+  nanobanana: nanobananaProvider,
+  "gpt-image-2": image2Provider,
+  "comfyui-local": comfyuiStub
+};
+function getProvider(id) {
+  const p = providers[id];
+  if (!p) {
+    throw new ProviderError(`Unknown provider id: ${id}`, 400);
+  }
+  return p;
+}
+
+// server/providers/exact.ts
+async function generateExactImages(provider, request, requestedCount) {
+  const target = Math.max(1, Math.min(8, Math.floor(requestedCount) || 1));
+  const images = [];
+  const failures = [];
+  let model = provider.id;
+  let providerRequests = 0;
+  let firstError;
+  const maxAttempts = target + 3;
+  while (images.length < target && providerRequests < maxAttempts) {
+    const remaining = target - images.length;
+    const current = { ...request, batchSize: Math.min(4, remaining) };
+    providerRequests += 1;
+    try {
+      const result = current.referenceImages?.length ? await provider.edit(current) : await provider.generate(current);
+      model = result.model;
+      const accepted = result.images.filter(Boolean).slice(0, remaining);
+      images.push(...accepted);
+      if (accepted.length === 0) failures.push("\u6A21\u578B\u672A\u8FD4\u56DE\u56FE\u7247");
+    } catch (error) {
+      firstError ??= error;
+      failures.push(publicProviderErrorMessage(error));
+      if (error instanceof ProviderError && error.status !== void 0 && error.status >= 400 && error.status < 500) break;
+    }
+  }
+  if (images.length === 0) throw firstError instanceof Error ? firstError : new Error(failures[0] ?? "\u6A21\u578B\u672A\u8FD4\u56DE\u56FE\u7247");
+  if (images.length < target) failures.push(`\u53EA\u751F\u6210\u4E86 ${images.length}/${target} \u5F20\u56FE\u7247`);
+  return { images, model, providerRequests, failures };
+}
+
 // server/lib/fileStore.ts
+import fs2 from "node:fs";
+import path2 from "node:path";
+import dns from "node:dns/promises";
+import { isIP } from "node:net";
+import http from "node:http";
+import https from "node:https";
+import { nanoid } from "nanoid";
+import sharp3 from "sharp";
 var MIME_EXT = {
   "image/png": "png",
   "image/jpeg": "jpg",
@@ -554,6 +838,41 @@ function uploadsDir() {
   const dir = path2.join(config.dataDir(), "uploads");
   fs2.mkdirSync(dir, { recursive: true });
   return dir;
+}
+function thumbnailsDir() {
+  const dir = path2.join(config.dataDir(), "thumbnails");
+  fs2.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+var thumbnailJobs = /* @__PURE__ */ new Map();
+async function ensureThumbnail(id) {
+  if (!isSupportedImageFile(id) || path2.basename(id) !== id) throw new Error("invalid file id");
+  const source = path2.join(uploadsDir(), id);
+  if (!fs2.existsSync(source)) throw new Error("file not found");
+  const target = path2.join(thumbnailsDir(), `${id}.webp`);
+  const existing = thumbnailJobs.get(id);
+  if (existing) return existing;
+  const job = (async () => {
+    const sourceStat = fs2.statSync(source);
+    if (fs2.existsSync(target) && fs2.statSync(target).mtimeMs >= sourceStat.mtimeMs) return target;
+    const temporary = path2.join(thumbnailsDir(), `.${id}.${nanoid(6)}.tmp.webp`);
+    try {
+      await sharp3(source, { animated: false, failOn: "error" }).rotate().resize({ width: 384, height: 384, fit: "inside", withoutEnlargement: true }).webp({ quality: 78, effort: 4 }).toFile(temporary);
+      fs2.renameSync(temporary, target);
+      return target;
+    } finally {
+      try {
+        fs2.rmSync(temporary, { force: true });
+      } catch {
+      }
+    }
+  })().finally(() => thumbnailJobs.delete(id));
+  thumbnailJobs.set(id, job);
+  return job;
+}
+function thumbnailUrlForImage(ref) {
+  const match = /^\/api\/files\/([^/?#]+)$/.exec(ref);
+  return match ? `/api/files/${match[1]}/thumbnail` : ref;
 }
 function saveDataUrl(dataUrl) {
   const { mime, buffer } = validateImageDataUrl(dataUrl);
@@ -808,11 +1127,202 @@ async function persistImageRef(ref) {
   return saveDataUrl(dataUrl).url;
 }
 
-// server/routes/generate.ts
-import { nanoid as nanoid4 } from "nanoid";
+// server/lib/imagePostProcessing.ts
+import sharp4 from "sharp";
+var EXACT_ASPECT_DIMENSIONS = {
+  "1:1": { width: 1024, height: 1024 },
+  "3:4": { width: 1152, height: 1536 },
+  "4:3": { width: 1536, height: 1152 },
+  "9:16": { width: 864, height: 1536 },
+  "16:9": { width: 1536, height: 864 }
+};
+var WEBP_QUALITIES = [92, 84, 76, 68, 60, 50, 40, 30, 20, 10];
+var SHARP_INPUT_OPTIONS = {
+  animated: false,
+  failOn: "warning",
+  limitInputPixels: 4e7
+};
+function isExactAspectRatio(value) {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(EXACT_ASPECT_DIMENSIONS, value);
+}
+function isUpscaleSize(value) {
+  return value === "2K" || value === "4K";
+}
+function normalizeExactAspectRatio(value) {
+  return isExactAspectRatio(value) ? value : "1:1";
+}
+function normalizeUpscaleSize(value) {
+  return isUpscaleSize(value) ? value : "2K";
+}
+async function imageRefToBuffer(ref) {
+  const dataUrl = await normalizeImageRef(ref);
+  return validateImageDataUrl(dataUrl).buffer;
+}
+async function encodeWebpWithinLimit(image) {
+  for (const quality of WEBP_QUALITIES) {
+    const output = await image.clone().webp({ quality, effort: 4, smartSubsample: true }).toBuffer();
+    if (output.byteLength <= MAX_IMAGE_BYTES) return output;
+  }
+  throw new Error(`processed image exceeds ${MAX_IMAGE_BYTES} bytes even at minimum quality`);
+}
+function toWebpDataUrl(buffer) {
+  return `data:image/webp;base64,${buffer.toString("base64")}`;
+}
+async function fitGeneratedImageToAspect(ref, aspectRatio) {
+  return withImageProcessingSlot(async () => {
+    const normalizedAspectRatio = normalizeExactAspectRatio(aspectRatio);
+    const input = await imageRefToBuffer(ref);
+    const { width, height } = EXACT_ASPECT_DIMENSIONS[normalizedAspectRatio];
+    const source = sharp4(input, SHARP_INPUT_OPTIONS).rotate();
+    const { dominant } = await source.clone().stats();
+    const background = { r: dominant.r, g: dominant.g, b: dominant.b, alpha: 1 };
+    const output = await encodeWebpWithinLimit(
+      source.resize({ width, height, fit: "contain", position: "centre", background }).flatten({ background }).toColourspace("srgb")
+    );
+    return toWebpDataUrl(output);
+  });
+}
+async function upscaleImageToLongEdge(ref, imageSize) {
+  return withImageProcessingSlot(async () => {
+    const normalizedImageSize = normalizeUpscaleSize(imageSize);
+    const input = await imageRefToBuffer(ref);
+    const longEdge = normalizedImageSize === "4K" ? 4096 : 2048;
+    const output = await encodeWebpWithinLimit(
+      sharp4(input, SHARP_INPUT_OPTIONS).rotate().resize({ width: longEdge, height: longEdge, fit: "inside" }).toColourspace("srgb")
+    );
+    return toWebpDataUrl(output);
+  });
+}
 
-// server/lib/auth.ts
-import { createHash, randomBytes as randomBytes2 } from "node:crypto";
+// src/lib/colors.ts
+var COLOR_CATEGORIES = [
+  {
+    id: "neutral",
+    label: "\u4E2D\u6027\u57FA\u7840\u8272",
+    swatches: [
+      { name: "\u78B3\u7D20\u9ED1", hex: "#161616" },
+      { name: "\u68D5\u9ED1", hex: "#2B1D16" },
+      { name: "\u70AD\u9ED1", hex: "#1A1A1A" },
+      { name: "\u66AE\u8272\u7070", hex: "#6B6B70" },
+      { name: "\u70DF\u7070", hex: "#6E6E6E" },
+      { name: "\u6DF1\u6D77\u9E25\u7070", hex: "#8B9296" },
+      { name: "\u6C34\u6CE5\u7070", hex: "#9A9A98" },
+      { name: "\u5927\u8C61\u7070", hex: "#8A8378" },
+      { name: "\u66AE\u6C99\u7070", hex: "#A39B8B" },
+      { name: "\u4E91\u70DF\u7070", hex: "#B9B7B2" },
+      { name: "\u6D45\u7070", hex: "#C8C8C8" },
+      { name: "\u73CD\u73E0\u767D", hex: "#F2EFE9" },
+      { name: "\u71D5\u9EA6\u767D", hex: "#EDE6D6" },
+      { name: "\u739B\u7459\u767D", hex: "#E9E4DA" },
+      { name: "\u7C73\u767D", hex: "#F5F0E6" },
+      { name: "\u67D4\u548C\u7C73", hex: "#E5DCC8" },
+      { name: "\u5976\u674F\u7C73", hex: "#F0E4CE" },
+      { name: "\u7EAF\u767D", hex: "#FFFFFF" },
+      { name: "\u9999\u69DF\u8272", hex: "#F0DCB8" },
+      { name: "\u9A7C\u8272", hex: "#C19A6B" },
+      { name: "\u5361\u5176", hex: "#B8A47E" },
+      { name: "\u5496\u5561", hex: "#6F4E37" },
+      { name: "\u6989\u6728\u8272", hex: "#A67B4F" },
+      { name: "\u7126\u7CD6", hex: "#A0522D" }
+    ]
+  },
+  {
+    id: "warm",
+    label: "\u6696\u8272\u7CFB",
+    swatches: [
+      // 红
+      { name: "\u7194\u5CA9\u7EA2", hex: "#B03A2E" },
+      { name: "\u4E2D\u56FD\u7EA2", hex: "#DE2910" },
+      { name: "\u6B63\u7EA2", hex: "#C8102E" },
+      { name: "\u6A31\u6843\u7EA2", hex: "#C2183C" },
+      { name: "\u6CE2\u826E\u7B2C\u7EA2", hex: "#5C1A24" },
+      { name: "\u9152\u7EA2", hex: "#722F37" },
+      { name: "\u6885\u6D1B\u8461\u8404\u9152\u7EA2", hex: "#6E2438" },
+      { name: "\u7816\u7EA2", hex: "#B5493A" },
+      // 粉
+      { name: "\u8393\u679C\u7C89", hex: "#D98CA6" },
+      { name: "\u82AD\u6BD4\u7C89", hex: "#E0219C" },
+      { name: "\u73CA\u745A\u7C89", hex: "#F88379" },
+      { name: "\u85D5\u7C89", hex: "#E8C4C4" },
+      { name: "\u73AB\u7470\u8336", hex: "#C08585" },
+      { name: "\u96FE\u73AB\u7470\u8272", hex: "#B48A8C" },
+      { name: "\u7070\u7C89\u73AB", hex: "#C4A4A8" },
+      { name: "\u73AB\u7470\u91D1", hex: "#B76E79" },
+      // 橙
+      { name: "\u7231\u9A6C\u4ED5\u6A59", hex: "#F37021" },
+      { name: "\u6A58\u6A59", hex: "#E8752A" },
+      { name: "\u67F3\u6A59\u6C41\u6A58", hex: "#F28C28" },
+      { name: "\u9999\u74DC\u6A59", hex: "#F2A65A" },
+      { name: "\u67D4\u548C\u6843", hex: "#F5CBA7" },
+      // 黄/金
+      { name: "\u82A6\u82C7\u9EC4", hex: "#D9C97A" },
+      { name: "\u900F\u660E\u9EC4", hex: "#F5E663" },
+      { name: "\u9E45\u9EC4", hex: "#F2D16B" },
+      { name: "\u59DC\u9EC4", hex: "#D9A441" },
+      { name: "\u91D1\u9EA6\u9EC4", hex: "#D9B24A" },
+      { name: "\u7425\u73C0\u9EC4", hex: "#D99400" },
+      { name: "\u91D1\u68D5\u6988\u8272", hex: "#C9A227" },
+      { name: "\u91D1\u5408\u6B22", hex: "#C77F2F" },
+      { name: "\u9999\u69DF\u91D1", hex: "#D4C5A0" },
+      // 棕/赭
+      { name: "\u8D64\u8910\u8D6D", hex: "#8C4A2F" },
+      { name: "\u6817\u8D64\u8272", hex: "#7A3B2E" },
+      { name: "\u7EA2\u68D5\u8272", hex: "#8B3A2A" },
+      { name: "\u62FF\u94C1\u68D5", hex: "#9C7A5B" },
+      { name: "\u8DEF\u6613\u5A01\u767B\u68D5", hex: "#4E3424" },
+      { name: "\u51E1\u6234\u514B\u68D5", hex: "#3D2B1F" },
+      { name: "\u6DF1\u7119\u68D5", hex: "#4A2E1E" },
+      { name: "\u5DE7\u514B\u529B\u8272", hex: "#5C3A24" },
+      { name: "\u7194\u5CA9\u70DF\u96FE", hex: "#7A6E6A" }
+    ]
+  },
+  {
+    id: "cool",
+    label: "\u51B7\u8272\u7CFB",
+    swatches: [
+      // 绿
+      { name: "\u7FE0\u7389\u7EFF", hex: "#2E8B6E" },
+      { name: "\u58A8\u7EFF", hex: "#1F3D2B" },
+      { name: "\u6DF1\u82D4\u7EFF", hex: "#3B4A2F" },
+      { name: "\u6DF1\u6A44\u6984\u7EFF", hex: "#4A5423" },
+      { name: "\u6A44\u6984\u7EFF", hex: "#6B7C4A" },
+      { name: "\u83B3\u841D\u7EFF", hex: "#6E7F4E" },
+      { name: "\u8C5A\u8349\u7EFF", hex: "#8A9A4B" },
+      { name: "\u8584\u8377\u7EFF", hex: "#98D8C8" },
+      // 蓝
+      { name: "\u8482\u8299\u5C3C\u84DD", hex: "#81D8D0" },
+      { name: "\u6D77\u6EE8\u84DD", hex: "#4FA3C2" },
+      { name: "\u5361\u5E03\u91CC\u84DD", hex: "#3579A8" },
+      { name: "\u8FDC\u5C71\u84DD", hex: "#7B9BB8" },
+      { name: "\u96FE\u973E\u84DD", hex: "#8FA8BF" },
+      { name: "\u725B\u4ED4\u84DD", hex: "#3B5B7C" },
+      { name: "\u85CF\u9752", hex: "#1B2A4A" },
+      { name: "\u7FA4\u9752", hex: "#4166B0" },
+      { name: "\u514B\u83B1\u56E0\u84DD", hex: "#002FA7" },
+      { name: "\u7075\u6C14\u975B\u84DD", hex: "#3F4E8C" },
+      // 紫
+      { name: "\u82CB\u83DC\u7D2B", hex: "#9B2D5F" },
+      { name: "\u7D2B\u7F57\u5170\u8272", hex: "#7F5AA2" },
+      { name: "\u85B0\u8863\u8349\u7D2B", hex: "#B4A7D6" },
+      { name: "\u9999\u828B\u7D2B", hex: "#B8A9C9" },
+      { name: "\u70DF\u718F\u7D2B", hex: "#6E5A72" },
+      { name: "\u6DF1\u7D2B", hex: "#4A3B5C" },
+      { name: "\u94F6\u7070", hex: "#C0C0C0" }
+    ]
+  }
+];
+var COLOR_PRESETS = COLOR_CATEGORIES.flatMap((c) => c.swatches);
+function nameOfColor(hex) {
+  return COLOR_PRESETS.find((c) => c.hex.toLowerCase() === hex.toLowerCase())?.name ?? hex;
+}
+function buildRecolorPrompt(colors) {
+  const list = colors.map((hex) => `${nameOfColor(hex)}(${hex})`).join("\u3001");
+  return `\u4FDD\u6301\u670D\u88C5\u7684\u7248\u578B\u3001\u6B3E\u5F0F\u7EC6\u8282\u3001\u6784\u56FE\u548C\u5149\u7EBF\u5B8C\u5168\u4E0D\u53D8\uFF0C\u4EC5\u5C06\u9762\u6599\u914D\u8272\u66FF\u6362\u4E3A\uFF1A${list}\u3002\u914D\u8272\u5E94\u7528\u4E8E\u9762\u6599\u4E3B\u4F53\uFF0C\u5448\u73B0\u771F\u5B9E\u9762\u6599\u8D28\u611F\u4E0E\u51C6\u786E\u8272\u5F69\uFF0C\u65E0\u6587\u5B57\u65E0\u6C34\u5370\u3002`;
+}
+
+// server/lib/generationRecords.ts
+import { nanoid as nanoid3 } from "nanoid";
+import path3 from "node:path";
 
 // server/lib/database.ts
 import pg from "pg";
@@ -869,33 +1379,31 @@ async function importTable(source, client, name, columns) {
   const columnSql = columns.map((column) => `"${column}"`).join(", ");
   const placeholders = columns.map((_, index) => `$${index + 1}`).join(", ");
   for (const row of rows) {
+    const valuesSql = name === "project_asset_refs" ? `SELECT ${placeholders}
+         WHERE EXISTS (SELECT 1 FROM projects WHERE id = $1)
+           AND EXISTS (SELECT 1 FROM assets WHERE id = $2)` : `VALUES (${placeholders})`;
     await client.query(
-      `INSERT INTO "${name}" (${columnSql}) VALUES (${placeholders}) ON CONFLICT DO NOTHING`,
+      `INSERT INTO "${name}" (${columnSql}) ${valuesSql} ON CONFLICT DO NOTHING`,
       columns.map((column) => row[column] ?? null)
     );
   }
   return rows.length;
 }
-async function importSqliteIfNeeded() {
-  const target = await queryOne("SELECT COUNT(*)::int AS count FROM users");
-  if ((target?.count ?? 0) > 0) return;
+async function importSqliteIfNeeded(client) {
+  const target = (await client.query("SELECT COUNT(*)::int AS count FROM users")).rows[0];
+  if ((target?.count ?? 0) > 0) return void 0;
   const sourcePath = config.sqliteImportPath();
-  if (!fs3.existsSync(sourcePath) || fs3.statSync(sourcePath).size === 0) return;
+  if (!fs3.existsSync(sourcePath) || fs3.statSync(sourcePath).size === 0) return void 0;
   const source = new Database(sourcePath, { readonly: true, fileMustExist: true });
-  const client = await db().connect();
   try {
-    if (!sqliteTableExists(source, "users")) return;
-    await client.query("BEGIN");
+    if (!sqliteTableExists(source, "users")) return void 0;
     let imported = 0;
     for (const table of TABLES) imported += await importTable(source, client, table.name, table.columns);
-    await client.query("COMMIT");
-    console.log(`[garment-canvas] imported ${imported} rows from SQLite into PostgreSQL`);
+    return imported;
   } catch (error) {
-    await client.query("ROLLBACK");
     throw new Error(`SQLite \u6570\u636E\u8FC1\u79FB\u5230 PostgreSQL \u5931\u8D25\uFF1A${error instanceof Error ? error.message : String(error)}`);
   } finally {
     source.close();
-    client.release();
   }
 }
 
@@ -904,6 +1412,7 @@ var { Pool, types } = pg;
 types.setTypeParser(20, Number);
 var pool;
 var initialization;
+var REQUIRED_POSTGRES_MAJOR = 18;
 function db() {
   if (!pool) {
     const connectionString = config.databaseUrl();
@@ -945,14 +1454,41 @@ async function transaction(fn) {
 }
 async function initializeDatabase() {
   initialization ??= (async () => {
+    await assertDatabaseVersion();
     await migrate();
-    await importSqliteIfNeeded();
     await bootstrapInitialAdmin();
   })();
   return initialization;
 }
+async function assertDatabaseVersion() {
+  const row = await queryOne(
+    "SELECT current_setting('server_version_num')::int AS version_num"
+  );
+  const major = Math.floor((row?.version_num ?? 0) / 1e4);
+  if (major !== REQUIRED_POSTGRES_MAJOR) {
+    throw new Error(
+      `PostgreSQL ${REQUIRED_POSTGRES_MAJOR} is required; connected server is major version ${major || "unknown"}`
+    );
+  }
+}
 async function migrate() {
-  await db().query(`
+  const importedRows = await transaction(async (client) => {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      )
+    `);
+    await client.query("LOCK TABLE schema_migrations IN EXCLUSIVE MODE");
+    const appliedRows = await query(
+      "SELECT version FROM schema_migrations",
+      [],
+      client
+    );
+    const applied = new Set(appliedRows.map((row) => row.version));
+    if (!applied.has(1)) {
+      await client.query(`
     CREATE TABLE IF NOT EXISTS users (
       id TEXT PRIMARY KEY,
       account_id TEXT NOT NULL UNIQUE,
@@ -1063,7 +1599,76 @@ async function migrate() {
       created_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS usage_owner_idx ON usage_events(owner_id, created_at DESC);
-  `);
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, $1, $2)",
+        ["initial_schema", (/* @__PURE__ */ new Date()).toISOString()]
+      );
+    }
+    const imported = await importSqliteIfNeeded(client);
+    if (!applied.has(2)) {
+      await client.query(`
+        DELETE FROM project_asset_refs refs
+        WHERE NOT EXISTS (SELECT 1 FROM projects WHERE projects.id = refs.project_id)
+           OR NOT EXISTS (SELECT 1 FROM assets WHERE assets.id = refs.asset_id)
+      `);
+      await client.query(`
+        DO $$
+        DECLARE
+          existing_constraint RECORD;
+        BEGIN
+          FOR existing_constraint IN
+            SELECT constraint_row.conname
+            FROM pg_constraint constraint_row
+            JOIN pg_attribute column_row
+              ON column_row.attrelid = constraint_row.conrelid
+             AND column_row.attnum = ANY(constraint_row.conkey)
+            WHERE constraint_row.contype = 'f'
+              AND constraint_row.conrelid = 'project_asset_refs'::regclass
+              AND constraint_row.confrelid = 'projects'::regclass
+              AND column_row.attname = 'project_id'
+          LOOP
+            EXECUTE format(
+              'ALTER TABLE project_asset_refs DROP CONSTRAINT %I',
+              existing_constraint.conname
+            );
+          END LOOP;
+          ALTER TABLE project_asset_refs
+            ADD CONSTRAINT project_asset_refs_project_id_fkey
+            FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE;
+        END
+        $$
+      `);
+      await client.query(
+        "CREATE INDEX IF NOT EXISTS project_asset_refs_asset_idx ON project_asset_refs(asset_id)"
+      );
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (2, $1, $2)",
+        ["project_asset_refs_project_foreign_key", (/* @__PURE__ */ new Date()).toISOString()]
+      );
+    }
+    if (!applied.has(3)) {
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS revoked_sessions (
+          token_hash TEXT PRIMARY KEY,
+          reason TEXT NOT NULL CHECK (reason IN ('replaced')),
+          revoked_at TEXT NOT NULL,
+          expires_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS revoked_sessions_expiry_idx ON revoked_sessions(expires_at);
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (3, $1, $2)",
+        ["revoked_session_reasons", (/* @__PURE__ */ new Date()).toISOString()]
+      );
+    }
+    return imported;
+  });
+  if (importedRows !== void 0) {
+    console.log(
+      `[garment-canvas] imported ${importedRows} rows from SQLite into PostgreSQL`
+    );
+  }
 }
 async function bootstrapInitialAdmin() {
   const row = await queryOne("SELECT COUNT(*)::int AS count FROM users");
@@ -1086,116 +1691,14 @@ async function hasUsers() {
 }
 async function databaseReady() {
   try {
-    await db().query("SELECT 1");
+    await assertDatabaseVersion();
     return true;
   } catch {
     return false;
   }
 }
 
-// server/lib/auth.ts
-var SESSION_COOKIE = "gc_session";
-var SESSION_DAYS = 30;
-function sessionHash(token) {
-  return createHash("sha256").update(token).digest("hex");
-}
-function cookieValue(req, name) {
-  const raw = req.headers.cookie;
-  if (!raw) return void 0;
-  for (const part of raw.split(";")) {
-    const [key, ...rest] = part.trim().split("=");
-    if (key === name) return decodeURIComponent(rest.join("="));
-  }
-  return void 0;
-}
-async function createSession(userId) {
-  const token = randomBytes2(32).toString("base64url");
-  const now = /* @__PURE__ */ new Date();
-  const expiresAt = new Date(now.getTime() + SESSION_DAYS * 24 * 60 * 60 * 1e3).toISOString();
-  await transaction(async (client) => {
-    await client.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
-    await client.query(
-      "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
-      [sessionHash(token), userId, now.toISOString(), expiresAt]
-    );
-  });
-  return { token, expiresAt };
-}
-function setSessionCookie(res, token) {
-  const secure = process.env.COOKIE_SECURE === "true";
-  res.cookie(SESSION_COOKIE, token, {
-    httpOnly: true,
-    sameSite: "strict",
-    secure,
-    path: "/",
-    maxAge: SESSION_DAYS * 24 * 60 * 60 * 1e3
-  });
-}
-function clearSessionCookie(res) {
-  res.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: "strict", path: "/" });
-}
-async function revokeRequestSession(req) {
-  const token = cookieValue(req, SESSION_COOKIE);
-  if (token) await query("DELETE FROM sessions WHERE token_hash = $1", [sessionHash(token)]);
-}
-async function revokeUserSessions(userId) {
-  await query("DELETE FROM sessions WHERE user_id = $1", [userId]);
-}
-async function authenticatedUser(req) {
-  const token = cookieValue(req, SESSION_COOKIE);
-  if (!token) return void 0;
-  const now = (/* @__PURE__ */ new Date()).toISOString();
-  const row = await queryOne(`
-    SELECT u.id, u.account_id, u.display_name, u.role, u.must_change_password
-    FROM sessions s JOIN users u ON u.id = s.user_id
-    WHERE s.token_hash = $1 AND s.expires_at > $2 AND u.active = 1 AND u.deleted_at IS NULL
-  `, [sessionHash(token), now]);
-  if (!row) return void 0;
-  return {
-    id: row.id,
-    accountId: row.account_id,
-    displayName: row.display_name,
-    role: row.role,
-    mustChangePassword: row.must_change_password === 1
-  };
-}
-function requireAuth(req, res, next) {
-  void authenticatedUser(req).then((user) => {
-    if (!user) {
-      clearSessionCookie(res);
-      res.status(401).json({ error: "\u8BF7\u5148\u767B\u5F55", code: "UNAUTHENTICATED" });
-      return;
-    }
-    req.authUser = user;
-    next();
-  }).catch(next);
-}
-function requirePasswordChanged(req, res, next) {
-  const user = req.authUser;
-  if (user.mustChangePassword) {
-    res.status(403).json({ error: "\u9996\u6B21\u767B\u5F55\u5FC5\u987B\u4FEE\u6539\u5BC6\u7801", code: "PASSWORD_CHANGE_REQUIRED" });
-    return;
-  }
-  next();
-}
-function requireAdmin(req, res, next) {
-  const user = req.authUser;
-  if (user.role !== "admin") {
-    res.status(403).json({ error: "\u9700\u8981\u7BA1\u7406\u5458\u6743\u9650", code: "FORBIDDEN" });
-    return;
-  }
-  next();
-}
-function requestUser(req) {
-  return req.authUser;
-}
-async function pruneExpiredSessions() {
-  await query("DELETE FROM sessions WHERE expires_at <= $1", [(/* @__PURE__ */ new Date()).toISOString()]);
-}
-
 // server/lib/generationRecords.ts
-import { nanoid as nanoid3 } from "nanoid";
-import path3 from "node:path";
 async function createGenerationRecord(runId, context, startedAt) {
   await query(`
     INSERT INTO generation_runs (
@@ -1308,8 +1811,429 @@ async function failGenerationRecord(runId, error, finishedAt) {
   });
 }
 
+// server/engine/runner.ts
+var DEFAULT_PROMPTS = {
+  "sketch-to-render": "\u5C06\u7EBF\u7A3F\u6E32\u67D3\u4E3A\u5199\u5B9E\u670D\u88C5\u6548\u679C\u56FE\uFF0C\u4FDD\u6301\u7ED3\u6784\u4E0E\u8F6E\u5ED3\uFF0C\u9AD8\u7AEF\u65F6\u88C5\u6444\u5F71\u8D28\u611F",
+  "ai-modify": "\u5728\u4FDD\u6301\u6574\u4F53\u7248\u578B\u4E0D\u53D8\u7684\u524D\u63D0\u4E0B\uFF0C\u4F18\u5316\u670D\u88C5\u7EC6\u8282\u8BBE\u8BA1",
+  "fabric-recolor": "\u4FDD\u6301\u670D\u88C5\u6B3E\u5F0F\u3001\u7EC6\u8282\u3001\u5149\u5F71\u4E0E\u80CC\u666F\u4E0D\u53D8\uFF0C\u4EC5\u66FF\u6362\u9762\u6599\u8D28\u611F"
+};
+var runs = /* @__PURE__ */ new Map();
+var MAX_FINISHED_RUNS = 50;
+var FINISHED_RUN_TTL_MS = 30 * 60 * 1e3;
+function pruneRuns() {
+  const now = Date.now();
+  const finished = [];
+  for (const run of runs.values()) {
+    if (!run.finished) continue;
+    if (run.emitter.listenerCount("event") > 0) continue;
+    if (now - run.createdAt > FINISHED_RUN_TTL_MS) {
+      runs.delete(run.id);
+    } else {
+      finished.push(run);
+    }
+  }
+  if (finished.length > MAX_FINISHED_RUNS) {
+    finished.sort((a, b) => a.createdAt - b.createdAt);
+    for (const run of finished.slice(0, finished.length - MAX_FINISHED_RUNS)) {
+      runs.delete(run.id);
+    }
+  }
+}
+function getRunForUser(id, ownerId) {
+  const run = runs.get(id);
+  return run?.ownerId === ownerId ? run : void 0;
+}
+async function createRun(plan, ownerId, recordContext) {
+  if (!ownerId.trim()) throw new Error("run ownerId is required");
+  if (recordContext && recordContext.userId !== ownerId) {
+    throw new Error("run ownerId must match recordContext.userId");
+  }
+  pruneRuns();
+  const run = {
+    id: nanoid4(10),
+    ownerId,
+    plan,
+    emitter: new EventEmitter(),
+    events: [],
+    finished: false,
+    createdAt: Date.now(),
+    recordContext
+  };
+  run.emitter.setMaxListeners(50);
+  runs.set(run.id, run);
+  if (recordContext) await createGenerationRecord(run.id, recordContext, run.createdAt);
+  setImmediate(() => {
+    executeRun(run).catch(async (err) => {
+      const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
+      if (run.recordContext) await failGenerationRecord(run.id, message, Date.now());
+      emit(run, { type: "run-error", error: message });
+    });
+  });
+  return run;
+}
+function emit(run, event) {
+  const sequenced = { ...event, seq: run.events.length + 1 };
+  run.events.push(sequenced);
+  run.emitter.emit("event", sequenced);
+  if (sequenced.type === "done" || sequenced.type === "run-error") {
+    run.finished = true;
+    run.emitter.emit("finish");
+  }
+}
+async function executeRun(run) {
+  const outputs = /* @__PURE__ */ new Map();
+  for (const step of run.plan.steps) {
+    const inputImages = (step.upstream ?? []).flatMap(
+      (u) => outputs.get(u.nodeId) ?? u.images
+    );
+    if (NODE_SPECS[step.kind].providerId && inputImages.length > MAX_REFERENCE_IMAGES) {
+      const message = `Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`;
+      const finishedAt = Date.now();
+      emit(run, { type: "node-status", nodeId: step.nodeId, status: "error", error: message, finishedAt });
+      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      return;
+    }
+    if (NODE_SPECS[step.kind].providerId && step.kind !== "sketch-to-render" && inputImages.length === 0) {
+      const message = `Node ${step.nodeId} requires an upstream image`;
+      const finishedAt = Date.now();
+      emit(run, {
+        type: "node-status",
+        nodeId: step.nodeId,
+        status: "error",
+        error: message,
+        finishedAt
+      });
+      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      return;
+    }
+    const startedAt = Date.now();
+    if (run.recordContext?.nodeId === step.nodeId) await markGenerationRunning(run.id, startedAt);
+    emit(run, { type: "node-status", nodeId: step.nodeId, status: "running", startedAt });
+    try {
+      const result = await executeStep(step, inputImages);
+      const persisted = await persistOutputImages(result.images);
+      if (run.recordContext) {
+        await registerGeneratedFiles(run.recordContext, run.id, step.nodeId, persisted, Date.now());
+      }
+      outputs.set(step.nodeId, persisted);
+      const finishedAt = Date.now();
+      if (run.recordContext?.nodeId === step.nodeId) {
+        await completeGenerationRecord({
+          runId: run.id,
+          images: persisted,
+          prompts: result.prompts,
+          failures: result.failures,
+          model: result.model,
+          providerRequests: result.providerRequests,
+          startedAt,
+          finishedAt
+        });
+      }
+      const partialWarning = result.failures?.length ? `${result.failures.length} \u4E2A\u751F\u6210\u4EFB\u52A1\u5931\u8D25` : void 0;
+      emit(run, {
+        type: "node-status",
+        nodeId: step.nodeId,
+        status: "success",
+        images: persisted,
+        error: partialWarning,
+        model: result.model,
+        prompts: result.prompts,
+        failures: result.failures,
+        startedAt,
+        finishedAt
+      });
+    } catch (err) {
+      const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
+      const finishedAt = Date.now();
+      if (run.recordContext?.nodeId === step.nodeId) await failGenerationRecord(run.id, message, finishedAt);
+      emit(run, {
+        type: "node-status",
+        nodeId: step.nodeId,
+        status: "error",
+        error: message,
+        startedAt,
+        finishedAt
+      });
+      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      return;
+    }
+  }
+  emit(run, { type: "done" });
+}
+async function persistOutputImages(images) {
+  return Promise.all(images.map((img) => persistImageRef(img)));
+}
+async function postProcessGeneratedOutputImages(kind, params, images) {
+  if (kind !== "sketch-to-render" && kind !== "ai-modify" && kind !== "upscale") return images;
+  const aspectRatio = normalizeExactAspectRatio(params.aspectRatio);
+  const imageSize = normalizeUpscaleSize(params.imageSize);
+  const processed = [];
+  for (const image of images) {
+    processed.push(
+      kind === "upscale" ? await upscaleImageToLongEdge(image, imageSize) : await fitGeneratedImageToAspect(image, aspectRatio)
+    );
+  }
+  return processed;
+}
+async function executeStep(step, inputImages, resolveProvider = getProvider) {
+  switch (step.kind) {
+    case "image-input": {
+      const imageUrl = step.params.imageUrl;
+      return { images: imageUrl ? [imageUrl] : [], providerRequests: 0 };
+    }
+    case "result": {
+      return { images: inputImages, providerRequests: 0 };
+    }
+    case "sketch-to-render":
+    case "ai-modify":
+    case "fabric-recolor":
+    case "upscale":
+    case "print-extract":
+    case "print-mutate": {
+      const spec = NODE_SPECS[step.kind];
+      const provider = resolveProvider(spec.providerId);
+      const referenceImages = await resolveImageRefs(inputImages);
+      const fabricImageUrl = step.params.fabricImageUrl;
+      if (step.kind === "fabric-recolor" && fabricImageUrl) {
+        referenceImages.push(...await resolveImageRefs([fabricImageUrl]));
+      }
+      if (referenceImages.length > MAX_REFERENCE_IMAGES) {
+        throw new Error(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
+      }
+      const extra = (step.params.prompt ?? "").trim();
+      if (step.kind === "fabric-recolor") {
+        const colors = Array.isArray(step.params.colors) ? step.params.colors.filter((value) => typeof value === "string") : [];
+        if (colors.length > 0) {
+          const images2 = [];
+          const prompts = [];
+          const failures = [];
+          let model;
+          let providerRequests = 0;
+          for (const color of colors) {
+            const prompt2 = buildRecolorPrompt([color]);
+            try {
+              const result2 = await generateExactImages(provider, { prompt: prompt2, referenceImages }, 1);
+              providerRequests += result2.providerRequests;
+              model = result2.model;
+              for (const image of result2.images) {
+                images2.push(image);
+                prompts.push(prompt2);
+              }
+            } catch (err) {
+              failures.push({
+                prompt: prompt2,
+                error: err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err)
+              });
+            }
+          }
+          if (images2.length === 0) {
+            throw new Error(failures[0]?.error ?? "\u5168\u90E8\u914D\u8272\u751F\u6210\u5931\u8D25");
+          }
+          return { images: images2, prompts, model, providerRequests, failures: failures.length ? failures : void 0 };
+        }
+      }
+      if (step.kind === "print-mutate") {
+        const count = Math.max(1, Math.min(8, Number(step.params.count) || 4));
+        const prompt2 = "\u57FA\u4E8E\u8FD9\u5F20\u5370\u82B1\u56FE\u6848\u751F\u6210\u98CE\u683C\u4E00\u81F4\u7684\u65B0\u53D8\u4F53\uFF1A\u4FDD\u6301\u539F\u6709\u914D\u8272\u4F53\u7CFB\u3001\u827A\u672F\u98CE\u683C\u4E0E\u7B14\u89E6\u8D28\u611F\uFF0C\u91CD\u65B0\u7F16\u6392\u5143\u7D20\u7684\u6784\u56FE\u4E0E\u7EC4\u5408\u65B9\u5F0F\uFF0C\u7EAF\u767D\u80CC\u666F\uFF0C\u9002\u5408\u4F5C\u4E3A\u5370\u82B1\u7D20\u6750\u590D\u7528" + (extra ? `\u3002\u8865\u5145\u8981\u6C42\uFF1A${extra}` : "");
+        const result2 = await generateExactImages(provider, { prompt: prompt2, referenceImages }, count);
+        const failures = result2.failures.map((error) => ({ prompt: prompt2, error }));
+        return {
+          images: result2.images,
+          prompts: result2.images.map(() => prompt2),
+          model: result2.model,
+          providerRequests: result2.providerRequests,
+          failures: failures.length ? failures : void 0
+        };
+      }
+      const prompt = step.kind === "upscale" ? "\u5C06\u8FD9\u5F20\u670D\u88C5\u6548\u679C\u56FE\u653E\u5927\u4E3A\u8D85\u9AD8\u6E05\u7248\u672C\uFF0C\u589E\u5F3A\u9762\u6599\u7EB9\u7406\u3001\u8D70\u7EBF\u4E0E\u8FB9\u7F18\u7EC6\u8282\uFF0C\u4FDD\u6301\u539F\u6709\u6784\u56FE\u3001\u8272\u5F69\u548C\u5149\u5F71\u5B8C\u5168\u4E0D\u53D8" : step.kind === "print-extract" ? "\u63D0\u53D6\u8FD9\u4EF6\u8863\u670D\u4E0A\u7684\u5370\u82B1\u56FE\u6848\uFF1A\u5C06\u5370\u82B1\u5B8C\u6574\u62A0\u51FA\u5E76\u5E73\u94FA\u5C55\u5F00\u4E3A\u89C4\u6574\u7684\u77E9\u5F62\u56FE\u6848\uFF0C\u7EAF\u767D\u80CC\u666F\uFF0C\u53BB\u9664\u8863\u8EAB\u3001\u8936\u76B1\u3001\u9634\u5F71\u548C\u7A7F\u7740\u6548\u679C\uFF0C\u5370\u82B1\u7684\u6BD4\u4F8B\u3001\u7EC6\u8282\u548C\u8272\u5F69\u4E0E\u539F\u56FE\u4FDD\u6301\u4E00\u81F4\uFF0C\u9002\u5408\u4F5C\u4E3A\u5370\u82B1\u7D20\u6750\u590D\u7528" + (extra ? `\u3002\u8865\u5145\u8981\u6C42\uFF1A${extra}` : "") : extra || DEFAULT_PROMPTS[step.kind] || NODE_SPECS[step.kind].description;
+      const request = {
+        prompt,
+        referenceImages: referenceImages.length ? referenceImages : void 0,
+        aspectRatio: step.kind === "sketch-to-render" || step.kind === "ai-modify" ? normalizeExactAspectRatio(step.params.aspectRatio) : step.params.aspectRatio,
+        batchSize: step.params.batchSize,
+        imageSize: step.kind === "upscale" ? normalizeUpscaleSize(step.params.imageSize) : void 0
+      };
+      const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify" ? Math.max(1, Math.min(4, Number(step.params.batchSize) || 1)) : 1;
+      const result = await generateExactImages(provider, request, requestedCount);
+      const images = await postProcessGeneratedOutputImages(step.kind, step.params, result.images);
+      return {
+        images,
+        model: result.model,
+        prompts: images.map(() => prompt),
+        providerRequests: result.providerRequests,
+        failures: result.failures.length ? result.failures.map((error) => ({ prompt, error })) : void 0
+      };
+    }
+  }
+}
+async function resolveImageRefs(refs) {
+  return Promise.all(refs.map(normalizeImageRef));
+}
+
+// server/routes/generate.ts
+import { nanoid as nanoid5 } from "nanoid";
+
+// server/lib/auth.ts
+import { createHash, randomBytes as randomBytes2 } from "node:crypto";
+var SESSION_COOKIE = "gc_session";
+var SESSION_DAYS = 30;
+function sessionHash(token) {
+  return createHash("sha256").update(token).digest("hex");
+}
+function cookieValue(req, name) {
+  const raw = req.headers.cookie;
+  if (!raw) return void 0;
+  for (const part of raw.split(";")) {
+    const [key, ...rest] = part.trim().split("=");
+    if (key === name) return decodeURIComponent(rest.join("="));
+  }
+  return void 0;
+}
+async function createSession(userId) {
+  const token = randomBytes2(32).toString("base64url");
+  const now = /* @__PURE__ */ new Date();
+  const expiresAt = new Date(now.getTime() + SESSION_DAYS * 24 * 60 * 60 * 1e3).toISOString();
+  await transaction(async (client) => {
+    const lockedUser = await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [userId]);
+    if (lockedUser.rowCount !== 1) throw new Error("\u7528\u6237\u4E0D\u5B58\u5728");
+    await client.query(`
+      INSERT INTO revoked_sessions (token_hash, reason, revoked_at, expires_at)
+      SELECT token_hash, 'replaced', $2, expires_at FROM sessions WHERE user_id = $1
+      ON CONFLICT (token_hash) DO UPDATE
+        SET reason = excluded.reason, revoked_at = excluded.revoked_at, expires_at = excluded.expires_at
+    `, [userId, now.toISOString()]);
+    await client.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
+    await client.query(
+      "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
+      [sessionHash(token), userId, now.toISOString(), expiresAt]
+    );
+  });
+  return { token, expiresAt };
+}
+function setSessionCookie(res, token) {
+  const secure = process.env.COOKIE_SECURE === "true";
+  res.cookie(SESSION_COOKIE, token, {
+    httpOnly: true,
+    sameSite: "strict",
+    secure,
+    path: "/",
+    maxAge: SESSION_DAYS * 24 * 60 * 60 * 1e3
+  });
+}
+function clearSessionCookie(res) {
+  res.clearCookie(SESSION_COOKIE, { httpOnly: true, sameSite: "strict", path: "/" });
+}
+async function revokeRequestSession(req) {
+  const token = cookieValue(req, SESSION_COOKIE);
+  if (token) await query("DELETE FROM sessions WHERE token_hash = $1", [sessionHash(token)]);
+}
+async function revokeUserSessions(userId) {
+  await query("DELETE FROM sessions WHERE user_id = $1", [userId]);
+}
+async function authenticateRequest(req) {
+  const token = cookieValue(req, SESSION_COOKIE);
+  if (!token) return { status: "unauthenticated" };
+  const tokenHash = sessionHash(token);
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  const row = await queryOne(`
+    SELECT u.id, u.account_id, u.display_name, u.role, u.must_change_password
+    FROM sessions s JOIN users u ON u.id = s.user_id
+    WHERE s.token_hash = $1 AND s.expires_at > $2 AND u.active = 1 AND u.deleted_at IS NULL
+  `, [tokenHash, now]);
+  if (row) {
+    return {
+      status: "authenticated",
+      user: {
+        id: row.id,
+        accountId: row.account_id,
+        displayName: row.display_name,
+        role: row.role,
+        mustChangePassword: row.must_change_password === 1
+      }
+    };
+  }
+  const revoked = await queryOne(`
+    SELECT reason FROM revoked_sessions WHERE token_hash = $1 AND expires_at > $2
+  `, [tokenHash, now]);
+  return revoked?.reason === "replaced" ? { status: "replaced" } : { status: "unauthenticated" };
+}
+function authenticateMiddleware() {
+  return (req, res, next) => {
+    void authenticateRequest(req).then((result) => {
+      if (result.status !== "authenticated") {
+        const replaced = result.status === "replaced";
+        res.status(401).json({
+          error: replaced ? "\u8D26\u53F7\u5DF2\u5728\u5176\u4ED6\u8BBE\u5907\u767B\u5F55" : "\u8BF7\u5148\u767B\u5F55",
+          code: replaced ? "SESSION_REPLACED" : "UNAUTHENTICATED"
+        });
+        return;
+      }
+      req.authUser = result.user;
+      next();
+    }).catch(next);
+  };
+}
+var requireAuth = authenticateMiddleware();
+var requireAuthForSessionCheck = authenticateMiddleware();
+function requirePasswordChanged(req, res, next) {
+  const user = req.authUser;
+  if (user.mustChangePassword) {
+    res.status(403).json({ error: "\u9996\u6B21\u767B\u5F55\u5FC5\u987B\u4FEE\u6539\u5BC6\u7801", code: "PASSWORD_CHANGE_REQUIRED" });
+    return;
+  }
+  next();
+}
+function requireAdmin(req, res, next) {
+  const user = req.authUser;
+  if (user.role !== "admin") {
+    res.status(403).json({ error: "\u9700\u8981\u7BA1\u7406\u5458\u6743\u9650", code: "FORBIDDEN" });
+    return;
+  }
+  next();
+}
+function requestUser(req) {
+  return req.authUser;
+}
+async function pruneExpiredSessions() {
+  const now = (/* @__PURE__ */ new Date()).toISOString();
+  await transaction(async (client) => {
+    await client.query("DELETE FROM sessions WHERE expires_at <= $1", [now]);
+    await client.query("DELETE FROM revoked_sessions WHERE expires_at <= $1", [now]);
+  });
+}
+
 // server/routes/generate.ts
 var generateRouter = Router();
+function isDirectGenerateKind(value) {
+  if (typeof value !== "string" || !Object.prototype.hasOwnProperty.call(NODE_SPECS, value)) return false;
+  return Boolean(NODE_SPECS[value].providerId);
+}
+function validateDirectGenerateRequest(kind, request) {
+  if (kind === void 0) return { ok: true };
+  if (!isDirectGenerateKind(kind)) {
+    return { ok: false, error: "kind must identify a supported AI node" };
+  }
+  if (kind === "sketch-to-render" || kind === "ai-modify") {
+    if (typeof request.aspectRatio !== "string" || !Object.prototype.hasOwnProperty.call(EXACT_ASPECT_DIMENSIONS, request.aspectRatio)) {
+      return {
+        ok: false,
+        error: `request.aspectRatio must be one of ${Object.keys(EXACT_ASPECT_DIMENSIONS).join(", ")}`
+      };
+    }
+  }
+  if (kind === "upscale" && request.imageSize !== "2K" && request.imageSize !== "4K") {
+    return { ok: false, error: "request.imageSize must be 2K or 4K" };
+  }
+  return { ok: true, kind };
+}
+function postProcessDirectGenerateImages(kind, request, images) {
+  if (!kind) return Promise.resolve(images);
+  return postProcessGeneratedOutputImages(
+    kind,
+    request,
+    images
+  );
+}
 generateRouter.post("/", async (req, res) => {
   const { providerId, request, projectId, projectName, nodeId, nodeLabel, kind } = req.body;
   if (!providerId || !request?.prompt) {
@@ -1320,7 +2244,12 @@ generateRouter.post("/", async (req, res) => {
     res.status(400).json({ error: `referenceImages must contain at most ${MAX_REFERENCE_IMAGES} images` });
     return;
   }
-  const runId = nanoid4(10);
+  const validation = validateDirectGenerateRequest(kind, request);
+  if (!validation.ok) {
+    res.status(400).json({ error: validation.error });
+    return;
+  }
+  const runId = nanoid5(10);
   const startedAt = Date.now();
   const requestedCount = Math.max(1, Math.min(8, Number(request.batchSize) || 1));
   await createGenerationRecord(runId, {
@@ -1329,7 +2258,7 @@ generateRouter.post("/", async (req, res) => {
     projectName,
     nodeId: nodeId ?? "direct-generate",
     nodeLabel: nodeLabel ?? "\u76F4\u63A5\u751F\u6210",
-    kind: kind ?? "sketch-to-render",
+    kind: validation.kind ?? "sketch-to-render",
     prompt: request.prompt,
     parameters: request,
     referenceImages: request.referenceImages,
@@ -1344,7 +2273,8 @@ generateRouter.post("/", async (req, res) => {
       mask: request.mask ? await normalizeImageRef(request.mask) : void 0
     };
     const raw = await generateExactImages(provider, resolved, requestedCount);
-    const images = await Promise.all(raw.images.map(persistImageRef));
+    const processedImages = await postProcessDirectGenerateImages(validation.kind, resolved, raw.images);
+    const images = await Promise.all(processedImages.map(persistImageRef));
     const finishedAt = Date.now();
     const failures = raw.failures.map((error) => ({ prompt: request.prompt, error }));
     await completeGenerationRecord({
@@ -1359,14 +2289,16 @@ generateRouter.post("/", async (req, res) => {
     });
     res.json({ ...raw, images, runId });
   } catch (err) {
-    await failGenerationRecord(runId, err instanceof Error ? err.message : String(err), Date.now());
+    const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
+    await failGenerationRecord(runId, message, Date.now());
     if (err instanceof ProviderError) {
       res.status(err.status && err.status >= 400 && err.status < 600 ? err.status : 502).json({
-        error: err.message,
-        providerId: err.providerId ?? providerId
+        error: message,
+        providerId: err.providerId ?? providerId,
+        category: err.category
       });
     } else {
-      res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
+      res.status(500).json({ error: message });
     }
   }
 });
@@ -1521,375 +2453,6 @@ function extractParams(data) {
   }
 }
 
-// server/engine/runner.ts
-import { EventEmitter } from "node:events";
-import { nanoid as nanoid5 } from "nanoid";
-
-// src/lib/colors.ts
-var COLOR_CATEGORIES = [
-  {
-    id: "neutral",
-    label: "\u4E2D\u6027\u57FA\u7840\u8272",
-    swatches: [
-      { name: "\u78B3\u7D20\u9ED1", hex: "#161616" },
-      { name: "\u68D5\u9ED1", hex: "#2B1D16" },
-      { name: "\u70AD\u9ED1", hex: "#1A1A1A" },
-      { name: "\u66AE\u8272\u7070", hex: "#6B6B70" },
-      { name: "\u70DF\u7070", hex: "#6E6E6E" },
-      { name: "\u6DF1\u6D77\u9E25\u7070", hex: "#8B9296" },
-      { name: "\u6C34\u6CE5\u7070", hex: "#9A9A98" },
-      { name: "\u5927\u8C61\u7070", hex: "#8A8378" },
-      { name: "\u66AE\u6C99\u7070", hex: "#A39B8B" },
-      { name: "\u4E91\u70DF\u7070", hex: "#B9B7B2" },
-      { name: "\u6D45\u7070", hex: "#C8C8C8" },
-      { name: "\u73CD\u73E0\u767D", hex: "#F2EFE9" },
-      { name: "\u71D5\u9EA6\u767D", hex: "#EDE6D6" },
-      { name: "\u739B\u7459\u767D", hex: "#E9E4DA" },
-      { name: "\u7C73\u767D", hex: "#F5F0E6" },
-      { name: "\u67D4\u548C\u7C73", hex: "#E5DCC8" },
-      { name: "\u5976\u674F\u7C73", hex: "#F0E4CE" },
-      { name: "\u7EAF\u767D", hex: "#FFFFFF" },
-      { name: "\u9999\u69DF\u8272", hex: "#F0DCB8" },
-      { name: "\u9A7C\u8272", hex: "#C19A6B" },
-      { name: "\u5361\u5176", hex: "#B8A47E" },
-      { name: "\u5496\u5561", hex: "#6F4E37" },
-      { name: "\u6989\u6728\u8272", hex: "#A67B4F" },
-      { name: "\u7126\u7CD6", hex: "#A0522D" }
-    ]
-  },
-  {
-    id: "warm",
-    label: "\u6696\u8272\u7CFB",
-    swatches: [
-      // 红
-      { name: "\u7194\u5CA9\u7EA2", hex: "#B03A2E" },
-      { name: "\u4E2D\u56FD\u7EA2", hex: "#DE2910" },
-      { name: "\u6B63\u7EA2", hex: "#C8102E" },
-      { name: "\u6A31\u6843\u7EA2", hex: "#C2183C" },
-      { name: "\u6CE2\u826E\u7B2C\u7EA2", hex: "#5C1A24" },
-      { name: "\u9152\u7EA2", hex: "#722F37" },
-      { name: "\u6885\u6D1B\u8461\u8404\u9152\u7EA2", hex: "#6E2438" },
-      { name: "\u7816\u7EA2", hex: "#B5493A" },
-      // 粉
-      { name: "\u8393\u679C\u7C89", hex: "#D98CA6" },
-      { name: "\u82AD\u6BD4\u7C89", hex: "#E0219C" },
-      { name: "\u73CA\u745A\u7C89", hex: "#F88379" },
-      { name: "\u85D5\u7C89", hex: "#E8C4C4" },
-      { name: "\u73AB\u7470\u8336", hex: "#C08585" },
-      { name: "\u96FE\u73AB\u7470\u8272", hex: "#B48A8C" },
-      { name: "\u7070\u7C89\u73AB", hex: "#C4A4A8" },
-      { name: "\u73AB\u7470\u91D1", hex: "#B76E79" },
-      // 橙
-      { name: "\u7231\u9A6C\u4ED5\u6A59", hex: "#F37021" },
-      { name: "\u6A58\u6A59", hex: "#E8752A" },
-      { name: "\u67F3\u6A59\u6C41\u6A58", hex: "#F28C28" },
-      { name: "\u9999\u74DC\u6A59", hex: "#F2A65A" },
-      { name: "\u67D4\u548C\u6843", hex: "#F5CBA7" },
-      // 黄/金
-      { name: "\u82A6\u82C7\u9EC4", hex: "#D9C97A" },
-      { name: "\u900F\u660E\u9EC4", hex: "#F5E663" },
-      { name: "\u9E45\u9EC4", hex: "#F2D16B" },
-      { name: "\u59DC\u9EC4", hex: "#D9A441" },
-      { name: "\u91D1\u9EA6\u9EC4", hex: "#D9B24A" },
-      { name: "\u7425\u73C0\u9EC4", hex: "#D99400" },
-      { name: "\u91D1\u68D5\u6988\u8272", hex: "#C9A227" },
-      { name: "\u91D1\u5408\u6B22", hex: "#C77F2F" },
-      { name: "\u9999\u69DF\u91D1", hex: "#D4C5A0" },
-      // 棕/赭
-      { name: "\u8D64\u8910\u8D6D", hex: "#8C4A2F" },
-      { name: "\u6817\u8D64\u8272", hex: "#7A3B2E" },
-      { name: "\u7EA2\u68D5\u8272", hex: "#8B3A2A" },
-      { name: "\u62FF\u94C1\u68D5", hex: "#9C7A5B" },
-      { name: "\u8DEF\u6613\u5A01\u767B\u68D5", hex: "#4E3424" },
-      { name: "\u51E1\u6234\u514B\u68D5", hex: "#3D2B1F" },
-      { name: "\u6DF1\u7119\u68D5", hex: "#4A2E1E" },
-      { name: "\u5DE7\u514B\u529B\u8272", hex: "#5C3A24" },
-      { name: "\u7194\u5CA9\u70DF\u96FE", hex: "#7A6E6A" }
-    ]
-  },
-  {
-    id: "cool",
-    label: "\u51B7\u8272\u7CFB",
-    swatches: [
-      // 绿
-      { name: "\u7FE0\u7389\u7EFF", hex: "#2E8B6E" },
-      { name: "\u58A8\u7EFF", hex: "#1F3D2B" },
-      { name: "\u6DF1\u82D4\u7EFF", hex: "#3B4A2F" },
-      { name: "\u6DF1\u6A44\u6984\u7EFF", hex: "#4A5423" },
-      { name: "\u6A44\u6984\u7EFF", hex: "#6B7C4A" },
-      { name: "\u83B3\u841D\u7EFF", hex: "#6E7F4E" },
-      { name: "\u8C5A\u8349\u7EFF", hex: "#8A9A4B" },
-      { name: "\u8584\u8377\u7EFF", hex: "#98D8C8" },
-      // 蓝
-      { name: "\u8482\u8299\u5C3C\u84DD", hex: "#81D8D0" },
-      { name: "\u6D77\u6EE8\u84DD", hex: "#4FA3C2" },
-      { name: "\u5361\u5E03\u91CC\u84DD", hex: "#3579A8" },
-      { name: "\u8FDC\u5C71\u84DD", hex: "#7B9BB8" },
-      { name: "\u96FE\u973E\u84DD", hex: "#8FA8BF" },
-      { name: "\u725B\u4ED4\u84DD", hex: "#3B5B7C" },
-      { name: "\u85CF\u9752", hex: "#1B2A4A" },
-      { name: "\u7FA4\u9752", hex: "#4166B0" },
-      { name: "\u514B\u83B1\u56E0\u84DD", hex: "#002FA7" },
-      { name: "\u7075\u6C14\u975B\u84DD", hex: "#3F4E8C" },
-      // 紫
-      { name: "\u82CB\u83DC\u7D2B", hex: "#9B2D5F" },
-      { name: "\u7D2B\u7F57\u5170\u8272", hex: "#7F5AA2" },
-      { name: "\u85B0\u8863\u8349\u7D2B", hex: "#B4A7D6" },
-      { name: "\u9999\u828B\u7D2B", hex: "#B8A9C9" },
-      { name: "\u70DF\u718F\u7D2B", hex: "#6E5A72" },
-      { name: "\u6DF1\u7D2B", hex: "#4A3B5C" },
-      { name: "\u94F6\u7070", hex: "#C0C0C0" }
-    ]
-  }
-];
-var COLOR_PRESETS = COLOR_CATEGORIES.flatMap((c) => c.swatches);
-function nameOfColor(hex) {
-  return COLOR_PRESETS.find((c) => c.hex.toLowerCase() === hex.toLowerCase())?.name ?? hex;
-}
-function buildRecolorPrompt(colors) {
-  const list = colors.map((hex) => `${nameOfColor(hex)}(${hex})`).join("\u3001");
-  return `\u4FDD\u6301\u670D\u88C5\u7684\u7248\u578B\u3001\u6B3E\u5F0F\u7EC6\u8282\u3001\u6784\u56FE\u548C\u5149\u7EBF\u5B8C\u5168\u4E0D\u53D8\uFF0C\u4EC5\u5C06\u9762\u6599\u914D\u8272\u66FF\u6362\u4E3A\uFF1A${list}\u3002\u914D\u8272\u5E94\u7528\u4E8E\u9762\u6599\u4E3B\u4F53\uFF0C\u5448\u73B0\u771F\u5B9E\u9762\u6599\u8D28\u611F\u4E0E\u51C6\u786E\u8272\u5F69\uFF0C\u65E0\u6587\u5B57\u65E0\u6C34\u5370\u3002`;
-}
-
-// server/engine/runner.ts
-var DEFAULT_PROMPTS = {
-  "sketch-to-render": "\u5C06\u7EBF\u7A3F\u6E32\u67D3\u4E3A\u5199\u5B9E\u670D\u88C5\u6548\u679C\u56FE\uFF0C\u4FDD\u6301\u7ED3\u6784\u4E0E\u8F6E\u5ED3\uFF0C\u9AD8\u7AEF\u65F6\u88C5\u6444\u5F71\u8D28\u611F",
-  "ai-modify": "\u5728\u4FDD\u6301\u6574\u4F53\u7248\u578B\u4E0D\u53D8\u7684\u524D\u63D0\u4E0B\uFF0C\u4F18\u5316\u670D\u88C5\u7EC6\u8282\u8BBE\u8BA1",
-  "fabric-recolor": "\u4FDD\u6301\u670D\u88C5\u6B3E\u5F0F\u3001\u7EC6\u8282\u3001\u5149\u5F71\u4E0E\u80CC\u666F\u4E0D\u53D8\uFF0C\u4EC5\u66FF\u6362\u9762\u6599\u8D28\u611F"
-};
-var runs = /* @__PURE__ */ new Map();
-var MAX_FINISHED_RUNS = 50;
-var FINISHED_RUN_TTL_MS = 30 * 60 * 1e3;
-function pruneRuns() {
-  const now = Date.now();
-  const finished = [];
-  for (const run of runs.values()) {
-    if (!run.finished) continue;
-    if (run.emitter.listenerCount("event") > 0) continue;
-    if (now - run.createdAt > FINISHED_RUN_TTL_MS) {
-      runs.delete(run.id);
-    } else {
-      finished.push(run);
-    }
-  }
-  if (finished.length > MAX_FINISHED_RUNS) {
-    finished.sort((a, b) => a.createdAt - b.createdAt);
-    for (const run of finished.slice(0, finished.length - MAX_FINISHED_RUNS)) {
-      runs.delete(run.id);
-    }
-  }
-}
-function getRun(id) {
-  return runs.get(id);
-}
-async function createRun(plan, recordContext) {
-  pruneRuns();
-  const run = {
-    id: nanoid5(10),
-    plan,
-    emitter: new EventEmitter(),
-    events: [],
-    finished: false,
-    createdAt: Date.now(),
-    recordContext
-  };
-  run.emitter.setMaxListeners(50);
-  runs.set(run.id, run);
-  if (recordContext) await createGenerationRecord(run.id, recordContext, run.createdAt);
-  setImmediate(() => {
-    executeRun(run).catch(async (err) => {
-      if (run.recordContext) await failGenerationRecord(run.id, err instanceof Error ? err.message : String(err), Date.now());
-      emit(run, { type: "run-error", error: err instanceof Error ? err.message : String(err) });
-    });
-  });
-  return run;
-}
-function emit(run, event) {
-  const sequenced = { ...event, seq: run.events.length + 1 };
-  run.events.push(sequenced);
-  run.emitter.emit("event", sequenced);
-  if (sequenced.type === "done" || sequenced.type === "run-error") {
-    run.finished = true;
-    run.emitter.emit("finish");
-  }
-}
-async function executeRun(run) {
-  const outputs = /* @__PURE__ */ new Map();
-  for (const step of run.plan.steps) {
-    const inputImages = (step.upstream ?? []).flatMap(
-      (u) => outputs.get(u.nodeId) ?? u.images
-    );
-    if (NODE_SPECS[step.kind].providerId && inputImages.length > MAX_REFERENCE_IMAGES) {
-      const message = `Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`;
-      const finishedAt = Date.now();
-      emit(run, { type: "node-status", nodeId: step.nodeId, status: "error", error: message, finishedAt });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
-      return;
-    }
-    if (NODE_SPECS[step.kind].providerId && step.kind !== "sketch-to-render" && inputImages.length === 0) {
-      const message = `Node ${step.nodeId} requires an upstream image`;
-      const finishedAt = Date.now();
-      emit(run, {
-        type: "node-status",
-        nodeId: step.nodeId,
-        status: "error",
-        error: message,
-        finishedAt
-      });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
-      return;
-    }
-    const startedAt = Date.now();
-    if (run.recordContext?.nodeId === step.nodeId) await markGenerationRunning(run.id, startedAt);
-    emit(run, { type: "node-status", nodeId: step.nodeId, status: "running", startedAt });
-    try {
-      const result = await executeStep(step, inputImages);
-      const persisted = await persistOutputImages(result.images);
-      if (run.recordContext) {
-        await registerGeneratedFiles(run.recordContext, run.id, step.nodeId, persisted, Date.now());
-      }
-      outputs.set(step.nodeId, persisted);
-      const finishedAt = Date.now();
-      if (run.recordContext?.nodeId === step.nodeId) {
-        await completeGenerationRecord({
-          runId: run.id,
-          images: persisted,
-          prompts: result.prompts,
-          failures: result.failures,
-          model: result.model,
-          providerRequests: result.providerRequests,
-          startedAt,
-          finishedAt
-        });
-      }
-      const partialWarning = result.failures?.length ? `${result.failures.length} \u4E2A\u751F\u6210\u4EFB\u52A1\u5931\u8D25` : void 0;
-      emit(run, {
-        type: "node-status",
-        nodeId: step.nodeId,
-        status: "success",
-        images: persisted,
-        error: partialWarning,
-        model: result.model,
-        prompts: result.prompts,
-        failures: result.failures,
-        startedAt,
-        finishedAt
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      const finishedAt = Date.now();
-      if (run.recordContext?.nodeId === step.nodeId) await failGenerationRecord(run.id, message, finishedAt);
-      emit(run, {
-        type: "node-status",
-        nodeId: step.nodeId,
-        status: "error",
-        error: message,
-        startedAt,
-        finishedAt
-      });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
-      return;
-    }
-  }
-  emit(run, { type: "done" });
-}
-async function persistOutputImages(images) {
-  return Promise.all(images.map((img) => persistImageRef(img)));
-}
-async function executeStep(step, inputImages) {
-  switch (step.kind) {
-    case "image-input": {
-      const imageUrl = step.params.imageUrl;
-      return { images: imageUrl ? [imageUrl] : [], providerRequests: 0 };
-    }
-    case "result": {
-      return { images: inputImages, providerRequests: 0 };
-    }
-    case "sketch-to-render":
-    case "ai-modify":
-    case "fabric-recolor":
-    case "upscale":
-    case "print-extract":
-    case "print-mutate": {
-      const spec = NODE_SPECS[step.kind];
-      const provider = getProvider(spec.providerId);
-      const referenceImages = await resolveImageRefs(inputImages);
-      const fabricImageUrl = step.params.fabricImageUrl;
-      if (step.kind === "fabric-recolor" && fabricImageUrl) {
-        referenceImages.push(...await resolveImageRefs([fabricImageUrl]));
-      }
-      if (referenceImages.length > MAX_REFERENCE_IMAGES) {
-        throw new Error(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
-      }
-      const extra = (step.params.prompt ?? "").trim();
-      if (step.kind === "fabric-recolor") {
-        const colors = Array.isArray(step.params.colors) ? step.params.colors.filter((value) => typeof value === "string") : [];
-        if (colors.length > 0) {
-          const images = [];
-          const prompts = [];
-          const failures = [];
-          let model;
-          let providerRequests = 0;
-          for (const color of colors) {
-            const prompt2 = buildRecolorPrompt([color]);
-            try {
-              const result2 = await generateExactImages(provider, { prompt: prompt2, referenceImages }, 1);
-              providerRequests += result2.providerRequests;
-              model = result2.model;
-              for (const image of result2.images) {
-                images.push(image);
-                prompts.push(prompt2);
-              }
-            } catch (err) {
-              failures.push({
-                prompt: prompt2,
-                error: err instanceof Error ? err.message : String(err)
-              });
-            }
-          }
-          if (images.length === 0) {
-            throw new Error(failures[0]?.error ?? "\u5168\u90E8\u914D\u8272\u751F\u6210\u5931\u8D25");
-          }
-          return { images, prompts, model, providerRequests, failures: failures.length ? failures : void 0 };
-        }
-      }
-      if (step.kind === "print-mutate") {
-        const count = Math.max(1, Math.min(8, Number(step.params.count) || 4));
-        const prompt2 = "\u57FA\u4E8E\u8FD9\u5F20\u5370\u82B1\u56FE\u6848\u751F\u6210\u98CE\u683C\u4E00\u81F4\u7684\u65B0\u53D8\u4F53\uFF1A\u4FDD\u6301\u539F\u6709\u914D\u8272\u4F53\u7CFB\u3001\u827A\u672F\u98CE\u683C\u4E0E\u7B14\u89E6\u8D28\u611F\uFF0C\u91CD\u65B0\u7F16\u6392\u5143\u7D20\u7684\u6784\u56FE\u4E0E\u7EC4\u5408\u65B9\u5F0F\uFF0C\u7EAF\u767D\u80CC\u666F\uFF0C\u9002\u5408\u4F5C\u4E3A\u5370\u82B1\u7D20\u6750\u590D\u7528" + (extra ? `\u3002\u8865\u5145\u8981\u6C42\uFF1A${extra}` : "");
-        const result2 = await generateExactImages(provider, { prompt: prompt2, referenceImages }, count);
-        const failures = result2.failures.map((error) => ({ prompt: prompt2, error }));
-        return {
-          images: result2.images,
-          prompts: result2.images.map(() => prompt2),
-          model: result2.model,
-          providerRequests: result2.providerRequests,
-          failures: failures.length ? failures : void 0
-        };
-      }
-      const prompt = step.kind === "upscale" ? "\u5C06\u8FD9\u5F20\u670D\u88C5\u6548\u679C\u56FE\u653E\u5927\u4E3A\u8D85\u9AD8\u6E05\u7248\u672C\uFF0C\u589E\u5F3A\u9762\u6599\u7EB9\u7406\u3001\u8D70\u7EBF\u4E0E\u8FB9\u7F18\u7EC6\u8282\uFF0C\u4FDD\u6301\u539F\u6709\u6784\u56FE\u3001\u8272\u5F69\u548C\u5149\u5F71\u5B8C\u5168\u4E0D\u53D8" : step.kind === "print-extract" ? "\u63D0\u53D6\u8FD9\u4EF6\u8863\u670D\u4E0A\u7684\u5370\u82B1\u56FE\u6848\uFF1A\u5C06\u5370\u82B1\u5B8C\u6574\u62A0\u51FA\u5E76\u5E73\u94FA\u5C55\u5F00\u4E3A\u89C4\u6574\u7684\u77E9\u5F62\u56FE\u6848\uFF0C\u7EAF\u767D\u80CC\u666F\uFF0C\u53BB\u9664\u8863\u8EAB\u3001\u8936\u76B1\u3001\u9634\u5F71\u548C\u7A7F\u7740\u6548\u679C\uFF0C\u5370\u82B1\u7684\u6BD4\u4F8B\u3001\u7EC6\u8282\u548C\u8272\u5F69\u4E0E\u539F\u56FE\u4FDD\u6301\u4E00\u81F4\uFF0C\u9002\u5408\u4F5C\u4E3A\u5370\u82B1\u7D20\u6750\u590D\u7528" + (extra ? `\u3002\u8865\u5145\u8981\u6C42\uFF1A${extra}` : "") : extra || DEFAULT_PROMPTS[step.kind] || NODE_SPECS[step.kind].description;
-      const request = {
-        prompt,
-        referenceImages: referenceImages.length ? referenceImages : void 0,
-        aspectRatio: step.params.aspectRatio,
-        batchSize: step.params.batchSize,
-        imageSize: step.kind === "upscale" ? step.params.imageSize : void 0
-      };
-      const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify" ? Math.max(1, Math.min(4, Number(step.params.batchSize) || 1)) : 1;
-      const result = await generateExactImages(provider, request, requestedCount);
-      return {
-        images: result.images,
-        model: result.model,
-        prompts: result.images.map(() => prompt),
-        providerRequests: result.providerRequests,
-        failures: result.failures.length ? result.failures.map((error) => ({ prompt, error })) : void 0
-      };
-    }
-  }
-}
-async function resolveImageRefs(refs) {
-  return Promise.all(refs.map(normalizeImageRef));
-}
-
 // server/lib/workflowSchema.ts
 var NODE_KINDS = [
   "image-input",
@@ -1917,60 +2480,60 @@ var WorkflowValidationError = class extends Error {
     this.name = "WorkflowValidationError";
   }
 };
-function fail(path9, message) {
-  throw new WorkflowValidationError(`${path9}: ${message}`);
+function fail(path10, message) {
+  throw new WorkflowValidationError(`${path10}: ${message}`);
 }
-function record(value, path9) {
+function record(value, path10) {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    fail(path9, "must be an object");
+    fail(path10, "must be an object");
   }
   return value;
 }
-function stringValue(value, path9, opts) {
-  if (typeof value !== "string") fail(path9, "must be a string");
-  if (opts?.nonEmpty && value.trim().length === 0) fail(path9, "must not be empty");
-  if (value.length > MAX_TEXT_LENGTH) fail(path9, `must be at most ${MAX_TEXT_LENGTH} characters`);
+function stringValue(value, path10, opts) {
+  if (typeof value !== "string") fail(path10, "must be a string");
+  if (opts?.nonEmpty && value.trim().length === 0) fail(path10, "must not be empty");
+  if (value.length > MAX_TEXT_LENGTH) fail(path10, `must be at most ${MAX_TEXT_LENGTH} characters`);
   return value;
 }
-function optionalString(value, path9) {
-  return value === void 0 ? void 0 : stringValue(value, path9);
+function optionalString(value, path10) {
+  return value === void 0 ? void 0 : stringValue(value, path10);
 }
-function imageReference(value, path9) {
-  const ref = stringValue(value, path9, { nonEmpty: true });
+function imageReference(value, path10) {
+  const ref = stringValue(value, path10, { nonEmpty: true });
   if (ref.startsWith("data:")) {
     try {
       validateImageDataUrl(ref);
     } catch (error) {
-      fail(path9, error instanceof Error ? error.message : "invalid image dataURL");
+      fail(path10, error instanceof Error ? error.message : "invalid image dataURL");
     }
     return ref;
   }
   const isRemote = /^https?:\/\//i.test(ref);
   if (!isLocalImageReference(ref) && !isRemote) {
-    fail(path9, "must be an image dataURL, local /api/files reference, or http(s) URL");
+    fail(path10, "must be an image dataURL, local /api/files reference, or http(s) URL");
   }
   return ref;
 }
-function optionalImageReference(value, path9) {
-  return value === void 0 ? void 0 : imageReference(value, path9);
+function optionalImageReference(value, path10) {
+  return value === void 0 ? void 0 : imageReference(value, path10);
 }
-function finiteNumber(value, path9) {
-  if (typeof value !== "number" || !Number.isFinite(value)) fail(path9, "must be a finite number");
+function finiteNumber(value, path10) {
+  if (typeof value !== "number" || !Number.isFinite(value)) fail(path10, "must be a finite number");
   return value;
 }
-function oneOf(value, allowed, path9) {
-  if (!allowed.includes(value)) fail(path9, `must be one of: ${allowed.join(", ")}`);
+function oneOf(value, allowed, path10) {
+  if (!allowed.includes(value)) fail(path10, `must be one of: ${allowed.join(", ")}`);
   return value;
 }
-function stringArray(value, path9, max = MAX_IMAGE_REFS) {
-  if (!Array.isArray(value)) fail(path9, "must be an array");
-  if (value.length > max) fail(path9, `must contain at most ${max} items`);
-  return value.map((item, index) => stringValue(item, `${path9}[${index}]`, { nonEmpty: true }));
+function stringArray(value, path10, max = MAX_IMAGE_REFS) {
+  if (!Array.isArray(value)) fail(path10, "must be an array");
+  if (value.length > max) fail(path10, `must contain at most ${max} items`);
+  return value.map((item, index) => stringValue(item, `${path10}[${index}]`, { nonEmpty: true }));
 }
-function imageReferenceArray(value, path9, max = MAX_IMAGE_REFS) {
-  if (!Array.isArray(value)) fail(path9, "must be an array");
-  if (value.length > max) fail(path9, `must contain at most ${max} items`);
-  return value.map((item, index) => imageReference(item, `${path9}[${index}]`));
+function imageReferenceArray(value, path10, max = MAX_IMAGE_REFS) {
+  if (!Array.isArray(value)) fail(path10, "must be an array");
+  if (value.length > max) fail(path10, `must contain at most ${max} items`);
+  return value.map((item, index) => imageReference(item, `${path10}[${index}]`));
 }
 function migrateNodeData(kind, raw) {
   switch (kind) {
@@ -1992,87 +2555,87 @@ function migrateNodeData(kind, raw) {
       return { images: [], ...raw };
   }
 }
-function validateData(kind, rawValue, path9) {
-  const input = record(rawValue, path9);
+function validateData(kind, rawValue, path10) {
+  const input = record(rawValue, path10);
   const runtimeStatus = input.status;
   const raw = runtimeStatus === "queued" || runtimeStatus === "running" || runtimeStatus === "error" ? { ...input, status: "idle", error: void 0 } : input;
-  if (raw.kind !== kind) fail(`${path9}.kind`, `must equal node type ${kind}`);
-  stringValue(raw.label, `${path9}.label`, { nonEmpty: true });
-  oneOf(raw.status, STATUSES, `${path9}.status`);
-  optionalString(raw.error, `${path9}.error`);
+  if (raw.kind !== kind) fail(`${path10}.kind`, `must equal node type ${kind}`);
+  stringValue(raw.label, `${path10}.label`, { nonEmpty: true });
+  oneOf(raw.status, STATUSES, `${path10}.status`);
+  optionalString(raw.error, `${path10}.error`);
   switch (kind) {
     case "image-input":
-      oneOf(raw.imageRole, IMAGE_ROLES, `${path9}.imageRole`);
-      optionalImageReference(raw.imageUrl, `${path9}.imageUrl`);
+      oneOf(raw.imageRole, IMAGE_ROLES, `${path10}.imageRole`);
+      optionalImageReference(raw.imageUrl, `${path10}.imageUrl`);
       break;
     case "sketch-to-render":
     case "ai-modify":
-      stringValue(raw.prompt, `${path9}.prompt`);
-      oneOf(raw.aspectRatio, ASPECT_RATIOS, `${path9}.aspectRatio`);
-      oneOf(raw.batchSize, BATCH_SIZES, `${path9}.batchSize`);
-      imageReferenceArray(raw.outputImages, `${path9}.outputImages`);
+      stringValue(raw.prompt, `${path10}.prompt`);
+      oneOf(raw.aspectRatio, ASPECT_RATIOS, `${path10}.aspectRatio`);
+      oneOf(raw.batchSize, BATCH_SIZES, `${path10}.batchSize`);
+      imageReferenceArray(raw.outputImages, `${path10}.outputImages`);
       break;
     case "fabric-recolor": {
-      const colors = stringArray(raw.colors, `${path9}.colors`, 8);
+      const colors = stringArray(raw.colors, `${path10}.colors`, 8);
       for (let i = 0; i < colors.length; i++) {
-        if (!/^#[0-9a-fA-F]{6}$/.test(colors[i])) fail(`${path9}.colors[${i}]`, "must be #RRGGBB");
+        if (!/^#[0-9a-fA-F]{6}$/.test(colors[i])) fail(`${path10}.colors[${i}]`, "must be #RRGGBB");
       }
-      stringValue(raw.prompt, `${path9}.prompt`);
-      optionalImageReference(raw.fabricImageUrl, `${path9}.fabricImageUrl`);
-      imageReferenceArray(raw.outputImages, `${path9}.outputImages`);
+      stringValue(raw.prompt, `${path10}.prompt`);
+      optionalImageReference(raw.fabricImageUrl, `${path10}.fabricImageUrl`);
+      imageReferenceArray(raw.outputImages, `${path10}.outputImages`);
       break;
     }
     case "upscale":
-      oneOf(raw.imageSize, IMAGE_SIZES, `${path9}.imageSize`);
-      imageReferenceArray(raw.outputImages, `${path9}.outputImages`);
+      oneOf(raw.imageSize, IMAGE_SIZES, `${path10}.imageSize`);
+      imageReferenceArray(raw.outputImages, `${path10}.outputImages`);
       break;
     case "print-extract":
-      stringValue(raw.prompt, `${path9}.prompt`);
-      imageReferenceArray(raw.outputImages, `${path9}.outputImages`);
-      imageReferenceArray(raw.savedAsAssets, `${path9}.savedAsAssets`);
+      stringValue(raw.prompt, `${path10}.prompt`);
+      imageReferenceArray(raw.outputImages, `${path10}.outputImages`);
+      imageReferenceArray(raw.savedAsAssets, `${path10}.savedAsAssets`);
       break;
     case "print-mutate":
-      stringValue(raw.prompt, `${path9}.prompt`);
+      stringValue(raw.prompt, `${path10}.prompt`);
       if (!Number.isInteger(raw.count) || raw.count < 1 || raw.count > 8) {
-        fail(`${path9}.count`, "must be an integer from 1 to 8");
+        fail(`${path10}.count`, "must be an integer from 1 to 8");
       }
-      imageReferenceArray(raw.outputImages, `${path9}.outputImages`);
+      imageReferenceArray(raw.outputImages, `${path10}.outputImages`);
       break;
     case "result":
-      imageReferenceArray(raw.images, `${path9}.images`);
-      optionalString(raw.note, `${path9}.note`);
+      imageReferenceArray(raw.images, `${path10}.images`);
+      optionalString(raw.note, `${path10}.note`);
       break;
   }
   return raw;
 }
 function validateNode(value, index, migrateLegacy) {
-  const path9 = `flow.nodes[${index}]`;
-  const raw = record(value, path9);
-  const id = stringValue(raw.id, `${path9}.id`, { nonEmpty: true });
-  if (!SAFE_ID.test(id)) fail(`${path9}.id`, "must contain only letters, digits, underscore or hyphen");
-  const type = oneOf(raw.type, NODE_KINDS, `${path9}.type`);
-  const position = record(raw.position, `${path9}.position`);
-  finiteNumber(position.x, `${path9}.position.x`);
-  finiteNumber(position.y, `${path9}.position.y`);
-  const initialData = record(raw.data, `${path9}.data`);
+  const path10 = `flow.nodes[${index}]`;
+  const raw = record(value, path10);
+  const id = stringValue(raw.id, `${path10}.id`, { nonEmpty: true });
+  if (!SAFE_ID.test(id)) fail(`${path10}.id`, "must contain only letters, digits, underscore or hyphen");
+  const type = oneOf(raw.type, NODE_KINDS, `${path10}.type`);
+  const position = record(raw.position, `${path10}.position`);
+  finiteNumber(position.x, `${path10}.position.x`);
+  finiteNumber(position.y, `${path10}.position.y`);
+  const initialData = record(raw.data, `${path10}.data`);
   const data = validateData(
     type,
     migrateLegacy ? migrateNodeData(type, initialData) : initialData,
-    `${path9}.data`
+    `${path10}.data`
   );
   return { ...raw, id, type, position: { ...position, x: position.x, y: position.y }, data };
 }
 function validateEdge(value, index) {
-  const path9 = `flow.edges[${index}]`;
-  const raw = record(value, path9);
-  const id = stringValue(raw.id, `${path9}.id`, { nonEmpty: true });
-  const source = stringValue(raw.source, `${path9}.source`, { nonEmpty: true });
-  const target = stringValue(raw.target, `${path9}.target`, { nonEmpty: true });
-  if (!SAFE_ID.test(id)) fail(`${path9}.id`, "must contain only letters, digits, underscore or hyphen");
-  if (!SAFE_ID.test(source)) fail(`${path9}.source`, "must be a valid node id");
-  if (!SAFE_ID.test(target)) fail(`${path9}.target`, "must be a valid node id");
-  if (raw.sourceHandle !== void 0 && raw.sourceHandle !== null) stringValue(raw.sourceHandle, `${path9}.sourceHandle`);
-  if (raw.targetHandle !== void 0 && raw.targetHandle !== null) stringValue(raw.targetHandle, `${path9}.targetHandle`);
+  const path10 = `flow.edges[${index}]`;
+  const raw = record(value, path10);
+  const id = stringValue(raw.id, `${path10}.id`, { nonEmpty: true });
+  const source = stringValue(raw.source, `${path10}.source`, { nonEmpty: true });
+  const target = stringValue(raw.target, `${path10}.target`, { nonEmpty: true });
+  if (!SAFE_ID.test(id)) fail(`${path10}.id`, "must contain only letters, digits, underscore or hyphen");
+  if (!SAFE_ID.test(source)) fail(`${path10}.source`, "must be a valid node id");
+  if (!SAFE_ID.test(target)) fail(`${path10}.target`, "must be a valid node id");
+  if (raw.sourceHandle !== void 0 && raw.sourceHandle !== null) stringValue(raw.sourceHandle, `${path10}.sourceHandle`);
+  if (raw.targetHandle !== void 0 && raw.targetHandle !== null) stringValue(raw.targetHandle, `${path10}.targetHandle`);
   return { ...raw, id, source, target };
 }
 function validateAndMigrateFlow(value) {
@@ -2169,7 +2732,7 @@ runPlanRouter.post("/", asyncHandler(async (req, res) => {
         return;
       }
     }
-    const run = await createRun(plan, {
+    const run = await createRun(plan, user.id, {
       userId: user.id,
       projectId: typeof projectId === "string" ? projectId : void 0,
       projectName: typeof projectName === "string" ? projectName : void 0,
@@ -2191,7 +2754,7 @@ runPlanRouter.post("/", asyncHandler(async (req, res) => {
   }
 }));
 runPlanRouter.get("/:id/events", (req, res) => {
-  const run = getRun(req.params.id);
+  const run = getRunForUser(req.params.id, requestUser(req).id);
   if (!run) {
     res.status(404).json({ error: "run not found" });
     return;
@@ -2234,7 +2797,7 @@ runPlanRouter.get("/:id/events", (req, res) => {
   });
 });
 runPlanRouter.get("/:id", (req, res) => {
-  const run = getRun(req.params.id);
+  const run = getRunForUser(req.params.id, requestUser(req).id);
   if (!run) {
     res.status(404).json({ error: "run not found" });
     return;
@@ -2247,6 +2810,22 @@ import { Router as Router3 } from "express";
 import fs4 from "node:fs";
 import path4 from "node:path";
 var filesRouter = Router3();
+async function canAccessFile(id, req) {
+  const user = requestUser(req);
+  const access = await queryOne(`
+    SELECT f.owner_id,
+      EXISTS(SELECT 1 FROM assets a WHERE a.image = $1 AND a.deleted_at IS NULL AND a.scope IN ('global','shared')) AS shared
+    FROM files f WHERE f.id = $2
+  `, [`/api/files/${id}`, id]);
+  if (!access) return "private";
+  if (access.owner_id === null || access.shared) return "public";
+  if (access.owner_id === user.id || user.role === "admin") return "private";
+  return "denied";
+}
+function setFileCacheHeaders(res) {
+  res.setHeader("Cache-Control", "private, no-store");
+  res.vary("Cookie");
+}
 filesRouter.post("/", asyncHandler(async (req, res) => {
   const { dataUrl } = req.body;
   if (!dataUrl) {
@@ -2267,6 +2846,26 @@ filesRouter.post("/", asyncHandler(async (req, res) => {
     }
   }
 }));
+filesRouter.get("/:id/thumbnail", asyncHandler(async (req, res) => {
+  const id = path4.basename(req.params.id);
+  if (id !== req.params.id || !isSupportedImageFile(id)) {
+    res.status(400).json({ error: "invalid file id" });
+    return;
+  }
+  const access = await canAccessFile(id, req);
+  if (access === "denied") {
+    res.status(403).json({ error: "\u65E0\u6743\u8BBF\u95EE\u6B64\u6587\u4EF6" });
+    return;
+  }
+  try {
+    const thumbnail = await ensureThumbnail(id);
+    res.setHeader("Content-Type", "image/webp");
+    setFileCacheHeaders(res);
+    fs4.createReadStream(thumbnail).pipe(res);
+  } catch (error) {
+    res.status(error instanceof Error && error.message === "file not found" ? 404 : 422).json({ error: error instanceof Error ? error.message : "thumbnail failed" });
+  }
+}));
 filesRouter.get("/:id", asyncHandler(async (req, res) => {
   const id = path4.basename(req.params.id);
   if (id !== req.params.id || !isSupportedImageFile(id)) {
@@ -2278,18 +2877,13 @@ filesRouter.get("/:id", asyncHandler(async (req, res) => {
     res.status(404).json({ error: "file not found" });
     return;
   }
-  const user = requestUser(req);
-  const access = await queryOne(`
-    SELECT f.owner_id,
-      EXISTS(SELECT 1 FROM assets a WHERE a.image = $1 AND a.deleted_at IS NULL AND a.scope IN ('global','shared')) AS shared
-    FROM files f WHERE f.id = $2
-  `, [`/api/files/${id}`, id]);
-  if (access && access.owner_id !== null && access.owner_id !== user.id && user.role !== "admin" && !access.shared) {
+  const access = await canAccessFile(id, req);
+  if (access === "denied") {
     res.status(403).json({ error: "\u65E0\u6743\u8BBF\u95EE\u6B64\u6587\u4EF6" });
     return;
   }
   res.setHeader("Content-Type", mimeOfFile(id));
-  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  setFileCacheHeaders(res);
   fs4.createReadStream(filePath).pipe(res);
 }));
 
@@ -2303,20 +2897,21 @@ function imageRefs(value, output = /* @__PURE__ */ new Set()) {
   else if (value && typeof value === "object") Object.values(value).forEach((item) => imageRefs(item, output));
   return output;
 }
-async function syncAssetRefs(projectId, flow) {
+async function syncAssetRefs(client, projectId, ownerId, flow) {
   const refs = imageRefs(flow);
-  const assets = await query("SELECT id, image FROM assets WHERE deleted_at IS NULL");
+  const assets = await query(`
+    SELECT id, image FROM assets
+    WHERE deleted_at IS NULL AND (scope IN ('global','shared') OR owner_id = $1)
+  `, [ownerId], client);
   const wanted = assets.filter((asset) => refs.has(asset.image)).map((asset) => asset.id);
   const now = (/* @__PURE__ */ new Date()).toISOString();
-  await transaction(async (client) => {
-    await client.query("DELETE FROM project_asset_refs WHERE project_id = $1", [projectId]);
-    for (const assetId of wanted) {
-      await client.query(
-        "INSERT INTO project_asset_refs (project_id, asset_id, created_at) VALUES ($1, $2, $3)",
-        [projectId, assetId, now]
-      );
-    }
-  });
+  await client.query("DELETE FROM project_asset_refs WHERE project_id = $1", [projectId]);
+  for (const assetId of wanted) {
+    await client.query(
+      "INSERT INTO project_asset_refs (project_id, asset_id, created_at) VALUES ($1, $2, $3)",
+      [projectId, assetId, now]
+    );
+  }
 }
 async function purgeExpiredProjects() {
   const now = (/* @__PURE__ */ new Date()).toISOString();
@@ -2342,21 +2937,30 @@ projectsRouter.post("/", asyncHandler(async (req, res) => {
   try {
     const normalized = validateAndMigrateFlow(flow);
     const projectId = id || nanoid6(10);
-    const existing = await queryOne(
-      "SELECT owner_id FROM projects WHERE id = $1 AND deleted_at IS NULL",
-      [projectId]
-    );
-    if (existing && existing.owner_id !== user.id) {
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const saved = await transaction(async (client) => {
+      const existing = await queryOne(
+        "SELECT owner_id FROM projects WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        [projectId],
+        client
+      );
+      if (existing && existing.owner_id !== user.id) return false;
+      const result = await client.query(`
+        INSERT INTO projects (id, owner_id, name, flow_json, updated_at, created_at)
+        VALUES ($1, $2, $3, $4, $5, $5)
+        ON CONFLICT(id) DO UPDATE
+          SET name = excluded.name, flow_json = excluded.flow_json, updated_at = excluded.updated_at
+          WHERE projects.owner_id = excluded.owner_id
+        RETURNING id
+      `, [projectId, user.id, name.trim(), JSON.stringify(normalized), now]);
+      if (result.rowCount !== 1) return false;
+      await syncAssetRefs(client, projectId, user.id, normalized);
+      return true;
+    });
+    if (!saved) {
       res.status(403).json({ error: "\u7BA1\u7406\u5458\u53EA\u80FD\u67E5\u770B\u5176\u4ED6\u7528\u6237\u9879\u76EE\uFF0C\u4E0D\u80FD\u4FEE\u6539" });
       return;
     }
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    await query(`
-      INSERT INTO projects (id, owner_id, name, flow_json, updated_at, created_at)
-      VALUES ($1, $2, $3, $4, $5, $5)
-      ON CONFLICT(id) DO UPDATE SET name = excluded.name, flow_json = excluded.flow_json, updated_at = excluded.updated_at
-    `, [projectId, user.id, name.trim(), JSON.stringify(normalized), now]);
-    await syncAssetRefs(projectId, normalized);
     res.json({ ok: true, id: projectId });
   } catch (error) {
     res.status(error instanceof WorkflowValidationError ? 400 : 500).json({ error: error instanceof Error ? error.message : String(error) });
@@ -2396,17 +3000,20 @@ projectsRouter.get("/:id", asyncHandler(async (req, res) => {
     return;
   }
   try {
+    const flow = validateAndMigrateFlow(JSON.parse(row.flow_json));
     res.json({
       id: row.id,
       name: row.name,
-      flow: JSON.parse(row.flow_json),
+      flow,
       updatedAt: row.updated_at,
       ownerId: row.owner_id,
       ownerName: row.owner_name,
       readOnly: row.owner_id !== user.id
     });
-  } catch {
-    res.status(422).json({ error: "\u9879\u76EE\u6570\u636E\u635F\u574F" });
+  } catch (error) {
+    res.status(422).json({
+      error: error instanceof WorkflowValidationError ? `\u9879\u76EE\u6570\u636E\u65E0\u6CD5\u8FC1\u79FB\uFF1A${error.message}` : "\u9879\u76EE\u6570\u636E\u635F\u574F"
+    });
   }
 }));
 
@@ -2819,11 +3426,14 @@ function readTemplateFile(filePath) {
   }
   return { ...raw, schemaVersion: WORKFLOW_SCHEMA_VERSION, flow };
 }
+function templateForResponse(template) {
+  return template.thumbnail ? { ...template, thumbnail: thumbnailUrlForImage(template.thumbnail) } : template;
+}
 templatesRouter.get("/", (_req, res) => {
   try {
     const builtin = readTemplates("builtin");
     const user = readTemplates("user").sort((a, b) => b.createdAt.localeCompare(a.createdAt));
-    res.json([...builtin, ...user]);
+    res.json([...builtin, ...user].map(templateForResponse));
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -2836,7 +3446,7 @@ templatesRouter.get("/:id", (req, res) => {
     return;
   }
   try {
-    res.json(readTemplateFile(filePath));
+    res.json(templateForResponse(readTemplateFile(filePath)));
   } catch (err) {
     res.status(err instanceof WorkflowValidationError ? 422 : 500).json({ error: err instanceof Error ? err.message : String(err) });
   }
@@ -2902,6 +3512,7 @@ function mapAsset(row, currentUserId) {
     name: row.name,
     category: row.category,
     image: row.image,
+    thumbnail: thumbnailUrlForImage(row.image),
     ...row.source_note ? { sourceNote: row.source_note } : {},
     createdAt: row.created_at,
     deletedAt: row.deleted_at,
@@ -2924,6 +3535,8 @@ assetsRouter.get("/", asyncHandler(async (req, res) => {
     return;
   }
   const includeDeleted = req.query.deleted === "true";
+  const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 20));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
   const rows = await query(`
     SELECT a.*, u.display_name AS owner_name
     FROM assets a LEFT JOIN users u ON u.id = a.owner_id
@@ -2931,7 +3544,8 @@ assetsRouter.get("/", asyncHandler(async (req, res) => {
       AND (${includeDeleted ? "a.deleted_at IS NOT NULL" : "a.deleted_at IS NULL"})
       AND ($2 = 'admin' OR a.scope IN ('global','shared') OR a.owner_id = $3)
     ORDER BY a.created_at DESC
-  `, [category ?? null, user.role, user.id]);
+    LIMIT $4 OFFSET $5
+  `, [category ?? null, user.role, user.id, limit, offset]);
   res.json(rows.map((row) => ({
     ...mapAsset(row, user.id),
     canManage: row.scope === "global" ? user.role === "admin" : row.owner_id === user.id
@@ -3013,18 +3627,28 @@ assetsRouter.post("/:id/references", asyncHandler(async (req, res) => {
     res.status(400).json({ error: "projectId is required" });
     return;
   }
-  const asset = await queryOne(`
-    SELECT id FROM assets WHERE id = $1 AND deleted_at IS NULL
-      AND (scope IN ('global','shared') OR owner_id = $2 OR $3 = 'admin')
-  `, [req.params.id, user.id, user.role]);
-  if (!asset) {
-    res.status(404).json({ error: "asset not found" });
+  const linked = await transaction(async (client) => {
+    const project = await queryOne(`
+      SELECT id FROM projects
+      WHERE id = $1 AND owner_id = $2 AND deleted_at IS NULL
+      FOR UPDATE
+    `, [projectId, user.id], client);
+    if (!project) return false;
+    const asset = await queryOne(`
+      SELECT id FROM assets WHERE id = $1 AND deleted_at IS NULL
+        AND (scope IN ('global','shared') OR owner_id = $2)
+    `, [req.params.id, user.id], client);
+    if (!asset) return false;
+    await client.query(`
+      INSERT INTO project_asset_refs (project_id, asset_id, created_at) VALUES ($1, $2, $3)
+      ON CONFLICT (project_id, asset_id) DO NOTHING
+    `, [projectId, req.params.id, (/* @__PURE__ */ new Date()).toISOString()]);
+    return true;
+  });
+  if (!linked) {
+    res.status(404).json({ error: "project or asset not found" });
     return;
   }
-  await query(`
-    INSERT INTO project_asset_refs (project_id, asset_id, created_at) VALUES ($1, $2, $3)
-    ON CONFLICT (project_id, asset_id) DO NOTHING
-  `, [projectId, req.params.id, (/* @__PURE__ */ new Date()).toISOString()]);
   res.json({ ok: true });
 }));
 assetsRouter.delete("/:id", asyncHandler(async (req, res) => {
@@ -3137,10 +3761,14 @@ authRouter.post("/login", asyncHandler(async (req, res) => {
   setSessionCookie(res, session.token);
   res.json({ user: publicUser(row), expiresAt: session.expiresAt });
 }));
-authRouter.use(requireAuth);
-authRouter.get("/me", (req, res) => {
+authRouter.get("/me", (req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Pragma", "no-cache");
+  requireAuthForSessionCheck(req, res, next);
+}, (req, res) => {
   res.json({ user: requestUser(req) });
 });
+authRouter.use(requireAuth);
 authRouter.post("/logout", asyncHandler(async (req, res) => {
   await revokeRequestSession(req);
   clearSessionCookie(res);
@@ -3206,8 +3834,8 @@ authRouter.post("/users", requireAdmin, asyncHandler(async (req, res) => {
 }));
 authRouter.patch("/users/:id", requireAdmin, asyncHandler(async (req, res) => {
   const actor = requestUser(req);
-  const { active, displayName } = req.body;
-  if (req.params.id === actor.id && active === false) {
+  const { active: active2, displayName } = req.body;
+  if (req.params.id === actor.id && active2 === false) {
     res.status(400).json({ error: "\u4E0D\u80FD\u505C\u7528\u5F53\u524D\u7BA1\u7406\u5458\u8D26\u53F7" });
     return;
   }
@@ -3220,9 +3848,9 @@ authRouter.patch("/users/:id", requireAdmin, asyncHandler(async (req, res) => {
   if (typeof displayName === "string" && displayName.trim() && displayName.length <= 100) {
     await query("UPDATE users SET display_name = $1, updated_at = $2 WHERE id = $3", [displayName.trim(), now, req.params.id]);
   }
-  if (typeof active === "boolean") {
-    await query("UPDATE users SET active = $1, updated_at = $2 WHERE id = $3", [active ? 1 : 0, now, req.params.id]);
-    if (!active) await revokeUserSessions(req.params.id);
+  if (typeof active2 === "boolean") {
+    await query("UPDATE users SET active = $1, updated_at = $2 WHERE id = $3", [active2 ? 1 : 0, now, req.params.id]);
+    if (!active2) await revokeUserSessions(req.params.id);
   }
   res.json({ ok: true });
 }));
@@ -3331,6 +3959,7 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
     id: row.output_id ?? row.id,
     runId: row.id,
     image: row.image ?? "",
+    thumbnail: row.image ? thumbnailUrlForImage(row.image) : "",
     nodeId: row.node_id,
     nodeLabel: row.node_label,
     kind: row.kind,
@@ -3380,9 +4009,11 @@ async function queryRows(ownerId, from, to) {
 }
 function csvCell(value) {
   const text = value == null ? "" : String(value);
-  return /[",\r\n]/.test(text) ? `"${text.replaceAll('"', '""')}"` : text;
+  const safeText = typeof value === "string" && /^\s*[=+\-@]/u.test(text) ? `'${text}` : text;
+  return /[",\r\n]/.test(safeText) ? `"${safeText.replaceAll('"', '""')}"` : safeText;
 }
 usageRouter.get("/", asyncHandler(async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   const user = requestUser(req);
   const selected = typeof req.query.userId === "string" ? req.query.userId : void 0;
   if (selected && user.role !== "admin" && selected !== user.id) {
@@ -3410,6 +4041,7 @@ usageRouter.get("/", asyncHandler(async (req, res) => {
     ])].map((line) => line.map(csvCell).join(","));
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", `attachment; filename="usage-${(/* @__PURE__ */ new Date()).toISOString().slice(0, 10)}.csv"`);
+    res.setHeader("X-Content-Type-Options", "nosniff");
     res.send(`\uFEFF${lines.join("\r\n")}`);
     return;
   }
@@ -3428,6 +4060,116 @@ usageRouter.get("/", asyncHandler(async (req, res) => {
     createdAt: row.created_at
   })));
 }));
+
+// server/routes/aiDiagnostics.ts
+import { Router as Router10 } from "express";
+function providerSettings(providerId) {
+  const nanobanana = providerId === "nanobanana";
+  return {
+    providerId,
+    model: nanobanana ? config.nanobananaModel() : config.image2Model(),
+    capabilities: nanobanana ? config.nanobananaCapabilities() : config.image2Capabilities(),
+    apiKey: nanobanana ? config.nanobananaApiKey() : config.change2proApiKey()
+  };
+}
+var getDiagnostics = asyncHandler(async (_req, res) => {
+  let gateway = "\u672A\u914D\u7F6E";
+  try {
+    gateway = new URL(config.change2proBaseUrl()).host;
+  } catch {
+  }
+  const providers2 = ["nanobanana", "gpt-image-2"].map((providerId) => {
+    try {
+      const settings = providerSettings(providerId);
+      return {
+        providerId,
+        model: settings.model,
+        capabilities: settings.capabilities,
+        configured: true
+      };
+    } catch (error) {
+      return {
+        providerId,
+        model: "",
+        configured: false,
+        error: error instanceof Error ? error.message : "\u914D\u7F6E\u7F3A\u5931"
+      };
+    }
+  });
+  res.json({ gateway, providers: providers2 });
+});
+var DIAGNOSTIC_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+var probeDiagnostics = asyncHandler(async (req, res) => {
+  const { providerId, mode } = req.body;
+  if (providerId !== "nanobanana" && providerId !== "gpt-image-2" || !["model", "generate", "edit"].includes(String(mode))) {
+    res.status(400).json({ error: "providerId \u6216\u8BCA\u65AD\u65B9\u5F0F\u65E0\u6548" });
+    return;
+  }
+  const settings = providerSettings(providerId);
+  const startedAt = Date.now();
+  try {
+    let imageCount;
+    if (mode === "model") {
+      const requestOptions = { providerId, maxRetries: 0, timeoutMs: Math.min(config.aiTimeoutMs(), 3e4) };
+      const requestInit = () => ({ headers: { Authorization: `Bearer ${settings.apiKey}` } });
+      try {
+        await fetchWithRetry(
+          `${config.change2proBaseUrl()}/models/${encodeURIComponent(settings.model)}`,
+          requestInit,
+          requestOptions
+        );
+      } catch (error) {
+        if (!(error instanceof ProviderError) || error.status !== 404) throw error;
+        const response = await fetchWithRetry(
+          `${config.change2proBaseUrl()}/models`,
+          requestInit,
+          requestOptions
+        );
+        const body = await response.json();
+        const exists = Array.isArray(body.data) && body.data.some((item) => item?.id === settings.model);
+        if (!exists) {
+          throw new ProviderError(
+            "\u5F53\u524D AI \u6A21\u578B\u4E0D\u53EF\u7528\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u68C0\u67E5\u6A21\u578B\u914D\u7F6E",
+            404,
+            providerId,
+            "model_unavailable",
+            `Configured model ${settings.model} was not present in GET /models`
+          );
+        }
+      }
+    } else {
+      const provider = getProvider(providerId);
+      const prompt = "\u670D\u88C5\u8BBE\u8BA1\u7CFB\u7EDF\u8FDE\u901A\u6027\u6D4B\u8BD5\uFF1A\u751F\u6210\u4E00\u5757\u7EAF\u767D\u8272\u65B9\u5F62\u9762\u6599\u8272\u5361\uFF0C\u4E0D\u5305\u542B\u6587\u5B57";
+      const result = mode === "generate" ? await provider.generate({ prompt, batchSize: 1, aspectRatio: "1:1" }) : await provider.edit({
+        prompt: "\u4FDD\u6301\u753B\u9762\u4E3A\u7EAF\u767D\u8272\u65B9\u5F62\u8272\u5361\uFF0C\u4E0D\u6DFB\u52A0\u6587\u5B57",
+        referenceImages: [DIAGNOSTIC_IMAGE],
+        batchSize: 1,
+        aspectRatio: "1:1"
+      });
+      imageCount = result.images.length;
+    }
+    res.json({ ok: true, providerId, mode, model: settings.model, imageCount, durationMs: Date.now() - startedAt });
+  } catch (error) {
+    if (error instanceof ProviderError && error.diagnostic) {
+      console.error(`[ai-diagnostic:${providerId}:${String(mode)}] ${error.diagnostic}`);
+    }
+    res.status(error instanceof ProviderError && error.status === 429 ? 429 : 502).json({
+      ok: false,
+      providerId,
+      mode,
+      error: publicProviderErrorMessage(error),
+      category: error instanceof ProviderError ? error.category : "unknown",
+      durationMs: Date.now() - startedAt
+    });
+  }
+});
+function createAiDiagnosticsRouter(probeRateLimit) {
+  const router = Router10();
+  router.use(requireAdmin);
+  router.get("/", getDiagnostics);
+  router.post("/probe", probeRateLimit, probeDiagnostics);
+  return router;
+}
 
 // server/lib/legacyMigration.ts
 import fs7 from "node:fs";
@@ -3506,19 +4248,58 @@ async function migrateLegacyData() {
   }
 }
 
+// server/lib/staticFrontend.ts
+import express from "express";
+import path8 from "node:path";
+var HASHED_ASSET = /-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$/;
+function explicitlyAcceptsHtml(req) {
+  const accept = req.get("Accept") ?? "";
+  return /\btext\/html\b/i.test(accept) && req.accepts("html") === "html";
+}
+function mountProductionFrontend(app2, distDir2) {
+  const distIndex2 = path8.join(distDir2, "index.html");
+  const assetsDir = path8.join(distDir2, "assets") + path8.sep;
+  app2.use(express.static(distDir2, {
+    index: false,
+    fallthrough: true,
+    setHeaders: (res, filePath) => {
+      if (path8.resolve(filePath) === path8.resolve(distIndex2)) {
+        res.setHeader("Cache-Control", "no-store");
+      } else if (filePath.startsWith(assetsDir) && HASHED_ASSET.test(path8.basename(filePath))) {
+        res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+      } else {
+        res.setHeader("Cache-Control", "no-cache");
+      }
+    }
+  }));
+  app2.use("/assets", (_req, res) => {
+    res.status(404).type("text/plain").send("Asset not found");
+  });
+  app2.get("*", (req, res) => {
+    const isResourcePath = path8.extname(req.path) !== "";
+    if (isResourcePath || !explicitlyAcceptsHtml(req)) {
+      res.status(404).type("text/plain").send("Not found");
+      return;
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.sendFile(distIndex2);
+  });
+}
+
 // server/index.ts
-var app = express();
-app.use(express.json({ limit: "50mb" }));
+var app = express2();
+app.use(express2.json({ limit: "50mb" }));
 var aiRateLimit = createRateLimitMiddleware();
 var loginRateLimit = createRateLimitMiddleware({ windowMs: 6e4, maxRequests: 10 });
+var aiDiagnosticsRouter = createAiDiagnosticsRouter(aiRateLimit);
 app.get("/api/health", (_req, res) => res.json({ ok: true, status: "alive" }));
 var isProduction = process.env.NODE_ENV === "production";
 var apiOnly = config.apiOnly();
-var distDir = path8.join(ROOT_DIR, "dist");
-var distIndex = path8.join(distDir, "index.html");
+var distDir = path9.join(ROOT_DIR, "dist");
+var distIndex = path9.join(distDir, "index.html");
 function dataDirWritable() {
   const dataDir = config.dataDir();
-  const probePath = path8.join(dataDir, `.readiness-${process.pid}-${Date.now()}`);
+  const probePath = path9.join(dataDir, `.readiness-${process.pid}-${Date.now()}`);
   let fd;
   let writable = false;
   try {
@@ -3568,20 +4349,21 @@ app.use("/api/templates", templatesRouter);
 app.use("/api/assets", assetsRouter);
 app.use("/api/history", historyRouter);
 app.use("/api/usage", usageRouter);
-var apiErrorHandler = (error, _req, res, _next) => {
-  console.error("[garment-canvas] request failed", error);
-  if (!res.headersSent) res.status(500).json({ error: "\u670D\u52A1\u5668\u6682\u65F6\u65E0\u6CD5\u5904\u7406\u8BF7\u6C42" });
-};
-app.use(apiErrorHandler);
+app.use("/api/ai-diagnostics", aiDiagnosticsRouter);
+app.use("/api", (_req, res) => res.status(404).json({ error: "API not found" }));
 if (isProduction && !apiOnly) {
   if (!fs8.existsSync(distIndex)) {
     throw new Error(
       `Production frontend is missing: ${distIndex}. Run npm run build, or set API_ONLY=true for an API-only deployment.`
     );
   }
-  app.use(express.static(distDir));
-  app.get("*", (_req, res) => res.sendFile(distIndex));
+  mountProductionFrontend(app, distDir);
 }
+var apiErrorHandler = (error, _req, res, _next) => {
+  console.error("[garment-canvas] request failed", error);
+  if (!res.headersSent) res.status(500).json({ error: "\u670D\u52A1\u5668\u6682\u65F6\u65E0\u6CD5\u5904\u7406\u8BF7\u6C42" });
+};
+app.use(apiErrorHandler);
 var port = config.port();
 async function start() {
   await initializeDatabase();

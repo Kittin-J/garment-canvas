@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
-import { useAuth } from "./AuthContext";
+import { useAuth, type CurrentUser } from "./AuthContext";
+import { broadcastAuthChange, prepareWorkspaceForLogin } from "./session";
 
 export function LoginPage() {
   const [accountId, setAccountId] = useState("");
@@ -17,11 +18,12 @@ export function LoginPage() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ accountId, password }),
       });
-      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      const body = (await response.json().catch(() => ({}))) as { error?: string; user?: CurrentUser };
       if (!response.ok) throw new Error(body.error ?? `登录失败（HTTP ${response.status}）`);
-      // 避免同一浏览器先前用户的画布会话泄露给新登录账号。
-      window.sessionStorage.removeItem("garment-canvas-project-tabs");
-      window.localStorage.removeItem("garment-canvas-recent-results");
+      if (!body.user?.id) throw new Error("登录响应缺少用户信息");
+      // 同账号恢复本机草稿；只有切换到不同账号时才清除旧画布。
+      prepareWorkspaceForLogin(window.sessionStorage, window.localStorage, body.user.id);
+      broadcastAuthChange(window.localStorage, "login", body.user.id);
       window.location.reload();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
@@ -58,8 +60,29 @@ export function LoginPage() {
   );
 }
 
+export function SessionEndedPage({ onContinue }: { onContinue: () => void }) {
+  return (
+    <main className="flex h-full items-center justify-center bg-[#101214] px-4 text-neutral-200">
+      <section className="w-full max-w-sm rounded-2xl border border-[#2b2d30] bg-[#17191c] p-7 shadow-2xl">
+        <p className="text-[10px] font-medium uppercase tracking-[0.35em] text-[#9A7333]">GARMENT CANVAS</p>
+        <h1 className="mt-3 text-xl font-semibold">账号已在其他设备登录</h1>
+        <p className="mt-2 text-sm leading-6 text-neutral-400">
+          为保护项目数据，本设备已退出工作区。已绑定当前账号的本机草稿会保留；使用其他账号登录时会安全清除，无法确认归属的旧缓存也不会继续加载。
+        </p>
+        <button
+          type="button"
+          onClick={onContinue}
+          className="mt-5 w-full rounded-lg bg-[#9A7333] py-2.5 text-sm font-medium text-white hover:bg-[#ae8440]"
+        >
+          返回登录页
+        </button>
+      </section>
+    </main>
+  );
+}
+
 export function ChangePasswordPage() {
-  const { refresh } = useAuth();
+  const { user } = useAuth();
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirm, setConfirm] = useState("");
@@ -82,7 +105,9 @@ export function ChangePasswordPage() {
       });
       const body = (await response.json().catch(() => ({}))) as { error?: string };
       if (!response.ok) throw new Error(body.error ?? "修改密码失败");
-      await refresh();
+      if (!user) throw new Error("登录状态已失效");
+      broadcastAuthChange(window.localStorage, "auth-changed", user.id);
+      window.location.reload();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {

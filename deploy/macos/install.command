@@ -44,7 +44,7 @@ if [[ -f "$SOURCE_DIR/FILE-SHA256SUMS.txt" ]]; then
 fi
 
 if ! command -v node >/dev/null 2>&1; then
-  print -u2 "Node.js 20+ is required. Install it first from https://nodejs.org/"
+  print -u2 "Node.js 20.9.0+ is required. Install it first from https://nodejs.org/"
   exit 1
 fi
 
@@ -53,9 +53,9 @@ if [[ "$NODE_PATH" != /* ]]; then
   print -u2 "Node.js executable must resolve to an absolute path; found: $NODE_PATH"
   exit 1
 fi
-NODE_MAJOR="$("$NODE_PATH" -p 'Number(process.versions.node.split(".")[0])')"
-if (( NODE_MAJOR < 20 )); then
-  print -u2 "Node.js 20+ is required; found $("$NODE_PATH" -v)."
+NODE_SUPPORTED="$("$NODE_PATH" -p 'const [major, minor] = process.versions.node.split(".").map(Number); major > 20 || (major === 20 && minor >= 9) ? "yes" : "no"')"
+if [[ "$NODE_SUPPORTED" != "yes" ]]; then
+  print -u2 "Node.js 20.9.0+ is required; found $("$NODE_PATH" -v)."
   exit 1
 fi
 
@@ -68,13 +68,13 @@ if ! docker info >/dev/null 2>&1; then
   print -u2 "Docker is installed but not running. Start Docker Desktop first."
   exit 1
 fi
-if ! docker image inspect postgres:17-alpine >/dev/null 2>&1; then
-  if [[ -f "$SOURCE_DIR/postgres-17-alpine.tar" ]]; then
+if ! docker image inspect postgres:18-alpine >/dev/null 2>&1; then
+  if [[ -f "$SOURCE_DIR/postgres-18-alpine.tar" ]]; then
     print "Loading the bundled PostgreSQL image..."
-    docker load -i "$SOURCE_DIR/postgres-17-alpine.tar" >/dev/null
+    docker load -i "$SOURCE_DIR/postgres-18-alpine.tar" >/dev/null
   else
     print "Downloading the PostgreSQL image..."
-    docker pull postgres:17-alpine >/dev/null
+    docker pull postgres:18-alpine >/dev/null
   fi
 fi
 
@@ -128,6 +128,7 @@ fi
   "$NODE_PATH" -e "import('express').then(() => process.exit(0)).catch(() => process.exit(1))"
   "$NODE_PATH" -e "import('pg').then(() => process.exit(0)).catch(() => process.exit(1))"
   "$NODE_PATH" -e "import('better-sqlite3').then(m => { const db = new m.default(':memory:'); db.close(); }).catch(() => process.exit(1))"
+  "$NODE_PATH" -e "import('sharp').then(() => process.exit(0)).catch(() => process.exit(1))"
 )
 
 /bin/mv "$STAGE_DIR" "$RELEASE_DIR"
