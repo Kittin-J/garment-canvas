@@ -1,14 +1,10 @@
 import { spawnSync } from "node:child_process";
 import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { basename, dirname, resolve, sep } from "node:path";
+import { pathToFileURL } from "node:url";
 
 function deny(message) {
-  process.stderr.write(
-    `${JSON.stringify({
-      hookSpecificOutput: { permissionDecision: "deny" },
-      systemMessage: message,
-    })}\n`,
-  );
+  process.stderr.write(`${message}\n`);
   process.exit(2);
 }
 
@@ -36,12 +32,39 @@ function isLinkedWorktree(cwd) {
   return gitDir !== commonDir;
 }
 
-function containsSensitivePath(value) {
-  const withoutPublicExample = value.replaceAll(".env.example", "");
-  return (
-    /(?:^|[\\/\s"'=])\.env(?:[.\\/\s"']|$)/i.test(withoutPublicExample) ||
-    /(?:^|[\\/])\.secrets(?:[\\/]|$)/i.test(value)
+export function containsSensitivePath(value) {
+  const withoutPublicExample = value.replace(
+    /(^|[\\/\s"'=])\.env\.example(?=$|[\\/\s"'])/gi,
+    "$1",
   );
+  return (
+    /(?:^|[\\/\s"'=*?{}\[\]])\.env(?:[.\\/\s"'*?{}\[\]]|$)/i.test(withoutPublicExample) ||
+    /(?:^|[\\/*?{}\[\]])\.secrets(?:[\\/*?{}\[\]]|$)/i.test(value)
+  );
+}
+
+function canonicalizePotentialPath(value) {
+  let current = resolve(value);
+  const missingSegments = [];
+
+  while (true) {
+    try {
+      return resolve(realpathSync(current), ...missingSegments.reverse());
+    } catch (error) {
+      if (error?.code !== "ENOENT") return null;
+      const parent = dirname(current);
+      if (parent === current) return null;
+      missingSegments.push(basename(current));
+      current = parent;
+    }
+  }
+}
+
+export function isPathInsideRoot(root, target) {
+  const canonicalRoot = canonicalizePotentialPath(root);
+  const canonicalTarget = canonicalizePotentialPath(target);
+  if (!canonicalRoot || !canonicalTarget) return false;
+  return canonicalTarget === canonicalRoot || canonicalTarget.startsWith(canonicalRoot + sep);
 }
 
 function forbiddenBashReason(command) {
@@ -78,7 +101,6 @@ function isReadOnlyGit(segment) {
     "ls-files",
     "ls-tree",
     "cat-file",
-    "grep",
     "describe",
     "name-rev",
   ].includes(subcommand);
@@ -93,17 +115,17 @@ function isReadOnlySegment(segment) {
   const match = trimmed.match(/^(?:(?:\/[^\s]+\/)?)([a-z0-9_-]+)(?:\s|$)/i);
   if (!match) return false;
   const command = match[1];
-  if (!["ls", "rg", "grep", "cat", "head", "tail", "wc", "cut", "tr", "jq", "file", "stat", "realpath", "dirname", "basename", "sed"].includes(command)) {
+  if (!["ls", "rg", "grep", "cat", "head", "tail", "wc", "cut", "tr", "jq", "file", "stat", "realpath", "dirname", "basename"].includes(command)) {
     return false;
   }
-  if (command === "sed" && /(?:^|\s)(?:-[^\s]*i[^\s]*|--in-place(?:=\S*)?)(?:\s|$)/.test(trimmed)) return false;
   if (command === "rg" && /(?:^|\s)(?:--hidden|--no-ignore|-u{1,3}|--pre)(?:\s|=|$)/.test(trimmed)) return false;
   return true;
 }
 
-function isReadOnlyBash(command) {
+export function isReadOnlyBash(command) {
   if (!command.trim()) return false;
   if (/[<>`]/.test(command) || /\$\(/.test(command)) return false;
+  if (/[$*?{}\[\]]/.test(command)) return false;
   if (/(^|[^&])&([^&]|$)/.test(command)) return false;
   if (/\b(?:tee|xargs)\b/.test(command)) return false;
 
@@ -112,48 +134,69 @@ function isReadOnlyBash(command) {
     .every((segment) => isReadOnlySegment(segment));
 }
 
-let input;
-try {
-  input = JSON.parse(await new Promise((resolveInput, reject) => {
+async function readInput() {
+  return JSON.parse(await new Promise((resolveInput, reject) => {
     let value = "";
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", (chunk) => { value += chunk; });
     process.stdin.on("end", () => resolveInput(value));
     process.stdin.on("error", reject);
   }));
-} catch {
-  deny("Unable to validate this tool call because the hook input was invalid.");
 }
 
-const cwd = typeof input.cwd === "string" ? input.cwd : process.cwd();
-const toolName = input.tool_name;
-const filePath = input.tool_input?.file_path;
+async function main() {
+  let input;
+  try {
+    input = await readInput();
+  } catch {
+    deny("Unable to validate this tool call because the hook input was invalid.");
+  }
 
-if (toolName === "Read" || toolName === "Write" || toolName === "Edit") {
-  if (typeof filePath === "string" && containsSensitivePath(filePath)) {
+  const cwd = typeof input.cwd === "string" ? input.cwd : process.cwd();
+  const toolName = input.tool_name;
+  const toolInput = input.tool_input ?? {};
+  const writeTools = new Set(["Write", "Edit", "NotebookEdit"]);
+  const readOnlyTools = new Set(["Read", "Grep", "Glob"]);
+  const pathInputs = [toolInput.file_path, toolInput.notebook_path, toolInput.path, toolInput.glob];
+  if (toolName === "Glob") pathInputs.push(toolInput.pattern);
+
+  if (pathInputs.some((value) => typeof value === "string" && containsSensitivePath(value))) {
     deny("Access to private .env or .secrets files is blocked; use .env.example as the public contract.");
   }
-}
 
-if (toolName === "Read") {
+  if (readOnlyTools.has(toolName)) process.exit(0);
+
+  if (toolName === "Bash") {
+    const command = toolInput.command;
+    if (typeof command !== "string") deny("A Bash tool call without a command is blocked.");
+    const reason = forbiddenBashReason(command);
+    if (reason) deny(reason);
+  }
+
+  const linked = isLinkedWorktree(cwd);
+  if (linked === null) deny("Claude could not verify that the current directory is a linked git worktree.");
+
+  if (writeTools.has(toolName)) {
+    if (!linked) deny("The primary worktree is audit-only. Restart with: claude --worktree <task-name>");
+    const targetInput = toolInput.file_path ?? toolInput.notebook_path;
+    if (typeof targetInput !== "string" || !targetInput) deny("A write tool call without a target path is blocked.");
+    const root = gitPath(cwd, "--show-toplevel");
+    const target = resolve(cwd, targetInput);
+    if (!root || !isPathInsideRoot(root, target)) {
+      deny("Writes must stay inside the current linked worktree.");
+    }
+    process.exit(0);
+  }
+
+  if (toolName === "Bash") {
+    if (linked) process.exit(0);
+    if (!isReadOnlyBash(toolInput.command)) {
+      deny("Only a conservative read-only Bash allowlist is available in the primary worktree. Use Read/Grep/GitNexus, or restart with claude --worktree <task-name>.");
+    }
+  }
+
   process.exit(0);
 }
 
-if (toolName === "Bash") {
-  const command = input.tool_input?.command;
-  if (typeof command !== "string") deny("A Bash tool call without a command is blocked.");
-  const reason = forbiddenBashReason(command);
-  if (reason) deny(reason);
-}
-
-const linked = isLinkedWorktree(cwd);
-if (linked === true) process.exit(0);
-if (linked === null) deny("Claude could not verify that the current directory is a linked git worktree.");
-
-if (toolName === "Write" || toolName === "Edit") {
-  deny("The primary worktree is audit-only. Restart with: claude --worktree <task-name>");
-}
-
-if (toolName === "Bash" && !isReadOnlyBash(input.tool_input.command)) {
-  deny("Only a conservative read-only Bash allowlist is available in the primary worktree. Use Read/Grep/GitNexus, or restart with claude --worktree <task-name>.");
-}
+const isMain = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
+if (isMain) await main();

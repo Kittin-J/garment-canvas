@@ -1,15 +1,81 @@
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { closeSync, openSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { createServer } from "node:net";
-import { resolve } from "node:path";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-export function createComposeProjectName({
-  cwd = process.cwd(),
-  pid = process.pid,
-} = {}) {
+export function createComposeProjectName({ cwd = process.cwd() } = {}) {
   const worktreeId = createHash("sha256").update(resolve(cwd)).digest("hex").slice(0, 10);
-  return `garment-canvas-test-${worktreeId}-${pid}`;
+  return `garment-canvas-test-${worktreeId}`;
+}
+
+function processIsActive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+export function acquireTestLock({
+  projectName,
+  pid = process.pid,
+  lockRoot = tmpdir(),
+  isProcessActive = processIsActive,
+} = {}) {
+  if (!projectName) throw new Error("A Compose project name is required for the test lock");
+  const lockPath = join(lockRoot, `${projectName}.lock`);
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    let descriptor;
+    try {
+      descriptor = openSync(lockPath, "wx", 0o600);
+      writeFileSync(descriptor, `${pid}\n`, "utf8");
+      let released = false;
+      return () => {
+        if (released) return;
+        released = true;
+        closeSync(descriptor);
+        try {
+          unlinkSync(lockPath);
+        } catch (error) {
+          if (error?.code !== "ENOENT") throw error;
+        }
+      };
+    } catch (error) {
+      if (descriptor !== undefined) {
+        closeSync(descriptor);
+        try {
+          unlinkSync(lockPath);
+        } catch (unlinkError) {
+          if (unlinkError?.code !== "ENOENT") throw unlinkError;
+        }
+      }
+      if (error?.code !== "EEXIST") throw error;
+
+      let ownerPid;
+      try {
+        ownerPid = Number.parseInt(readFileSync(lockPath, "utf8").trim(), 10);
+      } catch (readError) {
+        if (readError?.code === "ENOENT") continue;
+        throw readError;
+      }
+      if (isProcessActive(ownerPid)) {
+        throw new Error(`Another PostgreSQL test run is active for this worktree (pid ${ownerPid})`);
+      }
+      try {
+        unlinkSync(lockPath);
+      } catch (unlinkError) {
+        if (unlinkError?.code !== "ENOENT") throw unlinkError;
+      }
+    }
+  }
+
+  throw new Error(`Unable to acquire PostgreSQL test lock: ${lockPath}`);
 }
 
 function findFreePort() {
@@ -37,8 +103,17 @@ function run(command, args, options = {}) {
   if (result.status !== 0) throw new Error(`${command} ${args.join(" ")} exited with ${result.status}`);
 }
 
+function runNpmScript(script, env) {
+  if (process.env.npm_execpath) {
+    run(process.execPath, [process.env.npm_execpath, "run", script], { env });
+    return;
+  }
+  run(process.platform === "win32" ? "npm.cmd" : "npm", ["run", script], { env });
+}
+
 async function main() {
   const composeProjectName = createComposeProjectName();
+  const releaseLock = acquireTestLock({ projectName: composeProjectName });
   const compose = [
     "compose",
     "--project-name",
@@ -46,20 +121,18 @@ async function main() {
     "-f",
     "compose.test.yaml",
   ];
-  const postgresPort = await findFreePort();
-  const composeEnv = {
+  let composeEnv = {
     ...process.env,
     COMPOSE_PROJECT_NAME: composeProjectName,
-    POSTGRES_TEST_PORT: String(postgresPort),
   };
-  const databaseUrl = `postgresql://garment_test:garment_test@127.0.0.1:${postgresPort}/garment_canvas_test`;
 
   try {
     run("docker", [...compose, "down", "--volumes", "--remove-orphans"], { env: composeEnv });
+    const postgresPort = await findFreePort();
+    composeEnv = { ...composeEnv, POSTGRES_TEST_PORT: String(postgresPort) };
+    const databaseUrl = `postgresql://garment_test:garment_test@127.0.0.1:${postgresPort}/garment_canvas_test`;
     run("docker", [...compose, "up", "-d", "--wait"], { env: composeEnv });
-    run(process.execPath, [process.env.npm_execpath, "run", "test:suite"], {
-      env: { ...composeEnv, DATABASE_URL: databaseUrl },
-    });
+    runNpmScript("test:suite", { ...composeEnv, DATABASE_URL: databaseUrl });
   } catch (error) {
     spawnSync("docker", [...compose, "logs", "--no-color"], {
       stdio: "inherit",
@@ -72,8 +145,9 @@ async function main() {
       stdio: "inherit",
       env: composeEnv,
     });
+    releaseLock();
   }
 }
 
-const isMain = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+const isMain = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href;
 if (isMain) await main();

@@ -5,18 +5,18 @@
   },
   "permissions": {
     "deny": [
-      "Bash(git push *)",
-      "Bash(gh pr create *)",
-      "Bash(git merge *)",
-      "Bash(git rebase *)",
-      "Bash(git cherry-pick *)",
-      "Bash(git reset --hard *)",
-      "Bash(git clean *)",
-      "Bash(npm install *)",
-      "Bash(npm ci *)",
-      "Bash(pnpm install *)",
-      "Bash(yarn install *)",
-      "Bash(bun install *)",
+      "Bash(git push:*)",
+      "Bash(gh pr create:*)",
+      "Bash(git merge:*)",
+      "Bash(git rebase:*)",
+      "Bash(git cherry-pick:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)",
+      "Bash(npm install:*)",
+      "Bash(npm ci:*)",
+      "Bash(pnpm install:*)",
+      "Bash(yarn install:*)",
+      "Bash(bun install:*)",
       "Read(./.env)",
       "Read(./.env.local)",
       "Read(./.secrets/**)"
@@ -25,7 +25,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Write|Edit|Bash|Read",
+        "matcher": "Write|Edit|Bash|Read|Grep|Glob|NotebookEdit",
         "hooks": [
           {
             "type": "command",

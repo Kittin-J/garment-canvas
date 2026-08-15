@@ -1,3 +1,5 @@
+name: garment-canvas-test
+
 services:
   postgres-test:
     image: postgres:18-alpine
