@@ -11,14 +11,21 @@ import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import sharp from "sharp";
 import { assertPlanInputs, buildExecutionPlan, DagError, type FlowEdge, type FlowNode } from "../server/engine/dag";
-import type { WorkflowNodeData } from "../src/types/workflow";
+import type {
+  AIProvider,
+  ImageGenRequest,
+  NodeExecution,
+  NodeKind,
+  WorkflowNodeData,
+} from "../src/types/workflow";
 
 // 所有测试文件都进入临时目录，绝不读写项目 data/。
 const TEST_DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "garment-canvas-test-"));
 process.env.DATA_DIR = TEST_DATA_DIR;
 
-const { createRun, getRunForUser } = await import("../server/engine/runner");
+const { createRun, executeStep, getRunForUser } = await import("../server/engine/runner");
 const { uploadsDir } = await import("../server/lib/fileStore");
 const TEST_OWNER_ID = "dag-test-owner";
 
@@ -27,6 +34,11 @@ const SEED_PNG = Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
   "base64",
 );
+const SECOND_PNG = await sharp({
+  create: { width: 1, height: 1, channels: 3, background: { r: 24, g: 92, b: 180 } },
+}).png().toBuffer();
+const SEED_DATA_URL = `data:image/png;base64,${SEED_PNG.toString("base64")}`;
+const SECOND_DATA_URL = `data:image/png;base64,${SECOND_PNG.toString("base64")}`;
 fs.writeFileSync(path.join(uploadsDir(), "seed.png"), SEED_PNG);
 
 let passed = 0;
@@ -83,6 +95,50 @@ function resultNode(id: string): FlowNode {
 }
 
 const edge = (source: string, target: string): FlowEdge => ({ source, target });
+
+interface RecordedProviderCall {
+  method: "generate" | "edit";
+  request: ImageGenRequest;
+}
+
+async function runRecordedAiStep(
+  kind: Exclude<NodeKind, "image-input" | "result">,
+  params: Record<string, unknown>,
+  inputImages: string[],
+) {
+  const calls: RecordedProviderCall[] = [];
+  const providerIds: string[] = [];
+  const record = (method: RecordedProviderCall["method"], request: ImageGenRequest) => {
+    calls.push({
+      method,
+      request: {
+        ...request,
+        referenceImages: request.referenceImages ? [...request.referenceImages] : undefined,
+      },
+    });
+    const count = Math.max(1, request.batchSize ?? 1);
+    return {
+      images: Array.from({ length: count }, () => SEED_DATA_URL),
+      model: "runner-stub-model",
+    };
+  };
+  const provider: AIProvider = {
+    id: "runner-stub",
+    async generate(request) { return record("generate", request); },
+    async edit(request) { return record("edit", request); },
+  };
+  const step: NodeExecution = {
+    nodeId: `runner-${kind}`,
+    kind,
+    inputImages,
+    params,
+  };
+  const result = await executeStep(step, inputImages, (providerId) => {
+    providerIds.push(providerId);
+    return provider;
+  });
+  return { calls, providerIds, result };
+}
 
 async function main() {
   console.log("DAG 回归测试");
@@ -244,6 +300,135 @@ async function main() {
     const step = plan.steps[0];
     assert.equal(step.params.prompt, "test");
     assert.deepStrictEqual(step.inputImages, []);
+  });
+
+  await ok("runner 草图效果图：有参考图走 edit 并按批量返回", async () => {
+    const prompt = "保留轮廓，渲染成真丝礼服";
+    const { calls, providerIds, result } = await runRecordedAiStep(
+      "sketch-to-render",
+      { prompt, aspectRatio: "3:4", batchSize: 2 },
+      [SEED_DATA_URL],
+    );
+    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].method, "edit");
+    assert.deepStrictEqual(calls[0].request.referenceImages, [SEED_DATA_URL]);
+    assert.strictEqual(calls[0].request.prompt, prompt);
+    assert.strictEqual(calls[0].request.aspectRatio, "3:4");
+    assert.strictEqual(calls[0].request.batchSize, 2);
+    assert.strictEqual(result.images.length, 2);
+    assert.deepStrictEqual(result.prompts, [prompt, prompt]);
+    assert.strictEqual(result.providerRequests, 1);
+  });
+
+  await ok("runner 文生图：无参考图走 generate 并保留数量", async () => {
+    const prompt = "生成一组沙漠金属感礼服";
+    const { calls, providerIds, result } = await runRecordedAiStep(
+      "sketch-to-render",
+      { prompt, aspectRatio: "16:9", batchSize: 2 },
+      [],
+    );
+    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].method, "generate");
+    assert.strictEqual(calls[0].request.referenceImages, undefined);
+    assert.strictEqual(calls[0].request.prompt, prompt);
+    assert.strictEqual(calls[0].request.batchSize, 2);
+    assert.strictEqual(result.images.length, 2);
+    assert.strictEqual(result.providerRequests, 1);
+  });
+
+  await ok("runner AI 改款：多参考图顺序传入 edit 并生成用户数量", async () => {
+    const prompt = "改成娃娃领和短袖";
+    const { calls, providerIds, result } = await runRecordedAiStep(
+      "ai-modify",
+      { prompt, aspectRatio: "1:1", batchSize: 4 },
+      [SEED_DATA_URL, SECOND_DATA_URL],
+    );
+    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].method, "edit");
+    assert.deepStrictEqual(calls[0].request.referenceImages, [SEED_DATA_URL, SECOND_DATA_URL]);
+    assert.strictEqual(calls[0].request.prompt, prompt);
+    assert.strictEqual(calls[0].request.batchSize, 4);
+    assert.strictEqual(result.images.length, 4);
+    assert.strictEqual(result.prompts?.length, 4);
+    assert.strictEqual(result.providerRequests, 1);
+  });
+
+  await ok("runner 面料配色：一色一次 edit，成衣与面料参考均传入", async () => {
+    const colors = ["#DE2910", "#002FA7"];
+    const { calls, providerIds, result } = await runRecordedAiStep(
+      "fabric-recolor",
+      { colors, fabricImageUrl: SECOND_DATA_URL },
+      [SEED_DATA_URL],
+    );
+    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.strictEqual(calls.length, colors.length);
+    assert.ok(calls.every((call) => call.method === "edit"));
+    assert.ok(calls.every((call) => call.request.batchSize === 1));
+    for (const call of calls) {
+      assert.deepStrictEqual(call.request.referenceImages, [SEED_DATA_URL, SECOND_DATA_URL]);
+    }
+    assert.match(calls[0].request.prompt, /中国红\(#DE2910\)/);
+    assert.match(calls[1].request.prompt, /克莱因蓝\(#002FA7\)/);
+    assert.strictEqual(result.images.length, colors.length);
+    assert.deepStrictEqual(result.prompts, calls.map((call) => call.request.prompt));
+    assert.strictEqual(result.providerRequests, colors.length);
+  });
+
+  await ok("runner 高清放大：单参考图走 edit，固定单图并传递 2K", async () => {
+    const { calls, providerIds, result } = await runRecordedAiStep(
+      "upscale",
+      { imageSize: "2K" },
+      [SEED_DATA_URL],
+    );
+    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].method, "edit");
+    assert.deepStrictEqual(calls[0].request.referenceImages, [SEED_DATA_URL]);
+    assert.match(calls[0].request.prompt, /放大为超高清版本/);
+    assert.strictEqual(calls[0].request.imageSize, "2K");
+    assert.strictEqual(calls[0].request.batchSize, 1);
+    assert.strictEqual(result.images.length, 1);
+    assert.strictEqual(result.providerRequests, 1);
+  });
+
+  await ok("runner 印花提取：参考图走 edit，合并固定与用户提示词", async () => {
+    const extra = "只要胸前的主图案";
+    const { calls, providerIds, result } = await runRecordedAiStep(
+      "print-extract",
+      { prompt: extra },
+      [SEED_DATA_URL],
+    );
+    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].method, "edit");
+    assert.deepStrictEqual(calls[0].request.referenceImages, [SEED_DATA_URL]);
+    assert.match(calls[0].request.prompt, /提取这件衣服上的印花图案/);
+    assert.match(calls[0].request.prompt, new RegExp(`补充要求：${extra}`));
+    assert.strictEqual(calls[0].request.batchSize, 1);
+    assert.strictEqual(result.images.length, 1);
+    assert.strictEqual(result.providerRequests, 1);
+  });
+
+  await ok("runner 印花裂变：参考图走 edit，按 count 返回且合并提示词", async () => {
+    const extra = "转为水墨风格";
+    const { calls, providerIds, result } = await runRecordedAiStep(
+      "print-mutate",
+      { prompt: extra, count: 3 },
+      [SEED_DATA_URL],
+    );
+    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].method, "edit");
+    assert.deepStrictEqual(calls[0].request.referenceImages, [SEED_DATA_URL]);
+    assert.match(calls[0].request.prompt, /生成风格一致的新变体/);
+    assert.match(calls[0].request.prompt, new RegExp(`补充要求：${extra}`));
+    assert.strictEqual(calls[0].request.batchSize, 3);
+    assert.strictEqual(result.images.length, 3);
+    assert.strictEqual(result.prompts?.length, 3);
+    assert.strictEqual(result.providerRequests, 1);
   });
 
   await ok("端到端（无 AI）：result 节点收到上游本次产出", async () => {

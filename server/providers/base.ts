@@ -27,23 +27,32 @@ export type ProviderErrorCategory =
   | "timeout"
   | "gateway_unavailable"
   | "empty_response"
+  | "invalid_response"
   | "unknown";
 
 function classifyProviderMessage(status: number | undefined, rawMessage: string): {
   category: ProviderErrorCategory;
   publicMessage: string;
 } {
-  const message = rawMessage.toLowerCase();
+  const message = rawMessage
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
   if (status === 401 || status === 403) {
     return {
       category: "gateway_authentication",
       publicMessage: "AI 网关鉴权失败，请联系管理员检查 API Key 或账号权限",
     };
   }
-  if (/content.{0,20}(policy|filter|safety)|moderation|safety.{0,20}(block|reject)|refus(ed|al)|内容.{0,10}(拒绝|违规)/i.test(message)) {
+  const contentRefused =
+    /content\s*(policy|filter)|content management policy|responsible\s*ai\s*policy\s*violation/i.test(message) ||
+    /(safety system|moderation).{0,50}(block|filter|reject|refus)/i.test(message) ||
+    /(block|filter|reject|refus).{0,50}(safety system|moderation|content management policy)/i.test(message) ||
+    /内容.{0,12}(安全|审核|政策|过滤).{0,12}(拦截|过滤|拒绝|违规)|内容.{0,10}(拒绝|违规)/i.test(message);
+  if (contentRefused) {
     return {
       category: "content_refused",
-      publicMessage: "原图案无法完整复刻，可尝试风格化重绘",
+      publicMessage: "本次请求未通过 AI 安全审核，请调整提示词或参考图片后重试",
     };
   }
   if (/model.{0,40}(not found|does not exist|unsupported|not available|invalid)|unknown model|模型.{0,10}(不存在|不可用|不支持)/i.test(message)) {

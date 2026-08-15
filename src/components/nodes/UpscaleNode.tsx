@@ -4,7 +4,10 @@ import type { UpscaleNodeData } from "@/types/workflow";
 import { NodeFrame, RunButton, Developing } from "./NodeFrame";
 import { ImageGrid } from "./ImageGrid";
 
-const IMAGE_SIZES = ["2K", "4K"] as const;
+const IMAGE_SIZES = [
+  { value: "2K", label: "2K · 长边 2048" },
+  { value: "4K", label: "4K · 长边 4096" },
+] as const;
 
 export function UpscaleNode({ id, data, selected }: NodeProps<Node<UpscaleNodeData>>) {
   const updateNodeData = useFlowStore((s) => s.updateNodeData);
@@ -18,20 +21,20 @@ export function UpscaleNode({ id, data, selected }: NodeProps<Node<UpscaleNodeDa
         <div className="space-y-1">
           <span className="text-[10px] text-neutral-500">放大档位</span>
           <div className="grid grid-cols-2 gap-2">
-            {IMAGE_SIZES.map((size) => {
-              const active = data.imageSize === size;
+            {IMAGE_SIZES.map(({ value, label }) => {
+              const active = data.imageSize === value;
               return (
                 <button
-                  key={size}
+                  key={value}
                   type="button"
-                  onClick={() => updateNodeData(id, { imageSize: size })}
+                  onClick={() => updateNodeData(id, { imageSize: value })}
                   className={`nodrag rounded-md border px-3 py-1.5 text-xs font-medium transition-colors ${
                     active
                       ? "border-gold bg-gold/10 text-gold"
                       : "border-[#262626] bg-[#0f0f0f] text-neutral-400 hover:border-gold/50"
                   }`}
                 >
-                  {size}
+                  {label}
                 </button>
               );
             })}

@@ -20,7 +20,6 @@ interface AiDiagnosticProvider {
     supportsBatchN: boolean;
     maxBatchSize: number;
     supportsMultiReference: boolean;
-    supportsImageArray: boolean;
     maxReferenceImages: number;
   };
 }
@@ -237,7 +236,7 @@ function AccountPanel({ initialTab, onClose }: { initialTab: AccountPanelTab; on
                   {provider.capabilities && (
                     <p className="mb-3 text-[11px] text-[var(--gc-text-muted)]">
                       批量参数：{provider.capabilities.supportsBatchN ? `支持，单次最多 ${provider.capabilities.maxBatchSize} 张` : "不发送，由系统循环补足"}
-                      ；多参考图：{provider.capabilities.supportsMultiReference && provider.capabilities.supportsImageArray ? `支持，最多 ${provider.capabilities.maxReferenceImages} 张` : "不支持"}
+                      ；多参考图：{provider.capabilities.supportsMultiReference ? `支持，最多 ${provider.capabilities.maxReferenceImages} 张` : "不支持"}
                     </p>
                   )}
                   <div className="flex flex-wrap gap-2">

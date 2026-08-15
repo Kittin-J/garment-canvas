@@ -67,7 +67,7 @@ export interface FabricRecolorNodeData extends BaseNodeData {
 
 export interface UpscaleNodeData extends BaseNodeData {
   kind: "upscale";
-  /** 放大档位（Gemini imageConfig.imageSize，必须大写） */
+  /** 最终输出长边：2K=2048px，4K=4096px。 */
   imageSize: "2K" | "4K";
   outputImages: string[];
 }
@@ -146,7 +146,7 @@ export interface ImageGenRequest {
   referenceImages?: string[];
   aspectRatio?: string;
   batchSize?: number;
-  /** 分辨率档位（Gemini imageConfig.imageSize："1K"|"2K"|"4K"，必须大写） */
+  /** 业务输出档位：保持比例，2K/4K 分别将最终图片长边处理为 2048/4096 像素。 */
   imageSize?: string;
   /** 局部编辑蒙版（dataURL），P0 可选 */
   mask?: string;

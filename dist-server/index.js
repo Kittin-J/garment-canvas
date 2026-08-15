@@ -54,14 +54,12 @@ var config = {
     supportsBatchN: booleanEnv("NANOBANANA_SUPPORTS_N", false),
     maxBatchSize: boundedIntegerEnv("NANOBANANA_MAX_BATCH", 1, 1, 4),
     supportsMultiReference: booleanEnv("NANOBANANA_SUPPORTS_MULTI_REFERENCE", true),
-    supportsImageArray: booleanEnv("NANOBANANA_SUPPORTS_IMAGE_ARRAY", true),
     maxReferenceImages: boundedIntegerEnv("NANOBANANA_MAX_REFERENCE_IMAGES", 8, 1, 8)
   }),
   image2Capabilities: () => ({
     supportsBatchN: booleanEnv("IMAGE2_SUPPORTS_N", false),
     maxBatchSize: boundedIntegerEnv("IMAGE2_MAX_BATCH", 1, 1, 4),
     supportsMultiReference: booleanEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", true),
-    supportsImageArray: booleanEnv("IMAGE2_SUPPORTS_IMAGE_ARRAY", true),
     maxReferenceImages: boundedIntegerEnv("IMAGE2_MAX_REFERENCE_IMAGES", 8, 1, 8)
   }),
   port: () => Number(process.env.PORT ?? 3001),
@@ -167,6 +165,10 @@ var NODE_SPECS = {
   }
 };
 
+// server/engine/runner.ts
+import { EventEmitter } from "node:events";
+import { nanoid as nanoid4 } from "nanoid";
+
 // server/providers/base.ts
 var ProviderError = class extends Error {
   constructor(message, status, providerId, category = "unknown", diagnostic) {
@@ -183,17 +185,18 @@ var ProviderError = class extends Error {
   diagnostic;
 };
 function classifyProviderMessage(status, rawMessage) {
-  const message = rawMessage.toLowerCase();
+  const message = rawMessage.toLowerCase().replace(/[_-]+/g, " ").replace(/\s+/g, " ");
   if (status === 401 || status === 403) {
     return {
       category: "gateway_authentication",
       publicMessage: "AI \u7F51\u5173\u9274\u6743\u5931\u8D25\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u68C0\u67E5 API Key \u6216\u8D26\u53F7\u6743\u9650"
     };
   }
-  if (/content.{0,20}(policy|filter|safety)|moderation|safety.{0,20}(block|reject)|refus(ed|al)|内容.{0,10}(拒绝|违规)/i.test(message)) {
+  const contentRefused = /content\s*(policy|filter)|content management policy|responsible\s*ai\s*policy\s*violation/i.test(message) || /(safety system|moderation).{0,50}(block|filter|reject|refus)/i.test(message) || /(block|filter|reject|refus).{0,50}(safety system|moderation|content management policy)/i.test(message) || /内容.{0,12}(安全|审核|政策|过滤).{0,12}(拦截|过滤|拒绝|违规)|内容.{0,10}(拒绝|违规)/i.test(message);
+  if (contentRefused) {
     return {
       category: "content_refused",
-      publicMessage: "\u539F\u56FE\u6848\u65E0\u6CD5\u5B8C\u6574\u590D\u523B\uFF0C\u53EF\u5C1D\u8BD5\u98CE\u683C\u5316\u91CD\u7ED8"
+      publicMessage: "\u672C\u6B21\u8BF7\u6C42\u672A\u901A\u8FC7 AI \u5B89\u5168\u5BA1\u6838\uFF0C\u8BF7\u8C03\u6574\u63D0\u793A\u8BCD\u6216\u53C2\u8003\u56FE\u7247\u540E\u91CD\u8BD5"
     };
   }
   if (/model.{0,40}(not found|does not exist|unsupported|not available|invalid)|unknown model|模型.{0,10}(不存在|不可用|不支持)/i.test(message)) {
@@ -319,6 +322,270 @@ function aspectRatioToSize(aspectRatio) {
   }
 }
 
+// server/providers/gptImagesResponse.ts
+import sharp from "sharp";
+
+// server/lib/imageProcessingLimit.ts
+var MAX_CONCURRENT_IMAGE_PROCESSING = 2;
+var active = 0;
+var waiters = [];
+async function acquireImageProcessingSlot() {
+  if (active < MAX_CONCURRENT_IMAGE_PROCESSING) {
+    active += 1;
+  } else {
+    await new Promise((resolve) => waiters.push(resolve));
+  }
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    const next = waiters.shift();
+    if (next) {
+      next();
+    } else {
+      active -= 1;
+    }
+  };
+}
+async function withImageProcessingSlot(work) {
+  const release = await acquireImageProcessingSlot();
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+}
+
+// server/lib/imageValidation.ts
+var ALLOWED_IMAGE_MIMES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
+var MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+var ImageValidationError = class extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "ImageValidationError";
+  }
+};
+function hasMagic(buffer, bytes, offset = 0) {
+  return bytes.every((byte, index) => buffer[offset + index] === byte);
+}
+function detectImageMime(buffer) {
+  if (buffer.length >= 8 && hasMagic(buffer, [137, 80, 78, 71, 13, 10, 26, 10])) {
+    return "image/png";
+  }
+  if (buffer.length >= 3 && hasMagic(buffer, [255, 216, 255])) return "image/jpeg";
+  if (buffer.length >= 12 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") {
+    return "image/webp";
+  }
+  if (buffer.length >= 6) {
+    const signature = buffer.toString("ascii", 0, 6);
+    if (signature === "GIF87a" || signature === "GIF89a") return "image/gif";
+  }
+  return null;
+}
+function validateImageDataUrl(dataUrl, maxBytes = MAX_IMAGE_BYTES) {
+  if (typeof dataUrl !== "string") throw new ImageValidationError("image dataURL must be a string");
+  const match = /^data:([^;,]+);base64,([A-Za-z0-9+/]*={0,2})$/.exec(dataUrl);
+  if (!match) throw new ImageValidationError("invalid image dataURL (strict base64 required)");
+  const mime = match[1].toLowerCase();
+  if (!ALLOWED_IMAGE_MIMES.includes(mime)) {
+    throw new ImageValidationError(`unsupported image MIME: ${mime}`);
+  }
+  const encoded = match[2];
+  if (encoded.length === 0 || encoded.length % 4 !== 0) {
+    throw new ImageValidationError("invalid image base64 payload");
+  }
+  if (encoded.includes("=") && !/^[A-Za-z0-9+/]+={1,2}$/.test(encoded)) {
+    throw new ImageValidationError("invalid image base64 padding");
+  }
+  const estimatedBytes = Math.floor(encoded.length * 3 / 4) - (encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0);
+  if (estimatedBytes > maxBytes) throw new ImageValidationError(`image too large (limit ${maxBytes} bytes)`);
+  const buffer = Buffer.from(encoded, "base64");
+  if (buffer.length === 0 || buffer.length !== estimatedBytes) {
+    throw new ImageValidationError("invalid image base64 payload");
+  }
+  if (buffer.toString("base64") !== encoded) {
+    throw new ImageValidationError("non-canonical image base64 payload");
+  }
+  const detected = detectImageMime(buffer);
+  if (!detected) throw new ImageValidationError("unrecognized image file signature");
+  if (detected !== mime) {
+    throw new ImageValidationError(`image MIME/signature mismatch: declared ${mime}, detected ${detected}`);
+  }
+  return { mime, buffer };
+}
+function isLocalImageReference(value) {
+  if (typeof value !== "string") return false;
+  return /^\/api\/files\/[A-Za-z0-9_-]{1,128}\.(?:png|jpe?g|webp|gif)$/.test(value);
+}
+
+// server/providers/gptImagesResponse.ts
+var INVALID_IMAGE_RESPONSE_MESSAGE = "AI \u670D\u52A1\u8FD4\u56DE\u4E86\u65E0\u6548\u56FE\u7247\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\uFF1B\u5982\u6301\u7EED\u5931\u8D25\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458";
+var MAX_PROVIDER_RESPONSE_PIXELS = 4e7;
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function invalidImageResponse(providerId, location, reason) {
+  return new ProviderError(
+    INVALID_IMAGE_RESPONSE_MESSAGE,
+    502,
+    providerId,
+    "invalid_response",
+    `Images response ${location}: ${reason}`
+  );
+}
+async function parsePngBase64(value, providerId, index) {
+  if (typeof value !== "string" || value.length === 0) {
+    throw invalidImageResponse(providerId, `item ${index}`, "b64_json must be a non-empty string");
+  }
+  try {
+    const validated = validateImageDataUrl(`data:image/png;base64,${value}`);
+    await withImageProcessingSlot(async () => {
+      await sharp(validated.buffer, {
+        animated: false,
+        failOn: "warning",
+        limitInputPixels: MAX_PROVIDER_RESPONSE_PIXELS
+      }).raw().toBuffer();
+    });
+    return `data:image/png;base64,${validated.buffer.toString("base64")}`;
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "PNG validation failed";
+    throw invalidImageResponse(providerId, `item ${index}`, reason);
+  }
+}
+function parseImageUrl(value, providerId, index) {
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw invalidImageResponse(providerId, `item ${index}`, "url must be a non-empty string");
+  }
+  const normalized = value.trim();
+  try {
+    const parsed = new URL(normalized);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("unsupported protocol");
+  } catch {
+    throw invalidImageResponse(providerId, `item ${index}`, "url must be an absolute HTTP(S) URL");
+  }
+  return normalized;
+}
+async function parseGptImagesPngResponse(payload, providerId) {
+  if (!isRecord(payload)) {
+    throw invalidImageResponse(providerId, "body", "expected a JSON object");
+  }
+  if (payload.error !== void 0 && payload.error !== null) {
+    if (!isRecord(payload.error)) {
+      throw invalidImageResponse(providerId, "error", "expected an error object");
+    }
+    const code = payload.error.code;
+    const message = typeof payload.error.message === "string" ? payload.error.message : "images api error";
+    const rawMessage = typeof code === "string" ? `${code}: ${message}` : message;
+    const status = typeof code === "number" && Number.isInteger(code) && code >= 400 && code < 600 ? code : void 0;
+    throw providerErrorFromMessage(rawMessage, providerId, status);
+  }
+  if (!Array.isArray(payload.data) || payload.data.length === 0) {
+    throw new ProviderError("AI \u670D\u52A1\u672A\u8FD4\u56DE\u56FE\u7247\uFF0C\u8BF7\u91CD\u8BD5", 502, providerId, "empty_response");
+  }
+  const images = [];
+  for (let index = 0; index < payload.data.length; index += 1) {
+    const item = payload.data[index];
+    if (!isRecord(item)) {
+      throw invalidImageResponse(providerId, `item ${index}`, "expected an object");
+    }
+    if (Object.prototype.hasOwnProperty.call(item, "b64_json")) {
+      images.push(await parsePngBase64(item.b64_json, providerId, index));
+    } else if (Object.prototype.hasOwnProperty.call(item, "url")) {
+      images.push(parseImageUrl(item.url, providerId, index));
+    } else {
+      throw invalidImageResponse(providerId, `item ${index}`, "expected b64_json or url");
+    }
+  }
+  return images;
+}
+
+// server/providers/image2References.ts
+import sharp2 from "sharp";
+var IMAGE2_COLLAGE_LAYOUT = {
+  padding: 24,
+  gap: 16,
+  labelHeight: 48,
+  tileSize: 512,
+  maxColumns: 4
+};
+var MAX_REFERENCE_INPUT_PIXELS = 4e7;
+function extensionForMime(mime) {
+  switch (mime) {
+    case "image/jpeg":
+      return "jpg";
+    case "image/webp":
+      return "webp";
+    case "image/gif":
+      return "gif";
+    default:
+      return "png";
+  }
+}
+function referenceLabel(index) {
+  const { tileSize, labelHeight } = IMAGE2_COLLAGE_LAYOUT;
+  return Buffer.from(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${tileSize}" height="${labelHeight}"><rect width="100%" height="100%" fill="#171717"/><text x="16" y="32" fill="#ffffff" font-family="sans-serif" font-size="22" font-weight="700">Image ${index}</text></svg>`
+  );
+}
+async function prepareImage2ReferenceUpload(referenceImages) {
+  if (referenceImages.length === 1) {
+    const { buffer, mime } = parseDataUrl(referenceImages[0]);
+    return {
+      buffer,
+      filename: `reference-1.${extensionForMime(mime)}`,
+      mime
+    };
+  }
+  return withImageProcessingSlot(async () => {
+    const { padding, gap, labelHeight, tileSize, maxColumns } = IMAGE2_COLLAGE_LAYOUT;
+    const columns = Math.min(referenceImages.length, maxColumns);
+    const rows = Math.ceil(referenceImages.length / columns);
+    const width = padding * 2 + columns * tileSize + (columns - 1) * gap;
+    const height = padding * 2 + rows * (labelHeight + tileSize) + (rows - 1) * gap;
+    const tiles = [];
+    for (const referenceImage of referenceImages) {
+      const { buffer: buffer2 } = parseDataUrl(referenceImage);
+      const tile = await sharp2(buffer2, {
+        animated: false,
+        failOn: "warning",
+        limitInputPixels: MAX_REFERENCE_INPUT_PIXELS,
+        sequentialRead: true
+      }).rotate().resize(tileSize, tileSize, {
+        fit: "contain",
+        background: { r: 255, g: 255, b: 255, alpha: 1 }
+      }).flatten({ background: { r: 255, g: 255, b: 255 } }).png().toBuffer();
+      tiles.push(tile);
+    }
+    const inputs = [];
+    for (let index = 0; index < tiles.length; index += 1) {
+      const column = index % columns;
+      const row = Math.floor(index / columns);
+      const left = padding + column * (tileSize + gap);
+      const top = padding + row * (labelHeight + tileSize + gap);
+      inputs.push({ input: referenceLabel(index + 1), left, top });
+      inputs.push({ input: tiles[index], left, top: top + labelHeight });
+    }
+    const buffer = await sharp2({
+      create: {
+        width,
+        height,
+        channels: 3,
+        background: { r: 244, g: 244, b: 244 }
+      }
+    }).composite(inputs).png().toBuffer();
+    return {
+      buffer,
+      filename: "numbered-references.png",
+      mime: "image/png"
+    };
+  });
+}
+function promptWithImageLayout(prompt, referenceCount) {
+  if (referenceCount <= 1) return prompt;
+  return `Reference collage: Image 1..${referenceCount} are arranged row by row, left to right, then top to bottom.
+${prompt}`;
+}
+
 // server/providers/nanobanana.ts
 var PROVIDER_ID = "nanobanana";
 async function generateOnce(req) {
@@ -344,18 +611,7 @@ async function generateOnce(req) {
     { providerId: PROVIDER_ID }
   );
   const json = await res.json();
-  if (json.error) {
-    throw providerErrorFromMessage(json.error.message ?? "images api error", PROVIDER_ID, json.error.code);
-  }
-  const images = [];
-  for (const item of json.data ?? []) {
-    if (item.b64_json) images.push(toDataUrl(item.b64_json));
-    else if (item.url) images.push(item.url);
-  }
-  if (images.length === 0) {
-    throw new ProviderError("AI \u670D\u52A1\u672A\u8FD4\u56DE\u56FE\u7247\uFF0C\u8BF7\u91CD\u8BD5", 502, PROVIDER_ID, "empty_response");
-  }
-  return images;
+  return await parseGptImagesPngResponse(json, PROVIDER_ID);
 }
 var nanobananaProvider = {
   id: PROVIDER_ID,
@@ -376,29 +632,32 @@ var nanobananaProvider = {
     if (req.referenceImages.length > maxReferences) {
       throw new ProviderError(`\u5F53\u524D AI \u670D\u52A1\u6700\u591A\u652F\u6301 ${maxReferences} \u5F20\u53C2\u8003\u56FE`, 400, PROVIDER_ID, "invalid_request");
     }
-    if (req.referenceImages.length > 1 && (!capabilities.supportsMultiReference || !capabilities.supportsImageArray)) {
-      throw new ProviderError("\u5F53\u524D AI \u670D\u52A1\u4E0D\u652F\u6301\u591A\u53C2\u8003\u56FE\uFF0C\u8BF7\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID, "invalid_request");
+    if (req.referenceImages.length > 1 && !capabilities.supportsMultiReference) {
+      throw new ProviderError("\u5F53\u524D AI \u670D\u52A1\u672A\u5F00\u542F\u591A\u53C2\u8003\u56FE\uFF0C\u8BF7\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID, "invalid_request");
     }
+    if (req.referenceImages.length > 1 && req.mask) {
+      throw new ProviderError("\u591A\u53C2\u8003\u56FE\u62FC\u56FE\u6682\u4E0D\u652F\u6301\u8499\u7248\uFF0C\u8BF7\u79FB\u9664\u8499\u7248\u6216\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID, "invalid_request");
+    }
+    const referenceUpload = await prepareImage2ReferenceUpload(req.referenceImages);
+    const prompt = promptWithImageLayout(req.prompt, req.referenceImages.length);
     const url = `${config.change2proBaseUrl()}/images/edits`;
     const res = await fetchWithRetry(
       url,
       () => {
         const form = new FormData();
         form.append("model", config.nanobananaModel());
-        form.append("prompt", req.prompt);
-        form.append("size", aspectRatioToSize(req.aspectRatio));
+        form.append("prompt", prompt);
+        if (req.aspectRatio) form.append("size", aspectRatioToSize(req.aspectRatio));
+        form.append("quality", "low");
+        form.append("output_format", "png");
         if (capabilities.supportsBatchN) {
           form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize))));
         }
-        req.referenceImages.forEach((ref, index) => {
-          const { mime, buffer } = parseDataUrl(ref);
-          const ext = mime.split("/")[1] ?? "png";
-          form.append(
-            capabilities.supportsImageArray ? "image[]" : "image",
-            new Blob([new Uint8Array(buffer)], { type: mime }),
-            `ref-${index}.${ext}`
-          );
-        });
+        form.append(
+          "image",
+          new Blob([new Uint8Array(referenceUpload.buffer)], { type: referenceUpload.mime }),
+          referenceUpload.filename
+        );
         if (req.mask) {
           const { mime, buffer } = parseDataUrl(req.mask);
           form.append("mask", new Blob([new Uint8Array(buffer)], { type: mime }), "mask.png");
@@ -412,37 +671,13 @@ var nanobananaProvider = {
       { providerId: PROVIDER_ID }
     );
     const json = await res.json();
-    if (json.error) {
-      throw providerErrorFromMessage(json.error.message ?? "images api error", PROVIDER_ID, json.error.code);
-    }
-    const images = [];
-    for (const item of json.data ?? []) {
-      if (item.b64_json) images.push(toDataUrl(item.b64_json));
-      else if (item.url) images.push(item.url);
-    }
-    if (images.length === 0) {
-      throw new ProviderError("AI \u670D\u52A1\u672A\u8FD4\u56DE\u56FE\u7247\uFF0C\u8BF7\u91CD\u8BD5", 502, PROVIDER_ID, "empty_response");
-    }
+    const images = await parseGptImagesPngResponse(json, PROVIDER_ID);
     return { images, model: config.nanobananaModel() };
   }
 };
 
 // server/providers/image2.ts
 var PROVIDER_ID2 = "gpt-image-2";
-function parseImagesResponse(json) {
-  if (json.error) {
-    throw providerErrorFromMessage(json.error.message ?? "images api error", PROVIDER_ID2);
-  }
-  const images = [];
-  for (const item of json.data ?? []) {
-    if (item.b64_json) images.push(toDataUrl(item.b64_json));
-    else if (item.url) images.push(item.url);
-  }
-  if (images.length === 0) {
-    throw new ProviderError("AI \u670D\u52A1\u672A\u8FD4\u56DE\u56FE\u7247\uFF0C\u8BF7\u91CD\u8BD5", 502, PROVIDER_ID2, "empty_response");
-  }
-  return images;
-}
 var image2Provider = {
   id: PROVIDER_ID2,
   /** 无参考图：/v1/images/generations */
@@ -469,7 +704,7 @@ var image2Provider = {
       { providerId: PROVIDER_ID2 }
     );
     const json = await res.json();
-    return { images: parseImagesResponse(json), model: config.image2Model() };
+    return { images: await parseGptImagesPngResponse(json, PROVIDER_ID2), model: config.image2Model() };
   },
   /** 有参考图：/v1/images/edits，multipart form 上传 */
   async edit(req) {
@@ -481,25 +716,32 @@ var image2Provider = {
     if (req.referenceImages.length > maxReferences) {
       throw new ProviderError(`\u5F53\u524D AI \u670D\u52A1\u6700\u591A\u652F\u6301 ${maxReferences} \u5F20\u53C2\u8003\u56FE`, 400, PROVIDER_ID2, "invalid_request");
     }
-    if (req.referenceImages.length > 1 && (!capabilities.supportsMultiReference || !capabilities.supportsImageArray)) {
-      throw new ProviderError("\u5F53\u524D AI \u670D\u52A1\u4E0D\u652F\u6301\u591A\u53C2\u8003\u56FE\uFF0C\u8BF7\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID2, "invalid_request");
+    if (req.referenceImages.length > 1 && !capabilities.supportsMultiReference) {
+      throw new ProviderError("\u5F53\u524D AI \u670D\u52A1\u672A\u5F00\u542F\u591A\u53C2\u8003\u56FE\uFF0C\u8BF7\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID2, "invalid_request");
     }
+    if (req.referenceImages.length > 1 && req.mask) {
+      throw new ProviderError("\u591A\u53C2\u8003\u56FE\u62FC\u56FE\u6682\u4E0D\u652F\u6301\u8499\u7248\uFF0C\u8BF7\u79FB\u9664\u8499\u7248\u6216\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID2, "invalid_request");
+    }
+    const referenceUpload = await prepareImage2ReferenceUpload(req.referenceImages);
+    const prompt = promptWithImageLayout(req.prompt, req.referenceImages.length);
     const url = `${config.change2proBaseUrl()}/images/edits`;
     const res = await fetchWithRetry(
       url,
       () => {
         const form = new FormData();
         form.append("model", config.image2Model());
-        form.append("prompt", req.prompt);
-        form.append("size", aspectRatioToSize(req.aspectRatio));
+        form.append("prompt", prompt);
+        if (req.aspectRatio) form.append("size", aspectRatioToSize(req.aspectRatio));
+        form.append("quality", "low");
+        form.append("output_format", "png");
         if (capabilities.supportsBatchN) {
           form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize))));
         }
-        req.referenceImages.forEach((ref, i) => {
-          const { mime, buffer } = parseDataUrl(ref);
-          const ext = mime.split("/")[1] ?? "png";
-          form.append(capabilities.supportsImageArray ? "image[]" : "image", new Blob([new Uint8Array(buffer)], { type: mime }), `ref-${i}.${ext}`);
-        });
+        form.append(
+          "image",
+          new Blob([new Uint8Array(referenceUpload.buffer)], { type: referenceUpload.mime }),
+          referenceUpload.filename
+        );
         if (req.mask) {
           const { mime, buffer } = parseDataUrl(req.mask);
           form.append("mask", new Blob([new Uint8Array(buffer)], { type: mime }), "mask.png");
@@ -513,7 +755,7 @@ var image2Provider = {
       { providerId: PROVIDER_ID2 }
     );
     const json = await res.json();
-    return { images: parseImagesResponse(json), model: config.image2Model() };
+    return { images: await parseGptImagesPngResponse(json, PROVIDER_ID2), model: config.image2Model() };
   }
 };
 
@@ -578,71 +820,7 @@ import { isIP } from "node:net";
 import http from "node:http";
 import https from "node:https";
 import { nanoid } from "nanoid";
-import sharp from "sharp";
-
-// server/lib/imageValidation.ts
-var ALLOWED_IMAGE_MIMES = ["image/png", "image/jpeg", "image/webp", "image/gif"];
-var MAX_IMAGE_BYTES = 20 * 1024 * 1024;
-var ImageValidationError = class extends Error {
-  constructor(message) {
-    super(message);
-    this.name = "ImageValidationError";
-  }
-};
-function hasMagic(buffer, bytes, offset = 0) {
-  return bytes.every((byte, index) => buffer[offset + index] === byte);
-}
-function detectImageMime(buffer) {
-  if (buffer.length >= 8 && hasMagic(buffer, [137, 80, 78, 71, 13, 10, 26, 10])) {
-    return "image/png";
-  }
-  if (buffer.length >= 3 && hasMagic(buffer, [255, 216, 255])) return "image/jpeg";
-  if (buffer.length >= 12 && buffer.toString("ascii", 0, 4) === "RIFF" && buffer.toString("ascii", 8, 12) === "WEBP") {
-    return "image/webp";
-  }
-  if (buffer.length >= 6) {
-    const signature = buffer.toString("ascii", 0, 6);
-    if (signature === "GIF87a" || signature === "GIF89a") return "image/gif";
-  }
-  return null;
-}
-function validateImageDataUrl(dataUrl, maxBytes = MAX_IMAGE_BYTES) {
-  if (typeof dataUrl !== "string") throw new ImageValidationError("image dataURL must be a string");
-  const match = /^data:([^;,]+);base64,([A-Za-z0-9+/]*={0,2})$/.exec(dataUrl);
-  if (!match) throw new ImageValidationError("invalid image dataURL (strict base64 required)");
-  const mime = match[1].toLowerCase();
-  if (!ALLOWED_IMAGE_MIMES.includes(mime)) {
-    throw new ImageValidationError(`unsupported image MIME: ${mime}`);
-  }
-  const encoded = match[2];
-  if (encoded.length === 0 || encoded.length % 4 !== 0) {
-    throw new ImageValidationError("invalid image base64 payload");
-  }
-  if (encoded.includes("=") && !/^[A-Za-z0-9+/]+={1,2}$/.test(encoded)) {
-    throw new ImageValidationError("invalid image base64 padding");
-  }
-  const estimatedBytes = Math.floor(encoded.length * 3 / 4) - (encoded.endsWith("==") ? 2 : encoded.endsWith("=") ? 1 : 0);
-  if (estimatedBytes > maxBytes) throw new ImageValidationError(`image too large (limit ${maxBytes} bytes)`);
-  const buffer = Buffer.from(encoded, "base64");
-  if (buffer.length === 0 || buffer.length !== estimatedBytes) {
-    throw new ImageValidationError("invalid image base64 payload");
-  }
-  if (buffer.toString("base64") !== encoded) {
-    throw new ImageValidationError("non-canonical image base64 payload");
-  }
-  const detected = detectImageMime(buffer);
-  if (!detected) throw new ImageValidationError("unrecognized image file signature");
-  if (detected !== mime) {
-    throw new ImageValidationError(`image MIME/signature mismatch: declared ${mime}, detected ${detected}`);
-  }
-  return { mime, buffer };
-}
-function isLocalImageReference(value) {
-  if (typeof value !== "string") return false;
-  return /^\/api\/files\/[A-Za-z0-9_-]{1,128}\.(?:png|jpe?g|webp|gif)$/.test(value);
-}
-
-// server/lib/fileStore.ts
+import sharp3 from "sharp";
 var MIME_EXT = {
   "image/png": "png",
   "image/jpeg": "jpg",
@@ -679,7 +857,7 @@ async function ensureThumbnail(id) {
     if (fs2.existsSync(target) && fs2.statSync(target).mtimeMs >= sourceStat.mtimeMs) return target;
     const temporary = path2.join(thumbnailsDir(), `.${id}.${nanoid(6)}.tmp.webp`);
     try {
-      await sharp(source, { animated: false, failOn: "error" }).rotate().resize({ width: 384, height: 384, fit: "inside", withoutEnlargement: true }).webp({ quality: 78, effort: 4 }).toFile(temporary);
+      await sharp3(source, { animated: false, failOn: "error" }).rotate().resize({ width: 384, height: 384, fit: "inside", withoutEnlargement: true }).webp({ quality: 78, effort: 4 }).toFile(temporary);
       fs2.renameSync(temporary, target);
       return target;
     } finally {
@@ -949,11 +1127,202 @@ async function persistImageRef(ref) {
   return saveDataUrl(dataUrl).url;
 }
 
-// server/routes/generate.ts
-import { nanoid as nanoid4 } from "nanoid";
+// server/lib/imagePostProcessing.ts
+import sharp4 from "sharp";
+var EXACT_ASPECT_DIMENSIONS = {
+  "1:1": { width: 1024, height: 1024 },
+  "3:4": { width: 1152, height: 1536 },
+  "4:3": { width: 1536, height: 1152 },
+  "9:16": { width: 864, height: 1536 },
+  "16:9": { width: 1536, height: 864 }
+};
+var WEBP_QUALITIES = [92, 84, 76, 68, 60, 50, 40, 30, 20, 10];
+var SHARP_INPUT_OPTIONS = {
+  animated: false,
+  failOn: "warning",
+  limitInputPixels: 4e7
+};
+function isExactAspectRatio(value) {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(EXACT_ASPECT_DIMENSIONS, value);
+}
+function isUpscaleSize(value) {
+  return value === "2K" || value === "4K";
+}
+function normalizeExactAspectRatio(value) {
+  return isExactAspectRatio(value) ? value : "1:1";
+}
+function normalizeUpscaleSize(value) {
+  return isUpscaleSize(value) ? value : "2K";
+}
+async function imageRefToBuffer(ref) {
+  const dataUrl = await normalizeImageRef(ref);
+  return validateImageDataUrl(dataUrl).buffer;
+}
+async function encodeWebpWithinLimit(image) {
+  for (const quality of WEBP_QUALITIES) {
+    const output = await image.clone().webp({ quality, effort: 4, smartSubsample: true }).toBuffer();
+    if (output.byteLength <= MAX_IMAGE_BYTES) return output;
+  }
+  throw new Error(`processed image exceeds ${MAX_IMAGE_BYTES} bytes even at minimum quality`);
+}
+function toWebpDataUrl(buffer) {
+  return `data:image/webp;base64,${buffer.toString("base64")}`;
+}
+async function fitGeneratedImageToAspect(ref, aspectRatio) {
+  return withImageProcessingSlot(async () => {
+    const normalizedAspectRatio = normalizeExactAspectRatio(aspectRatio);
+    const input = await imageRefToBuffer(ref);
+    const { width, height } = EXACT_ASPECT_DIMENSIONS[normalizedAspectRatio];
+    const source = sharp4(input, SHARP_INPUT_OPTIONS).rotate();
+    const { dominant } = await source.clone().stats();
+    const background = { r: dominant.r, g: dominant.g, b: dominant.b, alpha: 1 };
+    const output = await encodeWebpWithinLimit(
+      source.resize({ width, height, fit: "contain", position: "centre", background }).flatten({ background }).toColourspace("srgb")
+    );
+    return toWebpDataUrl(output);
+  });
+}
+async function upscaleImageToLongEdge(ref, imageSize) {
+  return withImageProcessingSlot(async () => {
+    const normalizedImageSize = normalizeUpscaleSize(imageSize);
+    const input = await imageRefToBuffer(ref);
+    const longEdge = normalizedImageSize === "4K" ? 4096 : 2048;
+    const output = await encodeWebpWithinLimit(
+      sharp4(input, SHARP_INPUT_OPTIONS).rotate().resize({ width: longEdge, height: longEdge, fit: "inside" }).toColourspace("srgb")
+    );
+    return toWebpDataUrl(output);
+  });
+}
 
-// server/lib/auth.ts
-import { createHash, randomBytes as randomBytes2 } from "node:crypto";
+// src/lib/colors.ts
+var COLOR_CATEGORIES = [
+  {
+    id: "neutral",
+    label: "\u4E2D\u6027\u57FA\u7840\u8272",
+    swatches: [
+      { name: "\u78B3\u7D20\u9ED1", hex: "#161616" },
+      { name: "\u68D5\u9ED1", hex: "#2B1D16" },
+      { name: "\u70AD\u9ED1", hex: "#1A1A1A" },
+      { name: "\u66AE\u8272\u7070", hex: "#6B6B70" },
+      { name: "\u70DF\u7070", hex: "#6E6E6E" },
+      { name: "\u6DF1\u6D77\u9E25\u7070", hex: "#8B9296" },
+      { name: "\u6C34\u6CE5\u7070", hex: "#9A9A98" },
+      { name: "\u5927\u8C61\u7070", hex: "#8A8378" },
+      { name: "\u66AE\u6C99\u7070", hex: "#A39B8B" },
+      { name: "\u4E91\u70DF\u7070", hex: "#B9B7B2" },
+      { name: "\u6D45\u7070", hex: "#C8C8C8" },
+      { name: "\u73CD\u73E0\u767D", hex: "#F2EFE9" },
+      { name: "\u71D5\u9EA6\u767D", hex: "#EDE6D6" },
+      { name: "\u739B\u7459\u767D", hex: "#E9E4DA" },
+      { name: "\u7C73\u767D", hex: "#F5F0E6" },
+      { name: "\u67D4\u548C\u7C73", hex: "#E5DCC8" },
+      { name: "\u5976\u674F\u7C73", hex: "#F0E4CE" },
+      { name: "\u7EAF\u767D", hex: "#FFFFFF" },
+      { name: "\u9999\u69DF\u8272", hex: "#F0DCB8" },
+      { name: "\u9A7C\u8272", hex: "#C19A6B" },
+      { name: "\u5361\u5176", hex: "#B8A47E" },
+      { name: "\u5496\u5561", hex: "#6F4E37" },
+      { name: "\u6989\u6728\u8272", hex: "#A67B4F" },
+      { name: "\u7126\u7CD6", hex: "#A0522D" }
+    ]
+  },
+  {
+    id: "warm",
+    label: "\u6696\u8272\u7CFB",
+    swatches: [
+      // 红
+      { name: "\u7194\u5CA9\u7EA2", hex: "#B03A2E" },
+      { name: "\u4E2D\u56FD\u7EA2", hex: "#DE2910" },
+      { name: "\u6B63\u7EA2", hex: "#C8102E" },
+      { name: "\u6A31\u6843\u7EA2", hex: "#C2183C" },
+      { name: "\u6CE2\u826E\u7B2C\u7EA2", hex: "#5C1A24" },
+      { name: "\u9152\u7EA2", hex: "#722F37" },
+      { name: "\u6885\u6D1B\u8461\u8404\u9152\u7EA2", hex: "#6E2438" },
+      { name: "\u7816\u7EA2", hex: "#B5493A" },
+      // 粉
+      { name: "\u8393\u679C\u7C89", hex: "#D98CA6" },
+      { name: "\u82AD\u6BD4\u7C89", hex: "#E0219C" },
+      { name: "\u73CA\u745A\u7C89", hex: "#F88379" },
+      { name: "\u85D5\u7C89", hex: "#E8C4C4" },
+      { name: "\u73AB\u7470\u8336", hex: "#C08585" },
+      { name: "\u96FE\u73AB\u7470\u8272", hex: "#B48A8C" },
+      { name: "\u7070\u7C89\u73AB", hex: "#C4A4A8" },
+      { name: "\u73AB\u7470\u91D1", hex: "#B76E79" },
+      // 橙
+      { name: "\u7231\u9A6C\u4ED5\u6A59", hex: "#F37021" },
+      { name: "\u6A58\u6A59", hex: "#E8752A" },
+      { name: "\u67F3\u6A59\u6C41\u6A58", hex: "#F28C28" },
+      { name: "\u9999\u74DC\u6A59", hex: "#F2A65A" },
+      { name: "\u67D4\u548C\u6843", hex: "#F5CBA7" },
+      // 黄/金
+      { name: "\u82A6\u82C7\u9EC4", hex: "#D9C97A" },
+      { name: "\u900F\u660E\u9EC4", hex: "#F5E663" },
+      { name: "\u9E45\u9EC4", hex: "#F2D16B" },
+      { name: "\u59DC\u9EC4", hex: "#D9A441" },
+      { name: "\u91D1\u9EA6\u9EC4", hex: "#D9B24A" },
+      { name: "\u7425\u73C0\u9EC4", hex: "#D99400" },
+      { name: "\u91D1\u68D5\u6988\u8272", hex: "#C9A227" },
+      { name: "\u91D1\u5408\u6B22", hex: "#C77F2F" },
+      { name: "\u9999\u69DF\u91D1", hex: "#D4C5A0" },
+      // 棕/赭
+      { name: "\u8D64\u8910\u8D6D", hex: "#8C4A2F" },
+      { name: "\u6817\u8D64\u8272", hex: "#7A3B2E" },
+      { name: "\u7EA2\u68D5\u8272", hex: "#8B3A2A" },
+      { name: "\u62FF\u94C1\u68D5", hex: "#9C7A5B" },
+      { name: "\u8DEF\u6613\u5A01\u767B\u68D5", hex: "#4E3424" },
+      { name: "\u51E1\u6234\u514B\u68D5", hex: "#3D2B1F" },
+      { name: "\u6DF1\u7119\u68D5", hex: "#4A2E1E" },
+      { name: "\u5DE7\u514B\u529B\u8272", hex: "#5C3A24" },
+      { name: "\u7194\u5CA9\u70DF\u96FE", hex: "#7A6E6A" }
+    ]
+  },
+  {
+    id: "cool",
+    label: "\u51B7\u8272\u7CFB",
+    swatches: [
+      // 绿
+      { name: "\u7FE0\u7389\u7EFF", hex: "#2E8B6E" },
+      { name: "\u58A8\u7EFF", hex: "#1F3D2B" },
+      { name: "\u6DF1\u82D4\u7EFF", hex: "#3B4A2F" },
+      { name: "\u6DF1\u6A44\u6984\u7EFF", hex: "#4A5423" },
+      { name: "\u6A44\u6984\u7EFF", hex: "#6B7C4A" },
+      { name: "\u83B3\u841D\u7EFF", hex: "#6E7F4E" },
+      { name: "\u8C5A\u8349\u7EFF", hex: "#8A9A4B" },
+      { name: "\u8584\u8377\u7EFF", hex: "#98D8C8" },
+      // 蓝
+      { name: "\u8482\u8299\u5C3C\u84DD", hex: "#81D8D0" },
+      { name: "\u6D77\u6EE8\u84DD", hex: "#4FA3C2" },
+      { name: "\u5361\u5E03\u91CC\u84DD", hex: "#3579A8" },
+      { name: "\u8FDC\u5C71\u84DD", hex: "#7B9BB8" },
+      { name: "\u96FE\u973E\u84DD", hex: "#8FA8BF" },
+      { name: "\u725B\u4ED4\u84DD", hex: "#3B5B7C" },
+      { name: "\u85CF\u9752", hex: "#1B2A4A" },
+      { name: "\u7FA4\u9752", hex: "#4166B0" },
+      { name: "\u514B\u83B1\u56E0\u84DD", hex: "#002FA7" },
+      { name: "\u7075\u6C14\u975B\u84DD", hex: "#3F4E8C" },
+      // 紫
+      { name: "\u82CB\u83DC\u7D2B", hex: "#9B2D5F" },
+      { name: "\u7D2B\u7F57\u5170\u8272", hex: "#7F5AA2" },
+      { name: "\u85B0\u8863\u8349\u7D2B", hex: "#B4A7D6" },
+      { name: "\u9999\u828B\u7D2B", hex: "#B8A9C9" },
+      { name: "\u70DF\u718F\u7D2B", hex: "#6E5A72" },
+      { name: "\u6DF1\u7D2B", hex: "#4A3B5C" },
+      { name: "\u94F6\u7070", hex: "#C0C0C0" }
+    ]
+  }
+];
+var COLOR_PRESETS = COLOR_CATEGORIES.flatMap((c) => c.swatches);
+function nameOfColor(hex) {
+  return COLOR_PRESETS.find((c) => c.hex.toLowerCase() === hex.toLowerCase())?.name ?? hex;
+}
+function buildRecolorPrompt(colors) {
+  const list = colors.map((hex) => `${nameOfColor(hex)}(${hex})`).join("\u3001");
+  return `\u4FDD\u6301\u670D\u88C5\u7684\u7248\u578B\u3001\u6B3E\u5F0F\u7EC6\u8282\u3001\u6784\u56FE\u548C\u5149\u7EBF\u5B8C\u5168\u4E0D\u53D8\uFF0C\u4EC5\u5C06\u9762\u6599\u914D\u8272\u66FF\u6362\u4E3A\uFF1A${list}\u3002\u914D\u8272\u5E94\u7528\u4E8E\u9762\u6599\u4E3B\u4F53\uFF0C\u5448\u73B0\u771F\u5B9E\u9762\u6599\u8D28\u611F\u4E0E\u51C6\u786E\u8272\u5F69\uFF0C\u65E0\u6587\u5B57\u65E0\u6C34\u5370\u3002`;
+}
+
+// server/lib/generationRecords.ts
+import { nanoid as nanoid3 } from "nanoid";
+import path3 from "node:path";
 
 // server/lib/database.ts
 import pg from "pg";
@@ -1329,7 +1698,383 @@ async function databaseReady() {
   }
 }
 
+// server/lib/generationRecords.ts
+async function createGenerationRecord(runId, context, startedAt) {
+  await query(`
+    INSERT INTO generation_runs (
+      id, owner_id, project_id, project_name, node_id, node_label, kind, prompt,
+      parameters_json, reference_images_json, requested_count, status, started_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued', $12)
+  `, [
+    runId,
+    context.userId,
+    context.projectId ?? null,
+    context.projectName ?? null,
+    context.nodeId,
+    context.nodeLabel,
+    context.kind,
+    context.prompt ?? null,
+    JSON.stringify(context.parameters ?? {}),
+    JSON.stringify(context.referenceImages ?? []),
+    context.requestedCount,
+    startedAt
+  ]);
+}
+async function markGenerationRunning(runId, startedAt) {
+  await query("UPDATE generation_runs SET status = 'running', started_at = $1 WHERE id = $2", [startedAt, runId]);
+}
+async function registerGeneratedFiles(context, runId, nodeId, images, createdAt) {
+  const createdAtIso = new Date(createdAt).toISOString();
+  await transaction(async (client) => {
+    for (const image of images) {
+      if (!image.startsWith("/api/files/")) continue;
+      await client.query(`
+        INSERT INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)
+        VALUES ($1, $2, 'generated', $3, $4, $5, $6)
+        ON CONFLICT (id) DO NOTHING
+      `, [path3.basename(image), context.userId, context.projectId ?? null, nodeId, runId, createdAtIso]);
+    }
+  });
+}
+async function completeGenerationRecord(args) {
+  await transaction(async (client) => {
+    const run = await queryOne(
+      "SELECT owner_id, project_id, node_id FROM generation_runs WHERE id = $1 FOR UPDATE",
+      [args.runId],
+      client
+    );
+    if (!run) return;
+    await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [args.runId]);
+    for (const [index, image] of args.images.entries()) {
+      await client.query(`
+        INSERT INTO generation_outputs (id, run_id, image, prompt, status, error, created_at)
+        VALUES ($1, $2, $3, $4, 'success', NULL, $5)
+      `, [nanoid3(12), args.runId, image, args.prompts?.[index] ?? null, args.finishedAt + index]);
+      if (image.startsWith("/api/files/")) {
+        await client.query(`
+          INSERT INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)
+          VALUES ($1, $2, 'generated', $3, $4, $5, $6)
+          ON CONFLICT (id) DO NOTHING
+        `, [path3.basename(image), run.owner_id, run.project_id, run.node_id, args.runId, new Date(args.finishedAt).toISOString()]);
+      }
+    }
+    for (const [index, failure] of (args.failures ?? []).entries()) {
+      await client.query(`
+        INSERT INTO generation_outputs (id, run_id, image, prompt, status, error, created_at)
+        VALUES ($1, $2, '', $3, 'error', $4, $5)
+      `, [nanoid3(12), args.runId, failure.prompt ?? null, failure.error, args.finishedAt + args.images.length + index]);
+    }
+    const warning = args.failures?.length ? `${args.failures.length} \u4E2A\u751F\u6210\u4EFB\u52A1\u5931\u8D25` : null;
+    await client.query(`
+      UPDATE generation_runs SET status = 'success', successful_count = $1, provider_requests = $2,
+        model = $3, error = $4, finished_at = $5 WHERE id = $6
+    `, [args.images.length, args.providerRequests, args.model ?? null, warning, args.finishedAt, args.runId]);
+    if (args.images.length > 0) {
+      await client.query(`
+        INSERT INTO usage_events (
+          id, owner_id, run_id, project_id, node_id, model, successful_count,
+          provider_requests, duration_ms, created_at
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        ON CONFLICT (run_id) DO UPDATE SET
+          model = excluded.model,
+          successful_count = excluded.successful_count,
+          provider_requests = excluded.provider_requests,
+          duration_ms = excluded.duration_ms,
+          created_at = excluded.created_at
+      `, [
+        nanoid3(12),
+        run.owner_id,
+        args.runId,
+        run.project_id,
+        run.node_id,
+        args.model ?? null,
+        args.images.length,
+        args.providerRequests,
+        Math.max(0, args.finishedAt - args.startedAt),
+        new Date(args.finishedAt).toISOString()
+      ]);
+    }
+  });
+}
+async function failGenerationRecord(runId, error, finishedAt) {
+  await transaction(async (client) => {
+    await client.query("UPDATE generation_runs SET status = 'error', error = $1, finished_at = $2 WHERE id = $3", [
+      error,
+      finishedAt,
+      runId
+    ]);
+    await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [runId]);
+    await client.query(`
+      INSERT INTO generation_outputs (id, run_id, image, status, error, created_at)
+      SELECT $1, id, '', 'error', $2, $3 FROM generation_runs WHERE id = $4
+    `, [nanoid3(12), error, finishedAt, runId]);
+  });
+}
+
+// server/engine/runner.ts
+var DEFAULT_PROMPTS = {
+  "sketch-to-render": "\u5C06\u7EBF\u7A3F\u6E32\u67D3\u4E3A\u5199\u5B9E\u670D\u88C5\u6548\u679C\u56FE\uFF0C\u4FDD\u6301\u7ED3\u6784\u4E0E\u8F6E\u5ED3\uFF0C\u9AD8\u7AEF\u65F6\u88C5\u6444\u5F71\u8D28\u611F",
+  "ai-modify": "\u5728\u4FDD\u6301\u6574\u4F53\u7248\u578B\u4E0D\u53D8\u7684\u524D\u63D0\u4E0B\uFF0C\u4F18\u5316\u670D\u88C5\u7EC6\u8282\u8BBE\u8BA1",
+  "fabric-recolor": "\u4FDD\u6301\u670D\u88C5\u6B3E\u5F0F\u3001\u7EC6\u8282\u3001\u5149\u5F71\u4E0E\u80CC\u666F\u4E0D\u53D8\uFF0C\u4EC5\u66FF\u6362\u9762\u6599\u8D28\u611F"
+};
+var runs = /* @__PURE__ */ new Map();
+var MAX_FINISHED_RUNS = 50;
+var FINISHED_RUN_TTL_MS = 30 * 60 * 1e3;
+function pruneRuns() {
+  const now = Date.now();
+  const finished = [];
+  for (const run of runs.values()) {
+    if (!run.finished) continue;
+    if (run.emitter.listenerCount("event") > 0) continue;
+    if (now - run.createdAt > FINISHED_RUN_TTL_MS) {
+      runs.delete(run.id);
+    } else {
+      finished.push(run);
+    }
+  }
+  if (finished.length > MAX_FINISHED_RUNS) {
+    finished.sort((a, b) => a.createdAt - b.createdAt);
+    for (const run of finished.slice(0, finished.length - MAX_FINISHED_RUNS)) {
+      runs.delete(run.id);
+    }
+  }
+}
+function getRunForUser(id, ownerId) {
+  const run = runs.get(id);
+  return run?.ownerId === ownerId ? run : void 0;
+}
+async function createRun(plan, ownerId, recordContext) {
+  if (!ownerId.trim()) throw new Error("run ownerId is required");
+  if (recordContext && recordContext.userId !== ownerId) {
+    throw new Error("run ownerId must match recordContext.userId");
+  }
+  pruneRuns();
+  const run = {
+    id: nanoid4(10),
+    ownerId,
+    plan,
+    emitter: new EventEmitter(),
+    events: [],
+    finished: false,
+    createdAt: Date.now(),
+    recordContext
+  };
+  run.emitter.setMaxListeners(50);
+  runs.set(run.id, run);
+  if (recordContext) await createGenerationRecord(run.id, recordContext, run.createdAt);
+  setImmediate(() => {
+    executeRun(run).catch(async (err) => {
+      const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
+      if (run.recordContext) await failGenerationRecord(run.id, message, Date.now());
+      emit(run, { type: "run-error", error: message });
+    });
+  });
+  return run;
+}
+function emit(run, event) {
+  const sequenced = { ...event, seq: run.events.length + 1 };
+  run.events.push(sequenced);
+  run.emitter.emit("event", sequenced);
+  if (sequenced.type === "done" || sequenced.type === "run-error") {
+    run.finished = true;
+    run.emitter.emit("finish");
+  }
+}
+async function executeRun(run) {
+  const outputs = /* @__PURE__ */ new Map();
+  for (const step of run.plan.steps) {
+    const inputImages = (step.upstream ?? []).flatMap(
+      (u) => outputs.get(u.nodeId) ?? u.images
+    );
+    if (NODE_SPECS[step.kind].providerId && inputImages.length > MAX_REFERENCE_IMAGES) {
+      const message = `Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`;
+      const finishedAt = Date.now();
+      emit(run, { type: "node-status", nodeId: step.nodeId, status: "error", error: message, finishedAt });
+      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      return;
+    }
+    if (NODE_SPECS[step.kind].providerId && step.kind !== "sketch-to-render" && inputImages.length === 0) {
+      const message = `Node ${step.nodeId} requires an upstream image`;
+      const finishedAt = Date.now();
+      emit(run, {
+        type: "node-status",
+        nodeId: step.nodeId,
+        status: "error",
+        error: message,
+        finishedAt
+      });
+      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      return;
+    }
+    const startedAt = Date.now();
+    if (run.recordContext?.nodeId === step.nodeId) await markGenerationRunning(run.id, startedAt);
+    emit(run, { type: "node-status", nodeId: step.nodeId, status: "running", startedAt });
+    try {
+      const result = await executeStep(step, inputImages);
+      const persisted = await persistOutputImages(result.images);
+      if (run.recordContext) {
+        await registerGeneratedFiles(run.recordContext, run.id, step.nodeId, persisted, Date.now());
+      }
+      outputs.set(step.nodeId, persisted);
+      const finishedAt = Date.now();
+      if (run.recordContext?.nodeId === step.nodeId) {
+        await completeGenerationRecord({
+          runId: run.id,
+          images: persisted,
+          prompts: result.prompts,
+          failures: result.failures,
+          model: result.model,
+          providerRequests: result.providerRequests,
+          startedAt,
+          finishedAt
+        });
+      }
+      const partialWarning = result.failures?.length ? `${result.failures.length} \u4E2A\u751F\u6210\u4EFB\u52A1\u5931\u8D25` : void 0;
+      emit(run, {
+        type: "node-status",
+        nodeId: step.nodeId,
+        status: "success",
+        images: persisted,
+        error: partialWarning,
+        model: result.model,
+        prompts: result.prompts,
+        failures: result.failures,
+        startedAt,
+        finishedAt
+      });
+    } catch (err) {
+      const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
+      const finishedAt = Date.now();
+      if (run.recordContext?.nodeId === step.nodeId) await failGenerationRecord(run.id, message, finishedAt);
+      emit(run, {
+        type: "node-status",
+        nodeId: step.nodeId,
+        status: "error",
+        error: message,
+        startedAt,
+        finishedAt
+      });
+      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      return;
+    }
+  }
+  emit(run, { type: "done" });
+}
+async function persistOutputImages(images) {
+  return Promise.all(images.map((img) => persistImageRef(img)));
+}
+async function postProcessGeneratedOutputImages(kind, params, images) {
+  if (kind !== "sketch-to-render" && kind !== "ai-modify" && kind !== "upscale") return images;
+  const aspectRatio = normalizeExactAspectRatio(params.aspectRatio);
+  const imageSize = normalizeUpscaleSize(params.imageSize);
+  const processed = [];
+  for (const image of images) {
+    processed.push(
+      kind === "upscale" ? await upscaleImageToLongEdge(image, imageSize) : await fitGeneratedImageToAspect(image, aspectRatio)
+    );
+  }
+  return processed;
+}
+async function executeStep(step, inputImages, resolveProvider = getProvider) {
+  switch (step.kind) {
+    case "image-input": {
+      const imageUrl = step.params.imageUrl;
+      return { images: imageUrl ? [imageUrl] : [], providerRequests: 0 };
+    }
+    case "result": {
+      return { images: inputImages, providerRequests: 0 };
+    }
+    case "sketch-to-render":
+    case "ai-modify":
+    case "fabric-recolor":
+    case "upscale":
+    case "print-extract":
+    case "print-mutate": {
+      const spec = NODE_SPECS[step.kind];
+      const provider = resolveProvider(spec.providerId);
+      const referenceImages = await resolveImageRefs(inputImages);
+      const fabricImageUrl = step.params.fabricImageUrl;
+      if (step.kind === "fabric-recolor" && fabricImageUrl) {
+        referenceImages.push(...await resolveImageRefs([fabricImageUrl]));
+      }
+      if (referenceImages.length > MAX_REFERENCE_IMAGES) {
+        throw new Error(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
+      }
+      const extra = (step.params.prompt ?? "").trim();
+      if (step.kind === "fabric-recolor") {
+        const colors = Array.isArray(step.params.colors) ? step.params.colors.filter((value) => typeof value === "string") : [];
+        if (colors.length > 0) {
+          const images2 = [];
+          const prompts = [];
+          const failures = [];
+          let model;
+          let providerRequests = 0;
+          for (const color of colors) {
+            const prompt2 = buildRecolorPrompt([color]);
+            try {
+              const result2 = await generateExactImages(provider, { prompt: prompt2, referenceImages }, 1);
+              providerRequests += result2.providerRequests;
+              model = result2.model;
+              for (const image of result2.images) {
+                images2.push(image);
+                prompts.push(prompt2);
+              }
+            } catch (err) {
+              failures.push({
+                prompt: prompt2,
+                error: err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err)
+              });
+            }
+          }
+          if (images2.length === 0) {
+            throw new Error(failures[0]?.error ?? "\u5168\u90E8\u914D\u8272\u751F\u6210\u5931\u8D25");
+          }
+          return { images: images2, prompts, model, providerRequests, failures: failures.length ? failures : void 0 };
+        }
+      }
+      if (step.kind === "print-mutate") {
+        const count = Math.max(1, Math.min(8, Number(step.params.count) || 4));
+        const prompt2 = "\u57FA\u4E8E\u8FD9\u5F20\u5370\u82B1\u56FE\u6848\u751F\u6210\u98CE\u683C\u4E00\u81F4\u7684\u65B0\u53D8\u4F53\uFF1A\u4FDD\u6301\u539F\u6709\u914D\u8272\u4F53\u7CFB\u3001\u827A\u672F\u98CE\u683C\u4E0E\u7B14\u89E6\u8D28\u611F\uFF0C\u91CD\u65B0\u7F16\u6392\u5143\u7D20\u7684\u6784\u56FE\u4E0E\u7EC4\u5408\u65B9\u5F0F\uFF0C\u7EAF\u767D\u80CC\u666F\uFF0C\u9002\u5408\u4F5C\u4E3A\u5370\u82B1\u7D20\u6750\u590D\u7528" + (extra ? `\u3002\u8865\u5145\u8981\u6C42\uFF1A${extra}` : "");
+        const result2 = await generateExactImages(provider, { prompt: prompt2, referenceImages }, count);
+        const failures = result2.failures.map((error) => ({ prompt: prompt2, error }));
+        return {
+          images: result2.images,
+          prompts: result2.images.map(() => prompt2),
+          model: result2.model,
+          providerRequests: result2.providerRequests,
+          failures: failures.length ? failures : void 0
+        };
+      }
+      const prompt = step.kind === "upscale" ? "\u5C06\u8FD9\u5F20\u670D\u88C5\u6548\u679C\u56FE\u653E\u5927\u4E3A\u8D85\u9AD8\u6E05\u7248\u672C\uFF0C\u589E\u5F3A\u9762\u6599\u7EB9\u7406\u3001\u8D70\u7EBF\u4E0E\u8FB9\u7F18\u7EC6\u8282\uFF0C\u4FDD\u6301\u539F\u6709\u6784\u56FE\u3001\u8272\u5F69\u548C\u5149\u5F71\u5B8C\u5168\u4E0D\u53D8" : step.kind === "print-extract" ? "\u63D0\u53D6\u8FD9\u4EF6\u8863\u670D\u4E0A\u7684\u5370\u82B1\u56FE\u6848\uFF1A\u5C06\u5370\u82B1\u5B8C\u6574\u62A0\u51FA\u5E76\u5E73\u94FA\u5C55\u5F00\u4E3A\u89C4\u6574\u7684\u77E9\u5F62\u56FE\u6848\uFF0C\u7EAF\u767D\u80CC\u666F\uFF0C\u53BB\u9664\u8863\u8EAB\u3001\u8936\u76B1\u3001\u9634\u5F71\u548C\u7A7F\u7740\u6548\u679C\uFF0C\u5370\u82B1\u7684\u6BD4\u4F8B\u3001\u7EC6\u8282\u548C\u8272\u5F69\u4E0E\u539F\u56FE\u4FDD\u6301\u4E00\u81F4\uFF0C\u9002\u5408\u4F5C\u4E3A\u5370\u82B1\u7D20\u6750\u590D\u7528" + (extra ? `\u3002\u8865\u5145\u8981\u6C42\uFF1A${extra}` : "") : extra || DEFAULT_PROMPTS[step.kind] || NODE_SPECS[step.kind].description;
+      const request = {
+        prompt,
+        referenceImages: referenceImages.length ? referenceImages : void 0,
+        aspectRatio: step.kind === "sketch-to-render" || step.kind === "ai-modify" ? normalizeExactAspectRatio(step.params.aspectRatio) : step.params.aspectRatio,
+        batchSize: step.params.batchSize,
+        imageSize: step.kind === "upscale" ? normalizeUpscaleSize(step.params.imageSize) : void 0
+      };
+      const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify" ? Math.max(1, Math.min(4, Number(step.params.batchSize) || 1)) : 1;
+      const result = await generateExactImages(provider, request, requestedCount);
+      const images = await postProcessGeneratedOutputImages(step.kind, step.params, result.images);
+      return {
+        images,
+        model: result.model,
+        prompts: images.map(() => prompt),
+        providerRequests: result.providerRequests,
+        failures: result.failures.length ? result.failures.map((error) => ({ prompt, error })) : void 0
+      };
+    }
+  }
+}
+async function resolveImageRefs(refs) {
+  return Promise.all(refs.map(normalizeImageRef));
+}
+
+// server/routes/generate.ts
+import { nanoid as nanoid5 } from "nanoid";
+
 // server/lib/auth.ts
+import { createHash, randomBytes as randomBytes2 } from "node:crypto";
 var SESSION_COOKIE = "gc_session";
 var SESSION_DAYS = 30;
 function sessionHash(token) {
@@ -1457,123 +2202,38 @@ async function pruneExpiredSessions() {
   });
 }
 
-// server/lib/generationRecords.ts
-import { nanoid as nanoid3 } from "nanoid";
-import path3 from "node:path";
-async function createGenerationRecord(runId, context, startedAt) {
-  await query(`
-    INSERT INTO generation_runs (
-      id, owner_id, project_id, project_name, node_id, node_label, kind, prompt,
-      parameters_json, reference_images_json, requested_count, status, started_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued', $12)
-  `, [
-    runId,
-    context.userId,
-    context.projectId ?? null,
-    context.projectName ?? null,
-    context.nodeId,
-    context.nodeLabel,
-    context.kind,
-    context.prompt ?? null,
-    JSON.stringify(context.parameters ?? {}),
-    JSON.stringify(context.referenceImages ?? []),
-    context.requestedCount,
-    startedAt
-  ]);
-}
-async function markGenerationRunning(runId, startedAt) {
-  await query("UPDATE generation_runs SET status = 'running', started_at = $1 WHERE id = $2", [startedAt, runId]);
-}
-async function registerGeneratedFiles(context, runId, nodeId, images, createdAt) {
-  const createdAtIso = new Date(createdAt).toISOString();
-  await transaction(async (client) => {
-    for (const image of images) {
-      if (!image.startsWith("/api/files/")) continue;
-      await client.query(`
-        INSERT INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)
-        VALUES ($1, $2, 'generated', $3, $4, $5, $6)
-        ON CONFLICT (id) DO NOTHING
-      `, [path3.basename(image), context.userId, context.projectId ?? null, nodeId, runId, createdAtIso]);
-    }
-  });
-}
-async function completeGenerationRecord(args) {
-  await transaction(async (client) => {
-    const run = await queryOne(
-      "SELECT owner_id, project_id, node_id FROM generation_runs WHERE id = $1 FOR UPDATE",
-      [args.runId],
-      client
-    );
-    if (!run) return;
-    await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [args.runId]);
-    for (const [index, image] of args.images.entries()) {
-      await client.query(`
-        INSERT INTO generation_outputs (id, run_id, image, prompt, status, error, created_at)
-        VALUES ($1, $2, $3, $4, 'success', NULL, $5)
-      `, [nanoid3(12), args.runId, image, args.prompts?.[index] ?? null, args.finishedAt + index]);
-      if (image.startsWith("/api/files/")) {
-        await client.query(`
-          INSERT INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)
-          VALUES ($1, $2, 'generated', $3, $4, $5, $6)
-          ON CONFLICT (id) DO NOTHING
-        `, [path3.basename(image), run.owner_id, run.project_id, run.node_id, args.runId, new Date(args.finishedAt).toISOString()]);
-      }
-    }
-    for (const [index, failure] of (args.failures ?? []).entries()) {
-      await client.query(`
-        INSERT INTO generation_outputs (id, run_id, image, prompt, status, error, created_at)
-        VALUES ($1, $2, '', $3, 'error', $4, $5)
-      `, [nanoid3(12), args.runId, failure.prompt ?? null, failure.error, args.finishedAt + args.images.length + index]);
-    }
-    const warning = args.failures?.length ? `${args.failures.length} \u4E2A\u751F\u6210\u4EFB\u52A1\u5931\u8D25` : null;
-    await client.query(`
-      UPDATE generation_runs SET status = 'success', successful_count = $1, provider_requests = $2,
-        model = $3, error = $4, finished_at = $5 WHERE id = $6
-    `, [args.images.length, args.providerRequests, args.model ?? null, warning, args.finishedAt, args.runId]);
-    if (args.images.length > 0) {
-      await client.query(`
-        INSERT INTO usage_events (
-          id, owner_id, run_id, project_id, node_id, model, successful_count,
-          provider_requests, duration_ms, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (run_id) DO UPDATE SET
-          model = excluded.model,
-          successful_count = excluded.successful_count,
-          provider_requests = excluded.provider_requests,
-          duration_ms = excluded.duration_ms,
-          created_at = excluded.created_at
-      `, [
-        nanoid3(12),
-        run.owner_id,
-        args.runId,
-        run.project_id,
-        run.node_id,
-        args.model ?? null,
-        args.images.length,
-        args.providerRequests,
-        Math.max(0, args.finishedAt - args.startedAt),
-        new Date(args.finishedAt).toISOString()
-      ]);
-    }
-  });
-}
-async function failGenerationRecord(runId, error, finishedAt) {
-  await transaction(async (client) => {
-    await client.query("UPDATE generation_runs SET status = 'error', error = $1, finished_at = $2 WHERE id = $3", [
-      error,
-      finishedAt,
-      runId
-    ]);
-    await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [runId]);
-    await client.query(`
-      INSERT INTO generation_outputs (id, run_id, image, status, error, created_at)
-      SELECT $1, id, '', 'error', $2, $3 FROM generation_runs WHERE id = $4
-    `, [nanoid3(12), error, finishedAt, runId]);
-  });
-}
-
 // server/routes/generate.ts
 var generateRouter = Router();
+function isDirectGenerateKind(value) {
+  if (typeof value !== "string" || !Object.prototype.hasOwnProperty.call(NODE_SPECS, value)) return false;
+  return Boolean(NODE_SPECS[value].providerId);
+}
+function validateDirectGenerateRequest(kind, request) {
+  if (kind === void 0) return { ok: true };
+  if (!isDirectGenerateKind(kind)) {
+    return { ok: false, error: "kind must identify a supported AI node" };
+  }
+  if (kind === "sketch-to-render" || kind === "ai-modify") {
+    if (typeof request.aspectRatio !== "string" || !Object.prototype.hasOwnProperty.call(EXACT_ASPECT_DIMENSIONS, request.aspectRatio)) {
+      return {
+        ok: false,
+        error: `request.aspectRatio must be one of ${Object.keys(EXACT_ASPECT_DIMENSIONS).join(", ")}`
+      };
+    }
+  }
+  if (kind === "upscale" && request.imageSize !== "2K" && request.imageSize !== "4K") {
+    return { ok: false, error: "request.imageSize must be 2K or 4K" };
+  }
+  return { ok: true, kind };
+}
+function postProcessDirectGenerateImages(kind, request, images) {
+  if (!kind) return Promise.resolve(images);
+  return postProcessGeneratedOutputImages(
+    kind,
+    request,
+    images
+  );
+}
 generateRouter.post("/", async (req, res) => {
   const { providerId, request, projectId, projectName, nodeId, nodeLabel, kind } = req.body;
   if (!providerId || !request?.prompt) {
@@ -1584,7 +2244,12 @@ generateRouter.post("/", async (req, res) => {
     res.status(400).json({ error: `referenceImages must contain at most ${MAX_REFERENCE_IMAGES} images` });
     return;
   }
-  const runId = nanoid4(10);
+  const validation = validateDirectGenerateRequest(kind, request);
+  if (!validation.ok) {
+    res.status(400).json({ error: validation.error });
+    return;
+  }
+  const runId = nanoid5(10);
   const startedAt = Date.now();
   const requestedCount = Math.max(1, Math.min(8, Number(request.batchSize) || 1));
   await createGenerationRecord(runId, {
@@ -1593,7 +2258,7 @@ generateRouter.post("/", async (req, res) => {
     projectName,
     nodeId: nodeId ?? "direct-generate",
     nodeLabel: nodeLabel ?? "\u76F4\u63A5\u751F\u6210",
-    kind: kind ?? "sketch-to-render",
+    kind: validation.kind ?? "sketch-to-render",
     prompt: request.prompt,
     parameters: request,
     referenceImages: request.referenceImages,
@@ -1608,7 +2273,8 @@ generateRouter.post("/", async (req, res) => {
       mask: request.mask ? await normalizeImageRef(request.mask) : void 0
     };
     const raw = await generateExactImages(provider, resolved, requestedCount);
-    const images = await Promise.all(raw.images.map(persistImageRef));
+    const processedImages = await postProcessDirectGenerateImages(validation.kind, resolved, raw.images);
+    const images = await Promise.all(processedImages.map(persistImageRef));
     const finishedAt = Date.now();
     const failures = raw.failures.map((error) => ({ prompt: request.prompt, error }));
     await completeGenerationRecord({
@@ -1785,382 +2451,6 @@ function extractParams(data) {
     case "result":
       return { note: data.note };
   }
-}
-
-// server/engine/runner.ts
-import { EventEmitter } from "node:events";
-import { nanoid as nanoid5 } from "nanoid";
-
-// src/lib/colors.ts
-var COLOR_CATEGORIES = [
-  {
-    id: "neutral",
-    label: "\u4E2D\u6027\u57FA\u7840\u8272",
-    swatches: [
-      { name: "\u78B3\u7D20\u9ED1", hex: "#161616" },
-      { name: "\u68D5\u9ED1", hex: "#2B1D16" },
-      { name: "\u70AD\u9ED1", hex: "#1A1A1A" },
-      { name: "\u66AE\u8272\u7070", hex: "#6B6B70" },
-      { name: "\u70DF\u7070", hex: "#6E6E6E" },
-      { name: "\u6DF1\u6D77\u9E25\u7070", hex: "#8B9296" },
-      { name: "\u6C34\u6CE5\u7070", hex: "#9A9A98" },
-      { name: "\u5927\u8C61\u7070", hex: "#8A8378" },
-      { name: "\u66AE\u6C99\u7070", hex: "#A39B8B" },
-      { name: "\u4E91\u70DF\u7070", hex: "#B9B7B2" },
-      { name: "\u6D45\u7070", hex: "#C8C8C8" },
-      { name: "\u73CD\u73E0\u767D", hex: "#F2EFE9" },
-      { name: "\u71D5\u9EA6\u767D", hex: "#EDE6D6" },
-      { name: "\u739B\u7459\u767D", hex: "#E9E4DA" },
-      { name: "\u7C73\u767D", hex: "#F5F0E6" },
-      { name: "\u67D4\u548C\u7C73", hex: "#E5DCC8" },
-      { name: "\u5976\u674F\u7C73", hex: "#F0E4CE" },
-      { name: "\u7EAF\u767D", hex: "#FFFFFF" },
-      { name: "\u9999\u69DF\u8272", hex: "#F0DCB8" },
-      { name: "\u9A7C\u8272", hex: "#C19A6B" },
-      { name: "\u5361\u5176", hex: "#B8A47E" },
-      { name: "\u5496\u5561", hex: "#6F4E37" },
-      { name: "\u6989\u6728\u8272", hex: "#A67B4F" },
-      { name: "\u7126\u7CD6", hex: "#A0522D" }
-    ]
-  },
-  {
-    id: "warm",
-    label: "\u6696\u8272\u7CFB",
-    swatches: [
-      // 红
-      { name: "\u7194\u5CA9\u7EA2", hex: "#B03A2E" },
-      { name: "\u4E2D\u56FD\u7EA2", hex: "#DE2910" },
-      { name: "\u6B63\u7EA2", hex: "#C8102E" },
-      { name: "\u6A31\u6843\u7EA2", hex: "#C2183C" },
-      { name: "\u6CE2\u826E\u7B2C\u7EA2", hex: "#5C1A24" },
-      { name: "\u9152\u7EA2", hex: "#722F37" },
-      { name: "\u6885\u6D1B\u8461\u8404\u9152\u7EA2", hex: "#6E2438" },
-      { name: "\u7816\u7EA2", hex: "#B5493A" },
-      // 粉
-      { name: "\u8393\u679C\u7C89", hex: "#D98CA6" },
-      { name: "\u82AD\u6BD4\u7C89", hex: "#E0219C" },
-      { name: "\u73CA\u745A\u7C89", hex: "#F88379" },
-      { name: "\u85D5\u7C89", hex: "#E8C4C4" },
-      { name: "\u73AB\u7470\u8336", hex: "#C08585" },
-      { name: "\u96FE\u73AB\u7470\u8272", hex: "#B48A8C" },
-      { name: "\u7070\u7C89\u73AB", hex: "#C4A4A8" },
-      { name: "\u73AB\u7470\u91D1", hex: "#B76E79" },
-      // 橙
-      { name: "\u7231\u9A6C\u4ED5\u6A59", hex: "#F37021" },
-      { name: "\u6A58\u6A59", hex: "#E8752A" },
-      { name: "\u67F3\u6A59\u6C41\u6A58", hex: "#F28C28" },
-      { name: "\u9999\u74DC\u6A59", hex: "#F2A65A" },
-      { name: "\u67D4\u548C\u6843", hex: "#F5CBA7" },
-      // 黄/金
-      { name: "\u82A6\u82C7\u9EC4", hex: "#D9C97A" },
-      { name: "\u900F\u660E\u9EC4", hex: "#F5E663" },
-      { name: "\u9E45\u9EC4", hex: "#F2D16B" },
-      { name: "\u59DC\u9EC4", hex: "#D9A441" },
-      { name: "\u91D1\u9EA6\u9EC4", hex: "#D9B24A" },
-      { name: "\u7425\u73C0\u9EC4", hex: "#D99400" },
-      { name: "\u91D1\u68D5\u6988\u8272", hex: "#C9A227" },
-      { name: "\u91D1\u5408\u6B22", hex: "#C77F2F" },
-      { name: "\u9999\u69DF\u91D1", hex: "#D4C5A0" },
-      // 棕/赭
-      { name: "\u8D64\u8910\u8D6D", hex: "#8C4A2F" },
-      { name: "\u6817\u8D64\u8272", hex: "#7A3B2E" },
-      { name: "\u7EA2\u68D5\u8272", hex: "#8B3A2A" },
-      { name: "\u62FF\u94C1\u68D5", hex: "#9C7A5B" },
-      { name: "\u8DEF\u6613\u5A01\u767B\u68D5", hex: "#4E3424" },
-      { name: "\u51E1\u6234\u514B\u68D5", hex: "#3D2B1F" },
-      { name: "\u6DF1\u7119\u68D5", hex: "#4A2E1E" },
-      { name: "\u5DE7\u514B\u529B\u8272", hex: "#5C3A24" },
-      { name: "\u7194\u5CA9\u70DF\u96FE", hex: "#7A6E6A" }
-    ]
-  },
-  {
-    id: "cool",
-    label: "\u51B7\u8272\u7CFB",
-    swatches: [
-      // 绿
-      { name: "\u7FE0\u7389\u7EFF", hex: "#2E8B6E" },
-      { name: "\u58A8\u7EFF", hex: "#1F3D2B" },
-      { name: "\u6DF1\u82D4\u7EFF", hex: "#3B4A2F" },
-      { name: "\u6DF1\u6A44\u6984\u7EFF", hex: "#4A5423" },
-      { name: "\u6A44\u6984\u7EFF", hex: "#6B7C4A" },
-      { name: "\u83B3\u841D\u7EFF", hex: "#6E7F4E" },
-      { name: "\u8C5A\u8349\u7EFF", hex: "#8A9A4B" },
-      { name: "\u8584\u8377\u7EFF", hex: "#98D8C8" },
-      // 蓝
-      { name: "\u8482\u8299\u5C3C\u84DD", hex: "#81D8D0" },
-      { name: "\u6D77\u6EE8\u84DD", hex: "#4FA3C2" },
-      { name: "\u5361\u5E03\u91CC\u84DD", hex: "#3579A8" },
-      { name: "\u8FDC\u5C71\u84DD", hex: "#7B9BB8" },
-      { name: "\u96FE\u973E\u84DD", hex: "#8FA8BF" },
-      { name: "\u725B\u4ED4\u84DD", hex: "#3B5B7C" },
-      { name: "\u85CF\u9752", hex: "#1B2A4A" },
-      { name: "\u7FA4\u9752", hex: "#4166B0" },
-      { name: "\u514B\u83B1\u56E0\u84DD", hex: "#002FA7" },
-      { name: "\u7075\u6C14\u975B\u84DD", hex: "#3F4E8C" },
-      // 紫
-      { name: "\u82CB\u83DC\u7D2B", hex: "#9B2D5F" },
-      { name: "\u7D2B\u7F57\u5170\u8272", hex: "#7F5AA2" },
-      { name: "\u85B0\u8863\u8349\u7D2B", hex: "#B4A7D6" },
-      { name: "\u9999\u828B\u7D2B", hex: "#B8A9C9" },
-      { name: "\u70DF\u718F\u7D2B", hex: "#6E5A72" },
-      { name: "\u6DF1\u7D2B", hex: "#4A3B5C" },
-      { name: "\u94F6\u7070", hex: "#C0C0C0" }
-    ]
-  }
-];
-var COLOR_PRESETS = COLOR_CATEGORIES.flatMap((c) => c.swatches);
-function nameOfColor(hex) {
-  return COLOR_PRESETS.find((c) => c.hex.toLowerCase() === hex.toLowerCase())?.name ?? hex;
-}
-function buildRecolorPrompt(colors) {
-  const list = colors.map((hex) => `${nameOfColor(hex)}(${hex})`).join("\u3001");
-  return `\u4FDD\u6301\u670D\u88C5\u7684\u7248\u578B\u3001\u6B3E\u5F0F\u7EC6\u8282\u3001\u6784\u56FE\u548C\u5149\u7EBF\u5B8C\u5168\u4E0D\u53D8\uFF0C\u4EC5\u5C06\u9762\u6599\u914D\u8272\u66FF\u6362\u4E3A\uFF1A${list}\u3002\u914D\u8272\u5E94\u7528\u4E8E\u9762\u6599\u4E3B\u4F53\uFF0C\u5448\u73B0\u771F\u5B9E\u9762\u6599\u8D28\u611F\u4E0E\u51C6\u786E\u8272\u5F69\uFF0C\u65E0\u6587\u5B57\u65E0\u6C34\u5370\u3002`;
-}
-
-// server/engine/runner.ts
-var DEFAULT_PROMPTS = {
-  "sketch-to-render": "\u5C06\u7EBF\u7A3F\u6E32\u67D3\u4E3A\u5199\u5B9E\u670D\u88C5\u6548\u679C\u56FE\uFF0C\u4FDD\u6301\u7ED3\u6784\u4E0E\u8F6E\u5ED3\uFF0C\u9AD8\u7AEF\u65F6\u88C5\u6444\u5F71\u8D28\u611F",
-  "ai-modify": "\u5728\u4FDD\u6301\u6574\u4F53\u7248\u578B\u4E0D\u53D8\u7684\u524D\u63D0\u4E0B\uFF0C\u4F18\u5316\u670D\u88C5\u7EC6\u8282\u8BBE\u8BA1",
-  "fabric-recolor": "\u4FDD\u6301\u670D\u88C5\u6B3E\u5F0F\u3001\u7EC6\u8282\u3001\u5149\u5F71\u4E0E\u80CC\u666F\u4E0D\u53D8\uFF0C\u4EC5\u66FF\u6362\u9762\u6599\u8D28\u611F"
-};
-var runs = /* @__PURE__ */ new Map();
-var MAX_FINISHED_RUNS = 50;
-var FINISHED_RUN_TTL_MS = 30 * 60 * 1e3;
-function pruneRuns() {
-  const now = Date.now();
-  const finished = [];
-  for (const run of runs.values()) {
-    if (!run.finished) continue;
-    if (run.emitter.listenerCount("event") > 0) continue;
-    if (now - run.createdAt > FINISHED_RUN_TTL_MS) {
-      runs.delete(run.id);
-    } else {
-      finished.push(run);
-    }
-  }
-  if (finished.length > MAX_FINISHED_RUNS) {
-    finished.sort((a, b) => a.createdAt - b.createdAt);
-    for (const run of finished.slice(0, finished.length - MAX_FINISHED_RUNS)) {
-      runs.delete(run.id);
-    }
-  }
-}
-function getRunForUser(id, ownerId) {
-  const run = runs.get(id);
-  return run?.ownerId === ownerId ? run : void 0;
-}
-async function createRun(plan, ownerId, recordContext) {
-  if (!ownerId.trim()) throw new Error("run ownerId is required");
-  if (recordContext && recordContext.userId !== ownerId) {
-    throw new Error("run ownerId must match recordContext.userId");
-  }
-  pruneRuns();
-  const run = {
-    id: nanoid5(10),
-    ownerId,
-    plan,
-    emitter: new EventEmitter(),
-    events: [],
-    finished: false,
-    createdAt: Date.now(),
-    recordContext
-  };
-  run.emitter.setMaxListeners(50);
-  runs.set(run.id, run);
-  if (recordContext) await createGenerationRecord(run.id, recordContext, run.createdAt);
-  setImmediate(() => {
-    executeRun(run).catch(async (err) => {
-      const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
-      if (run.recordContext) await failGenerationRecord(run.id, message, Date.now());
-      emit(run, { type: "run-error", error: message });
-    });
-  });
-  return run;
-}
-function emit(run, event) {
-  const sequenced = { ...event, seq: run.events.length + 1 };
-  run.events.push(sequenced);
-  run.emitter.emit("event", sequenced);
-  if (sequenced.type === "done" || sequenced.type === "run-error") {
-    run.finished = true;
-    run.emitter.emit("finish");
-  }
-}
-async function executeRun(run) {
-  const outputs = /* @__PURE__ */ new Map();
-  for (const step of run.plan.steps) {
-    const inputImages = (step.upstream ?? []).flatMap(
-      (u) => outputs.get(u.nodeId) ?? u.images
-    );
-    if (NODE_SPECS[step.kind].providerId && inputImages.length > MAX_REFERENCE_IMAGES) {
-      const message = `Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`;
-      const finishedAt = Date.now();
-      emit(run, { type: "node-status", nodeId: step.nodeId, status: "error", error: message, finishedAt });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
-      return;
-    }
-    if (NODE_SPECS[step.kind].providerId && step.kind !== "sketch-to-render" && inputImages.length === 0) {
-      const message = `Node ${step.nodeId} requires an upstream image`;
-      const finishedAt = Date.now();
-      emit(run, {
-        type: "node-status",
-        nodeId: step.nodeId,
-        status: "error",
-        error: message,
-        finishedAt
-      });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
-      return;
-    }
-    const startedAt = Date.now();
-    if (run.recordContext?.nodeId === step.nodeId) await markGenerationRunning(run.id, startedAt);
-    emit(run, { type: "node-status", nodeId: step.nodeId, status: "running", startedAt });
-    try {
-      const result = await executeStep(step, inputImages);
-      const persisted = await persistOutputImages(result.images);
-      if (run.recordContext) {
-        await registerGeneratedFiles(run.recordContext, run.id, step.nodeId, persisted, Date.now());
-      }
-      outputs.set(step.nodeId, persisted);
-      const finishedAt = Date.now();
-      if (run.recordContext?.nodeId === step.nodeId) {
-        await completeGenerationRecord({
-          runId: run.id,
-          images: persisted,
-          prompts: result.prompts,
-          failures: result.failures,
-          model: result.model,
-          providerRequests: result.providerRequests,
-          startedAt,
-          finishedAt
-        });
-      }
-      const partialWarning = result.failures?.length ? `${result.failures.length} \u4E2A\u751F\u6210\u4EFB\u52A1\u5931\u8D25` : void 0;
-      emit(run, {
-        type: "node-status",
-        nodeId: step.nodeId,
-        status: "success",
-        images: persisted,
-        error: partialWarning,
-        model: result.model,
-        prompts: result.prompts,
-        failures: result.failures,
-        startedAt,
-        finishedAt
-      });
-    } catch (err) {
-      const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
-      const finishedAt = Date.now();
-      if (run.recordContext?.nodeId === step.nodeId) await failGenerationRecord(run.id, message, finishedAt);
-      emit(run, {
-        type: "node-status",
-        nodeId: step.nodeId,
-        status: "error",
-        error: message,
-        startedAt,
-        finishedAt
-      });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
-      return;
-    }
-  }
-  emit(run, { type: "done" });
-}
-async function persistOutputImages(images) {
-  return Promise.all(images.map((img) => persistImageRef(img)));
-}
-async function executeStep(step, inputImages) {
-  switch (step.kind) {
-    case "image-input": {
-      const imageUrl = step.params.imageUrl;
-      return { images: imageUrl ? [imageUrl] : [], providerRequests: 0 };
-    }
-    case "result": {
-      return { images: inputImages, providerRequests: 0 };
-    }
-    case "sketch-to-render":
-    case "ai-modify":
-    case "fabric-recolor":
-    case "upscale":
-    case "print-extract":
-    case "print-mutate": {
-      const spec = NODE_SPECS[step.kind];
-      const provider = getProvider(spec.providerId);
-      const referenceImages = await resolveImageRefs(inputImages);
-      const fabricImageUrl = step.params.fabricImageUrl;
-      if (step.kind === "fabric-recolor" && fabricImageUrl) {
-        referenceImages.push(...await resolveImageRefs([fabricImageUrl]));
-      }
-      if (referenceImages.length > MAX_REFERENCE_IMAGES) {
-        throw new Error(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
-      }
-      const extra = (step.params.prompt ?? "").trim();
-      if (step.kind === "fabric-recolor") {
-        const colors = Array.isArray(step.params.colors) ? step.params.colors.filter((value) => typeof value === "string") : [];
-        if (colors.length > 0) {
-          const images = [];
-          const prompts = [];
-          const failures = [];
-          let model;
-          let providerRequests = 0;
-          for (const color of colors) {
-            const prompt2 = buildRecolorPrompt([color]);
-            try {
-              const result2 = await generateExactImages(provider, { prompt: prompt2, referenceImages }, 1);
-              providerRequests += result2.providerRequests;
-              model = result2.model;
-              for (const image of result2.images) {
-                images.push(image);
-                prompts.push(prompt2);
-              }
-            } catch (err) {
-              failures.push({
-                prompt: prompt2,
-                error: err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err)
-              });
-            }
-          }
-          if (images.length === 0) {
-            throw new Error(failures[0]?.error ?? "\u5168\u90E8\u914D\u8272\u751F\u6210\u5931\u8D25");
-          }
-          return { images, prompts, model, providerRequests, failures: failures.length ? failures : void 0 };
-        }
-      }
-      if (step.kind === "print-mutate") {
-        const count = Math.max(1, Math.min(8, Number(step.params.count) || 4));
-        const prompt2 = "\u57FA\u4E8E\u8FD9\u5F20\u5370\u82B1\u56FE\u6848\u751F\u6210\u98CE\u683C\u4E00\u81F4\u7684\u65B0\u53D8\u4F53\uFF1A\u4FDD\u6301\u539F\u6709\u914D\u8272\u4F53\u7CFB\u3001\u827A\u672F\u98CE\u683C\u4E0E\u7B14\u89E6\u8D28\u611F\uFF0C\u91CD\u65B0\u7F16\u6392\u5143\u7D20\u7684\u6784\u56FE\u4E0E\u7EC4\u5408\u65B9\u5F0F\uFF0C\u7EAF\u767D\u80CC\u666F\uFF0C\u9002\u5408\u4F5C\u4E3A\u5370\u82B1\u7D20\u6750\u590D\u7528" + (extra ? `\u3002\u8865\u5145\u8981\u6C42\uFF1A${extra}` : "");
-        const result2 = await generateExactImages(provider, { prompt: prompt2, referenceImages }, count);
-        const failures = result2.failures.map((error) => ({ prompt: prompt2, error }));
-        return {
-          images: result2.images,
-          prompts: result2.images.map(() => prompt2),
-          model: result2.model,
-          providerRequests: result2.providerRequests,
-          failures: failures.length ? failures : void 0
-        };
-      }
-      const prompt = step.kind === "upscale" ? "\u5C06\u8FD9\u5F20\u670D\u88C5\u6548\u679C\u56FE\u653E\u5927\u4E3A\u8D85\u9AD8\u6E05\u7248\u672C\uFF0C\u589E\u5F3A\u9762\u6599\u7EB9\u7406\u3001\u8D70\u7EBF\u4E0E\u8FB9\u7F18\u7EC6\u8282\uFF0C\u4FDD\u6301\u539F\u6709\u6784\u56FE\u3001\u8272\u5F69\u548C\u5149\u5F71\u5B8C\u5168\u4E0D\u53D8" : step.kind === "print-extract" ? "\u63D0\u53D6\u8FD9\u4EF6\u8863\u670D\u4E0A\u7684\u5370\u82B1\u56FE\u6848\uFF1A\u5C06\u5370\u82B1\u5B8C\u6574\u62A0\u51FA\u5E76\u5E73\u94FA\u5C55\u5F00\u4E3A\u89C4\u6574\u7684\u77E9\u5F62\u56FE\u6848\uFF0C\u7EAF\u767D\u80CC\u666F\uFF0C\u53BB\u9664\u8863\u8EAB\u3001\u8936\u76B1\u3001\u9634\u5F71\u548C\u7A7F\u7740\u6548\u679C\uFF0C\u5370\u82B1\u7684\u6BD4\u4F8B\u3001\u7EC6\u8282\u548C\u8272\u5F69\u4E0E\u539F\u56FE\u4FDD\u6301\u4E00\u81F4\uFF0C\u9002\u5408\u4F5C\u4E3A\u5370\u82B1\u7D20\u6750\u590D\u7528" + (extra ? `\u3002\u8865\u5145\u8981\u6C42\uFF1A${extra}` : "") : extra || DEFAULT_PROMPTS[step.kind] || NODE_SPECS[step.kind].description;
-      const request = {
-        prompt,
-        referenceImages: referenceImages.length ? referenceImages : void 0,
-        aspectRatio: step.params.aspectRatio,
-        batchSize: step.params.batchSize,
-        imageSize: step.kind === "upscale" ? step.params.imageSize : void 0
-      };
-      const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify" ? Math.max(1, Math.min(4, Number(step.params.batchSize) || 1)) : 1;
-      const result = await generateExactImages(provider, request, requestedCount);
-      return {
-        images: result.images,
-        model: result.model,
-        prompts: result.images.map(() => prompt),
-        providerRequests: result.providerRequests,
-        failures: result.failures.length ? result.failures.map((error) => ({ prompt, error })) : void 0
-      };
-    }
-  }
-}
-async function resolveImageRefs(refs) {
-  return Promise.all(refs.map(normalizeImageRef));
 }
 
 // server/lib/workflowSchema.ts
@@ -3544,8 +3834,8 @@ authRouter.post("/users", requireAdmin, asyncHandler(async (req, res) => {
 }));
 authRouter.patch("/users/:id", requireAdmin, asyncHandler(async (req, res) => {
   const actor = requestUser(req);
-  const { active, displayName } = req.body;
-  if (req.params.id === actor.id && active === false) {
+  const { active: active2, displayName } = req.body;
+  if (req.params.id === actor.id && active2 === false) {
     res.status(400).json({ error: "\u4E0D\u80FD\u505C\u7528\u5F53\u524D\u7BA1\u7406\u5458\u8D26\u53F7" });
     return;
   }
@@ -3558,9 +3848,9 @@ authRouter.patch("/users/:id", requireAdmin, asyncHandler(async (req, res) => {
   if (typeof displayName === "string" && displayName.trim() && displayName.length <= 100) {
     await query("UPDATE users SET display_name = $1, updated_at = $2 WHERE id = $3", [displayName.trim(), now, req.params.id]);
   }
-  if (typeof active === "boolean") {
-    await query("UPDATE users SET active = $1, updated_at = $2 WHERE id = $3", [active ? 1 : 0, now, req.params.id]);
-    if (!active) await revokeUserSessions(req.params.id);
+  if (typeof active2 === "boolean") {
+    await query("UPDATE users SET active = $1, updated_at = $2 WHERE id = $3", [active2 ? 1 : 0, now, req.params.id]);
+    if (!active2) await revokeUserSessions(req.params.id);
   }
   res.json({ ok: true });
 }));

@@ -54,7 +54,6 @@ export interface ImageProviderCapabilities {
   supportsBatchN: boolean;
   maxBatchSize: number;
   supportsMultiReference: boolean;
-  supportsImageArray: boolean;
   maxReferenceImages: number;
 }
 
@@ -75,14 +74,12 @@ export const config = {
     supportsBatchN: booleanEnv("NANOBANANA_SUPPORTS_N", false),
     maxBatchSize: boundedIntegerEnv("NANOBANANA_MAX_BATCH", 1, 1, 4),
     supportsMultiReference: booleanEnv("NANOBANANA_SUPPORTS_MULTI_REFERENCE", true),
-    supportsImageArray: booleanEnv("NANOBANANA_SUPPORTS_IMAGE_ARRAY", true),
     maxReferenceImages: boundedIntegerEnv("NANOBANANA_MAX_REFERENCE_IMAGES", 8, 1, 8),
   }),
   image2Capabilities: (): ImageProviderCapabilities => ({
     supportsBatchN: booleanEnv("IMAGE2_SUPPORTS_N", false),
     maxBatchSize: boundedIntegerEnv("IMAGE2_MAX_BATCH", 1, 1, 4),
     supportsMultiReference: booleanEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", true),
-    supportsImageArray: booleanEnv("IMAGE2_SUPPORTS_IMAGE_ARRAY", true),
     maxReferenceImages: boundedIntegerEnv("IMAGE2_MAX_REFERENCE_IMAGES", 8, 1, 8),
   }),
 

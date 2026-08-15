@@ -13,32 +13,12 @@ import {
   aspectRatioToSize,
   fetchWithRetry,
   parseDataUrl,
-  toDataUrl,
   ProviderError,
-  providerErrorFromMessage,
 } from "./base";
+import { parseGptImagesPngResponse } from "./gptImagesResponse";
+import { prepareImage2ReferenceUpload, promptWithImageLayout } from "./image2References";
 
 const PROVIDER_ID = "gpt-image-2";
-
-interface ImagesApiResponse {
-  data?: Array<{ b64_json?: string; url?: string }>;
-  error?: { message?: string };
-}
-
-function parseImagesResponse(json: ImagesApiResponse): string[] {
-  if (json.error) {
-    throw providerErrorFromMessage(json.error.message ?? "images api error", PROVIDER_ID);
-  }
-  const images: string[] = [];
-  for (const item of json.data ?? []) {
-    if (item.b64_json) images.push(toDataUrl(item.b64_json));
-    else if (item.url) images.push(item.url);
-  }
-  if (images.length === 0) {
-    throw new ProviderError("AI 服务未返回图片，请重试", 502, PROVIDER_ID, "empty_response");
-  }
-  return images;
-}
 
 export const image2Provider: AIProvider = {
   id: PROVIDER_ID,
@@ -68,8 +48,8 @@ export const image2Provider: AIProvider = {
       }),
       { providerId: PROVIDER_ID },
     );
-    const json = (await res.json()) as ImagesApiResponse;
-    return { images: parseImagesResponse(json), model: config.image2Model() };
+    const json: unknown = await res.json();
+    return { images: await parseGptImagesPngResponse(json, PROVIDER_ID), model: config.image2Model() };
   },
 
   /** 有参考图：/v1/images/edits，multipart form 上传 */
@@ -82,9 +62,14 @@ export const image2Provider: AIProvider = {
     if (req.referenceImages.length > maxReferences) {
       throw new ProviderError(`当前 AI 服务最多支持 ${maxReferences} 张参考图`, 400, PROVIDER_ID, "invalid_request");
     }
-    if (req.referenceImages.length > 1 && (!capabilities.supportsMultiReference || !capabilities.supportsImageArray)) {
-      throw new ProviderError("当前 AI 服务不支持多参考图，请只保留一张参考图", 400, PROVIDER_ID, "invalid_request");
+    if (req.referenceImages.length > 1 && !capabilities.supportsMultiReference) {
+      throw new ProviderError("当前 AI 服务未开启多参考图，请只保留一张参考图", 400, PROVIDER_ID, "invalid_request");
     }
+    if (req.referenceImages.length > 1 && req.mask) {
+      throw new ProviderError("多参考图拼图暂不支持蒙版，请移除蒙版或只保留一张参考图", 400, PROVIDER_ID, "invalid_request");
+    }
+    const referenceUpload = await prepareImage2ReferenceUpload(req.referenceImages);
+    const prompt = promptWithImageLayout(req.prompt, req.referenceImages.length);
     const url = `${config.change2proBaseUrl()}/images/edits`;
 
     const res = await fetchWithRetry(
@@ -93,16 +78,18 @@ export const image2Provider: AIProvider = {
         // 每次重试需重建 FormData（body 只能消费一次）
         const form = new FormData();
         form.append("model", config.image2Model());
-        form.append("prompt", req.prompt);
-        form.append("size", aspectRatioToSize(req.aspectRatio));
+        form.append("prompt", prompt);
+        if (req.aspectRatio) form.append("size", aspectRatioToSize(req.aspectRatio));
+        form.append("quality", "low");
+        form.append("output_format", "png");
         if (capabilities.supportsBatchN) {
           form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize))));
         }
-        req.referenceImages!.forEach((ref, i) => {
-          const { mime, buffer } = parseDataUrl(ref);
-          const ext = mime.split("/")[1] ?? "png";
-          form.append(capabilities.supportsImageArray ? "image[]" : "image", new Blob([new Uint8Array(buffer)], { type: mime }), `ref-${i}.${ext}`);
-        });
+        form.append(
+          "image",
+          new Blob([new Uint8Array(referenceUpload.buffer)], { type: referenceUpload.mime }),
+          referenceUpload.filename,
+        );
         if (req.mask) {
           const { mime, buffer } = parseDataUrl(req.mask);
           form.append("mask", new Blob([new Uint8Array(buffer)], { type: mime }), "mask.png");
@@ -115,7 +102,7 @@ export const image2Provider: AIProvider = {
       },
       { providerId: PROVIDER_ID },
     );
-    const json = (await res.json()) as ImagesApiResponse;
-    return { images: parseImagesResponse(json), model: config.image2Model() };
+    const json: unknown = await res.json();
+    return { images: await parseGptImagesPngResponse(json, PROVIDER_ID), model: config.image2Model() };
   },
 };

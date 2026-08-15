@@ -8,6 +8,7 @@ import {
   NODE_SPECS,
   MAX_REFERENCE_IMAGES,
   type ExecutionPlan,
+  type AIProvider,
   type NodeExecution,
   type NodeRunStatus,
 } from "../../src/types/workflow";
@@ -15,6 +16,12 @@ import { getProvider } from "../providers";
 import { ProviderError, publicProviderErrorMessage } from "../providers/base";
 import { generateExactImages } from "../providers/exact";
 import { normalizeImageRef, persistImageRef } from "../lib/fileStore";
+import {
+  fitGeneratedImageToAspect,
+  normalizeExactAspectRatio,
+  normalizeUpscaleSize,
+  upscaleImageToLongEdge,
+} from "../lib/imagePostProcessing";
 import { buildRecolorPrompt } from "../../src/lib/colors";
 import {
   completeGenerationRecord,
@@ -267,7 +274,33 @@ async function persistOutputImages(images: string[]): Promise<string[]> {
   return Promise.all(images.map((img) => persistImageRef(img)));
 }
 
-async function executeStep(step: NodeExecution, inputImages: string[]): Promise<StepResult> {
+/** Apply business-side output guarantees only to nodes that expose size controls to users. */
+export async function postProcessGeneratedOutputImages(
+  kind: NodeExecution["kind"],
+  params: Record<string, unknown>,
+  images: string[],
+): Promise<string[]> {
+  if (kind !== "sketch-to-render" && kind !== "ai-modify" && kind !== "upscale") return images;
+  const aspectRatio = normalizeExactAspectRatio(params.aspectRatio);
+  const imageSize = normalizeUpscaleSize(params.imageSize);
+  const processed: string[] = [];
+  for (const image of images) {
+    processed.push(
+      kind === "upscale"
+        ? await upscaleImageToLongEdge(image, imageSize)
+        : await fitGeneratedImageToAspect(image, aspectRatio),
+    );
+  }
+  return processed;
+}
+
+export type ProviderResolver = (id: string) => AIProvider;
+
+export async function executeStep(
+  step: NodeExecution,
+  inputImages: string[],
+  resolveProvider: ProviderResolver = getProvider,
+): Promise<StepResult> {
   switch (step.kind) {
     case "image-input": {
       const imageUrl = step.params.imageUrl as string | undefined;
@@ -284,7 +317,7 @@ async function executeStep(step: NodeExecution, inputImages: string[]): Promise<
     case "print-extract":
     case "print-mutate": {
       const spec = NODE_SPECS[step.kind];
-      const provider = getProvider(spec.providerId!);
+      const provider = resolveProvider(spec.providerId!);
       const referenceImages = await resolveImageRefs(inputImages);
 
       // fabric-recolor 的面料参考图（可能不是边连入，而是节点参数）
@@ -362,18 +395,21 @@ async function executeStep(step: NodeExecution, inputImages: string[]): Promise<
       const request = {
         prompt,
         referenceImages: referenceImages.length ? referenceImages : undefined,
-        aspectRatio: step.params.aspectRatio as string | undefined,
+        aspectRatio: step.kind === "sketch-to-render" || step.kind === "ai-modify"
+          ? normalizeExactAspectRatio(step.params.aspectRatio)
+          : step.params.aspectRatio as string | undefined,
         batchSize: step.params.batchSize as number | undefined,
-        imageSize: step.kind === "upscale" ? (step.params.imageSize as string) : undefined,
+        imageSize: step.kind === "upscale" ? normalizeUpscaleSize(step.params.imageSize) : undefined,
       };
       const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify"
         ? Math.max(1, Math.min(4, Number(step.params.batchSize) || 1))
         : 1;
       const result = await generateExactImages(provider, request, requestedCount);
+      const images = await postProcessGeneratedOutputImages(step.kind, step.params, result.images);
       return {
-        images: result.images,
+        images,
         model: result.model,
-        prompts: result.images.map(() => prompt),
+        prompts: images.map(() => prompt),
         providerRequests: result.providerRequests,
         failures: result.failures.length ? result.failures.map((error) => ({ prompt, error })) : undefined,
       };
