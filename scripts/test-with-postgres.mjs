@@ -1,7 +1,16 @@
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createServer } from "node:net";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 
-const compose = ["compose", "-f", "compose.test.yaml"];
+export function createComposeProjectName({
+  cwd = process.cwd(),
+  pid = process.pid,
+} = {}) {
+  const worktreeId = createHash("sha256").update(resolve(cwd)).digest("hex").slice(0, 10);
+  return `garment-canvas-test-${worktreeId}-${pid}`;
+}
 
 function findFreePort() {
   return new Promise((resolve, reject) => {
@@ -28,26 +37,43 @@ function run(command, args, options = {}) {
   if (result.status !== 0) throw new Error(`${command} ${args.join(" ")} exited with ${result.status}`);
 }
 
-const postgresPort = await findFreePort();
-const composeEnv = { ...process.env, POSTGRES_TEST_PORT: String(postgresPort) };
-const databaseUrl = `postgresql://garment_test:garment_test@127.0.0.1:${postgresPort}/garment_canvas_test`;
+async function main() {
+  const composeProjectName = createComposeProjectName();
+  const compose = [
+    "compose",
+    "--project-name",
+    composeProjectName,
+    "-f",
+    "compose.test.yaml",
+  ];
+  const postgresPort = await findFreePort();
+  const composeEnv = {
+    ...process.env,
+    COMPOSE_PROJECT_NAME: composeProjectName,
+    POSTGRES_TEST_PORT: String(postgresPort),
+  };
+  const databaseUrl = `postgresql://garment_test:garment_test@127.0.0.1:${postgresPort}/garment_canvas_test`;
 
-try {
-  run("docker", [...compose, "down", "--volumes", "--remove-orphans"], { env: composeEnv });
-  run("docker", [...compose, "up", "-d", "--wait"], { env: composeEnv });
-  run(process.execPath, [process.env.npm_execpath, "run", "test:suite"], {
-    env: { ...composeEnv, DATABASE_URL: databaseUrl },
-  });
-} catch (error) {
-  spawnSync("docker", [...compose, "logs", "--no-color"], {
-    stdio: "inherit",
-    env: composeEnv,
-  });
-  console.error(error instanceof Error ? error.message : String(error));
-  process.exitCode = 1;
-} finally {
-  spawnSync("docker", [...compose, "down", "--volumes", "--remove-orphans"], {
-    stdio: "inherit",
-    env: composeEnv,
-  });
+  try {
+    run("docker", [...compose, "down", "--volumes", "--remove-orphans"], { env: composeEnv });
+    run("docker", [...compose, "up", "-d", "--wait"], { env: composeEnv });
+    run(process.execPath, [process.env.npm_execpath, "run", "test:suite"], {
+      env: { ...composeEnv, DATABASE_URL: databaseUrl },
+    });
+  } catch (error) {
+    spawnSync("docker", [...compose, "logs", "--no-color"], {
+      stdio: "inherit",
+      env: composeEnv,
+    });
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exitCode = 1;
+  } finally {
+    spawnSync("docker", [...compose, "down", "--volumes", "--remove-orphans"], {
+      stdio: "inherit",
+      env: composeEnv,
+    });
+  }
 }
+
+const isMain = Boolean(process.argv[1]) && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
+if (isMain) await main();
