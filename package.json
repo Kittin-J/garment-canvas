@@ -5,7 +5,7 @@
   "description": "Garment design collaboration SaaS - infinite canvas + node workflow (P0 MVP)",
   "type": "module",
   "engines": {
-    "node": ">=20.9.0"
+    "node": ">=22.0.0"
   },
   "scripts": {
     "dev": "concurrently -n server,web -c blue,green \"npm:dev:server\" \"npm:dev:web\"",

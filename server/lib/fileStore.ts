@@ -12,7 +12,10 @@ import { nanoid } from "nanoid";
 import sharp from "sharp";
 import { config } from "../config";
 import { toDataUrl } from "../providers/base";
+import { withImageProcessingSlot } from "./imageProcessingLimit";
 import { MAX_IMAGE_BYTES, detectImageMime, validateImageDataUrl } from "./imageValidation";
+
+const MAX_THUMBNAIL_INPUT_PIXELS = 40_000_000;
 
 const MIME_EXT: Record<string, string> = {
   "image/png": "png",
@@ -56,11 +59,17 @@ export async function ensureThumbnail(id: string): Promise<string> {
     if (fs.existsSync(target) && fs.statSync(target).mtimeMs >= sourceStat.mtimeMs) return target;
     const temporary = path.join(thumbnailsDir(), `.${id}.${nanoid(6)}.tmp.webp`);
     try {
-      await sharp(source, { animated: false, failOn: "error" })
-        .rotate()
-        .resize({ width: 384, height: 384, fit: "inside", withoutEnlargement: true })
-        .webp({ quality: 78, effort: 4 })
-        .toFile(temporary);
+      await withImageProcessingSlot(async () => {
+        await sharp(source, {
+          animated: false,
+          failOn: "error",
+          limitInputPixels: MAX_THUMBNAIL_INPUT_PIXELS,
+        })
+          .rotate()
+          .resize({ width: 384, height: 384, fit: "inside", withoutEnlargement: true })
+          .webp({ quality: 78, effort: 4 })
+          .toFile(temporary);
+      });
       fs.renameSync(temporary, target);
       return target;
     } finally {

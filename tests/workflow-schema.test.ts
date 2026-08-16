@@ -227,6 +227,27 @@ async function main() {
     }
   });
 
+  await test("缩略图拒绝超过四千万像素的输入且不留下临时文件", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "garment-canvas-thumbnail-limit-"));
+    const originalDataDir = process.env.DATA_DIR;
+    try {
+      process.env.DATA_DIR = dir;
+      const uploads = path.join(dir, "uploads");
+      fs.mkdirSync(uploads, { recursive: true });
+      const oversizedPng = Buffer.from(PNG);
+      oversizedPng.writeUInt32BE(10_000, 16);
+      oversizedPng.writeUInt32BE(5_000, 20);
+      fs.writeFileSync(path.join(uploads, "oversized.png"), oversizedPng);
+
+      await assert.rejects(() => ensureThumbnail("oversized.png"), /pixel limit/i);
+      assert.deepEqual(fs.readdirSync(path.join(dir, "thumbnails")), []);
+    } finally {
+      if (originalDataDir === undefined) delete process.env.DATA_DIR;
+      else process.env.DATA_DIR = originalDataDir;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   await test("IP 分类拒绝内网、回环、链路本地、ULA 和 IPv4-mapped", () => {
     for (const address of ["127.0.0.1", "10.1.2.3", "169.254.169.254", "192.168.1.1", "::1", "fe80::1", "fd00::1", "::192.168.1.1", "::ffff:127.0.0.1", "::ffff:7f00:1", "2002:c0a8:101::"]) {
       assert.equal(isGlobalIpAddress(address), false, address);
