@@ -821,6 +821,7 @@ import http from "node:http";
 import https from "node:https";
 import { nanoid } from "nanoid";
 import sharp3 from "sharp";
+var MAX_THUMBNAIL_INPUT_PIXELS = 4e7;
 var MIME_EXT = {
   "image/png": "png",
   "image/jpeg": "jpg",
@@ -857,7 +858,13 @@ async function ensureThumbnail(id) {
     if (fs2.existsSync(target) && fs2.statSync(target).mtimeMs >= sourceStat.mtimeMs) return target;
     const temporary = path2.join(thumbnailsDir(), `.${id}.${nanoid(6)}.tmp.webp`);
     try {
-      await sharp3(source, { animated: false, failOn: "error" }).rotate().resize({ width: 384, height: 384, fit: "inside", withoutEnlargement: true }).webp({ quality: 78, effort: 4 }).toFile(temporary);
+      await withImageProcessingSlot(async () => {
+        await sharp3(source, {
+          animated: false,
+          failOn: "error",
+          limitInputPixels: MAX_THUMBNAIL_INPUT_PIXELS
+        }).rotate().resize({ width: 384, height: 384, fit: "inside", withoutEnlargement: true }).webp({ quality: 78, effort: 4 }).toFile(temporary);
+      });
       fs2.renameSync(temporary, target);
       return target;
     } finally {
