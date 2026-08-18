@@ -43,3 +43,42 @@ This project is indexed by GitNexus as **garment-canvas** (7300 symbols, 15964 r
 | Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
 
 <!-- gitnexus:end -->
+
+# Garment Canvas — Shared Project Rules
+
+## Project Baseline
+
+- Use Node.js 20.9 or newer. The application is TypeScript with React 19, Vite 6, Express 4, and PostgreSQL 18.
+- Treat PostgreSQL as the production source of truth. SQLite support exists only for legacy import and migration verification.
+- Use the existing npm scripts: `npm run lint` for type-checking, `npm run test` for the isolated PostgreSQL regression suite, `npm run check` for both, and `npm run build` for production bundles.
+- The PostgreSQL test runner assigns a stable Docker Compose project to each worktree, cleans crash leftovers before starting, and rejects concurrent runs in the same worktree. Different worktrees remain isolated. Do not replace it with direct `docker compose -f compose.test.yaml` lifecycle commands in agent workflows.
+- Keep generated output, runtime data, private `.env`/`.env.local` files, secrets, uploads, database dumps, and credentials out of commits and agent output. The tracked `.env.example` remains the public configuration contract.
+
+## Security and Data Invariants
+
+- Keep `/api/health`, `/api/ready`, login, and session-check behavior intentionally separated from authenticated application routes. Do not weaken `requireAuth`, `requirePasswordChanged`, or `requireAdmin` coverage.
+- Preserve one active device session per account, hashed session tokens, replacement-session reporting, secure cookie attributes, and session revocation after password, account, or administrator changes.
+- Enforce owner/admin checks on projects, files, assets, history, usage, and generated output. For cross-resource lookups, prefer a non-disclosing `404` when revealing existence would leak private data.
+- Validate image identifiers, MIME/extension, decoded size, and local image references before filesystem access. Prevent path traversal and never expose arbitrary local or remote URLs.
+- Keep multi-table ownership transfers, destructive account actions, session replacement, and reference updates transactional. Preserve the 15-day recovery behavior and referenced-asset deletion guards.
+- Never expose AI gateway keys to the client or logs. Require HTTPS gateway configuration, retain request limits and reference-image ordering, and do not call paid providers from automated tests.
+- Preserve workflow schema compatibility, node/edge migration behavior, the maximum of eight ordered reference images, and non-stretching output resize semantics.
+
+## Change Workflow
+
+- Inspect the relevant execution flow and tests before proposing a change. Use GitNexus `impact` before editing a function, class, method, route contract, or shared type.
+- Prefer the smallest evidence-backed patch. Do not combine security/correctness fixes with cosmetic cleanup, broad rewrites, dependency upgrades, or unrelated formatting.
+- Add or update regression coverage for every behavior change. Tests must demonstrate the failure before the fix when practical.
+- For auth, authorization, storage, migration, provider, workflow, or API-contract changes, run the matching focused test file before the full suite.
+- Before handoff, run `npm run check`, `npm run build`, and GitNexus `detect_changes`. Report any unavailable test or degraded graph result explicitly.
+
+## Git and Agent Collaboration
+
+- Claude may edit only inside a linked worktree created for its task. A read-only audit may run in the primary worktree, but it must not change files there.
+- The project hook enforces a conservative Bash allowlist in the primary worktree. If it blocks a command, use Read/Grep/GitNexus or restart in a linked worktree; do not bypass or disable the hook.
+- Treat the hook as a defense against accidental agent actions, not an adversarial security sandbox. Shell indirection and child processes cannot be completely classified from a command string; use an OS-level sandbox or read-only mount when running untrusted agents.
+- Claude may create local commits on its worktree branch. It must never push, create a PR, merge, rebase, cherry-pick, force-reset, or clean the repository.
+- Worktrees share the primary checkout's `node_modules` for speed. Never run dependency installation or update commands from Claude; report lockfile or dependency changes for Codex to handle in an isolated dependency workflow.
+- Codex reviews `BASE_COMMIT..CLAUDE_COMMIT`, reruns impact analysis and tests, and decides whether to adopt, rewrite, or reject each change. Never cherry-pick a Claude commit without reviewing its diff and evidence.
+- Every Claude handoff must include `BASE_COMMIT`, worktree path, branch, commit IDs, findings, tests run, affected flows, residual risks, and requested Codex review focus.
+- Refresh stale GitNexus data with `node .gitnexus/run.cjs analyze --index-only --pdg`; keep `--index-only` so generated context does not overwrite these shared rules.
