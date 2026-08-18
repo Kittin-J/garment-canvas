@@ -95,6 +95,25 @@ async function main(): Promise<void> {
     }
   });
 
+  await test("Provider 公共请求出口拒绝非 HTTPS 且不会发送 Bearer 请求", async () => {
+    let calls = 0;
+    const restoreFetch = installFetchMock(() => {
+      calls += 1;
+      return Response.json({ data: [] });
+    });
+    try {
+      await assert.rejects(
+        () => fetchWithRetry("http://gateway.example/v1/images/generations", () => ({
+          headers: { Authorization: "Bearer secret" },
+        })),
+        (error: unknown) => error instanceof ProviderError && error.category === "invalid_request",
+      );
+      assert.equal(calls, 0);
+    } finally {
+      restoreFetch();
+    }
+  });
+
   await test("nanobanana 文生图调用 Images generations 契约", async () => {
     const restoreBase = setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1");
     const restoreKey = setEnv("NANOBANANA_API_KEY", "nanobanana-test-key");

@@ -13,8 +13,11 @@ export function ProjectTabs() {
 
   const requestClose = (tab: ProjectTab) => {
     const warnings: string[] = [];
+    if (hasRunningNode(tab)) {
+      window.alert("生成任务运行中，请等待任务完成后再关闭项目页签；结果会继续写回当前画布。");
+      return;
+    }
     if (tab.dirty) warnings.push("有未保存修改");
-    if (hasRunningNode(tab)) warnings.push("仍有生成任务运行中");
     if (
       warnings.length > 0 &&
       !window.confirm(`${tab.projectName}：${warnings.join("，")}。确定关闭这个项目页签吗？`)

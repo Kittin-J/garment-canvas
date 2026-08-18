@@ -139,6 +139,21 @@ export async function fetchWithRetry(
   initFactory: () => RequestInit,
   opts?: { timeoutMs?: number; maxRetries?: number; providerId?: string },
 ): Promise<Response> {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    throw new ProviderError("AI 网关地址无效，请联系管理员检查配置", 400, opts?.providerId, "invalid_request");
+  }
+  if (parsedUrl.protocol !== "https:") {
+    throw new ProviderError(
+      "AI 网关必须使用 HTTPS，请联系管理员检查配置",
+      400,
+      opts?.providerId,
+      "invalid_request",
+      `Blocked non-HTTPS provider URL with protocol ${parsedUrl.protocol}`,
+    );
+  }
   const timeoutMs = opts?.timeoutMs ?? config.aiTimeoutMs();
   const maxRetries = opts?.maxRetries ?? config.aiMaxRetries();
 

@@ -12,6 +12,7 @@ process.env.INITIAL_ADMIN_PASSWORD = "Initial1234";
 
 await resetPostgresTestDatabase();
 const { closeDatabaseForTests, initializeDatabase, query, queryOne } = await import("../server/lib/database");
+const { migrateLegacyData } = await import("../server/lib/legacyMigration");
 
 console.log("PostgreSQL 18 编号迁移回归测试");
 await initializeDatabase();
@@ -23,6 +24,8 @@ assert.deepEqual(versions, [
   { version: 1, name: "initial_schema" },
   { version: 2, name: "project_asset_refs_project_foreign_key" },
   { version: 3, name: "revoked_session_reasons" },
+  { version: 4, name: "active_account_id_unique" },
+  { version: 5, name: "account_data_retention_tombstones" },
 ]);
 console.log("  ✓ 新数据库记录全部编号迁移");
 
@@ -33,6 +36,42 @@ await query(`
   INSERT INTO assets (id, owner_id, scope, name, category, image, created_at)
   VALUES ('migration-asset', $1, 'private', '迁移素材', 'reference', '/api/files/migration.png', $2)
 `, [admin.id, now]);
+
+fs.mkdirSync(path.join(temp, "assets"), { recursive: true });
+fs.writeFileSync(path.join(temp, "assets", "private.json"), JSON.stringify({
+  id: "legacy-private", name: "旧文件名", category: "reference",
+  image: "/api/files/migration.png", sourceNote: "旧备注",
+}));
+await migrateLegacyData();
+const preserved = await queryOne<Record<string, unknown>>(
+  "SELECT owner_id, scope, name, category, source_note FROM assets WHERE image = '/api/files/migration.png'",
+);
+assert.deepEqual(preserved, {
+  owner_id: admin.id,
+  scope: "private",
+  name: "迁移素材",
+  category: "reference",
+  source_note: null,
+});
+console.log("  ✓ legacy 迁移不会在重复启动时夺取现有素材归属");
+
+await query(`
+  INSERT INTO users (
+    id, account_id, display_name, role, password_hash, must_change_password,
+    active, deleted_at, created_at, updated_at
+  ) VALUES ('deleted-reusable', 'reusable-account', '旧账号', 'user', 'test', 0, 0, $1, $1, $1)
+`, [now]);
+await query(`
+  INSERT INTO users (
+    id, account_id, display_name, role, password_hash, must_change_password,
+    active, created_at, updated_at
+  ) VALUES ('active-reusable', 'reusable-account', '新账号', 'user', 'test', 1, 1, $1, $1)
+`, [now]);
+const reusable = await query<{ id: string }>(
+  "SELECT id FROM users WHERE account_id = 'reusable-account' ORDER BY id",
+);
+assert.deepEqual(reusable, [{ id: "active-reusable" }, { id: "deleted-reusable" }]);
+console.log("  ✓ 软删除账号不会永久占用登录名");
 
 await query("ALTER TABLE project_asset_refs DROP CONSTRAINT project_asset_refs_project_id_fkey");
 await query("DELETE FROM schema_migrations WHERE version = 2");

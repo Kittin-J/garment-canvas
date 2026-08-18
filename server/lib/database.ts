@@ -150,7 +150,9 @@ async function migrate(): Promise<void> {
       project_id TEXT,
       node_id TEXT,
       run_id TEXT,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      deleted_at TEXT,
+      purge_after TEXT
     );
     CREATE INDEX IF NOT EXISTS files_owner_idx ON files(owner_id, created_at DESC);
 
@@ -193,7 +195,9 @@ async function migrate(): Promise<void> {
       status TEXT NOT NULL CHECK (status IN ('queued','running','success','error')),
       error TEXT,
       started_at BIGINT NOT NULL,
-      finished_at BIGINT
+      finished_at BIGINT,
+      deleted_at TEXT,
+      purge_after TEXT
     );
     CREATE INDEX IF NOT EXISTS generation_runs_owner_idx ON generation_runs(owner_id, started_at DESC);
 
@@ -218,7 +222,9 @@ async function migrate(): Promise<void> {
       successful_count INTEGER NOT NULL CHECK (successful_count > 0),
       provider_requests INTEGER NOT NULL DEFAULT 1,
       duration_ms INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      deleted_at TEXT,
+      purge_after TEXT
     );
     CREATE INDEX IF NOT EXISTS usage_owner_idx ON usage_events(owner_id, created_at DESC);
       `);
@@ -291,6 +297,36 @@ async function migrate(): Promise<void> {
       );
     }
 
+    if (!applied.has(4)) {
+      await client.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_id_key");
+      await client.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS users_active_account_id_unique
+        ON users(account_id) WHERE deleted_at IS NULL
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (4, $1, $2)",
+        ["active_account_id_unique", new Date().toISOString()],
+      );
+    }
+
+    if (!applied.has(5)) {
+      await client.query(`
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS deleted_at TEXT;
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS purge_after TEXT;
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS deleted_at TEXT;
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS purge_after TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS deleted_at TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS purge_after TEXT;
+        CREATE INDEX IF NOT EXISTS files_purge_idx ON files(purge_after);
+        CREATE INDEX IF NOT EXISTS generation_runs_purge_idx ON generation_runs(purge_after);
+        CREATE INDEX IF NOT EXISTS usage_events_purge_idx ON usage_events(purge_after);
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (5, $1, $2)",
+        ["account_data_retention_tombstones", new Date().toISOString()],
+      );
+    }
+
     return imported;
   });
   if (importedRows !== undefined) {
@@ -312,7 +348,7 @@ async function bootstrapInitialAdmin(): Promise<void> {
   await db().query(`
     INSERT INTO users (id, account_id, display_name, role, password_hash, must_change_password, active, created_at, updated_at)
     VALUES ($1, $2, $3, 'admin', $4, 1, 1, $5, $5)
-    ON CONFLICT (account_id) DO NOTHING
+    ON CONFLICT (account_id) WHERE deleted_at IS NULL DO NOTHING
   `, [nanoid(12), accountId, "管理员", hashPassword(password), now]);
 }
 

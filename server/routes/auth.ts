@@ -6,6 +6,7 @@ import {
   requireAuth,
   requireAuthForSessionCheck,
   requireAdmin,
+  requirePasswordChanged,
   requestUser,
   revokeRequestSession,
   revokeUserSessions,
@@ -95,10 +96,12 @@ authRouter.post("/change-password", asyncHandler(async (req, res) => {
   await query("UPDATE users SET password_hash = $1, must_change_password = 0, updated_at = $2 WHERE id = $3", [
     hashPassword(newPassword), now, user.id,
   ]);
-  const session = await createSession(user.id);
+  const session = await createSession(user.id, { markExistingAsReplaced: false });
   setSessionCookie(res, session.token);
   res.json({ ok: true, user: { ...user, mustChangePassword: false }, expiresAt: session.expiresAt });
 }));
+
+authRouter.use(requirePasswordChanged);
 
 authRouter.get("/users", requireAdmin, asyncHandler(async (_req, res) => {
   const rows = await query<UserRow>(`
@@ -218,11 +221,20 @@ authRouter.delete("/users/:id", requireAdmin, asyncHandler(async (req, res) => {
         await client.query(`UPDATE ${table} SET owner_id = $1 WHERE owner_id = $2`, [transferToUserId, req.params.id]);
       }
     } else {
-      await client.query("UPDATE projects SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3", [nowIso, purgeAfter, req.params.id]);
+      await client.query(
+        "UPDATE projects SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3 AND deleted_at IS NULL",
+        [nowIso, purgeAfter, req.params.id],
+      );
       await client.query(
         "UPDATE assets SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3 AND deleted_at IS NULL",
         [nowIso, purgeAfter, req.params.id],
       );
+      for (const table of ["files", "generation_runs", "usage_events"] as const) {
+        await client.query(
+          `UPDATE ${table} SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3 AND deleted_at IS NULL`,
+          [nowIso, purgeAfter, req.params.id],
+        );
+      }
     }
     await client.query("DELETE FROM sessions WHERE user_id = $1", [req.params.id]);
     await client.query("UPDATE users SET active = 0, deleted_at = $1, updated_at = $1 WHERE id = $2", [nowIso, req.params.id]);

@@ -7,6 +7,7 @@ import {
   type PersistedWorkflowEdge,
   type PersistedWorkflowNode,
   type WorkflowNodeData,
+  BATCH_SIZES,
 } from "../../src/types/workflow";
 import { isLocalImageReference, validateImageDataUrl } from "./imageValidation";
 
@@ -23,7 +24,6 @@ const NODE_KINDS: readonly NodeKind[] = [
 const STATUSES = ["idle", "queued", "running", "success", "error"] as const;
 const IMAGE_ROLES = ["default", "sketch", "garment", "fabric", "reference"] as const;
 const ASPECT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9"] as const;
-const BATCH_SIZES = [1, 2, 4] as const;
 const IMAGE_SIZES = ["2K", "4K"] as const;
 const MAX_NODES = 500;
 const MAX_EDGES = 2_000;

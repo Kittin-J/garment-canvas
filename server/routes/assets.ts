@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { nanoid } from "nanoid";
+import path from "node:path";
 import { requestUser } from "../lib/auth";
 import { asyncHandler } from "../lib/asyncHandler";
 import { query, queryOne, transaction } from "../lib/database";
@@ -58,7 +59,9 @@ assetsRouter.get("/", asyncHandler(async (req, res) => {
     FROM assets a LEFT JOIN users u ON u.id = a.owner_id
     WHERE ($1::text IS NULL OR a.category = $1)
       AND (${includeDeleted ? "a.deleted_at IS NOT NULL" : "a.deleted_at IS NULL"})
-      AND ($2 = 'admin' OR a.scope IN ('global','shared') OR a.owner_id = $3)
+      AND (${includeDeleted
+        ? "$2 = 'admin' OR a.owner_id = $3"
+        : "$2 = 'admin' OR a.scope IN ('global','shared') OR a.owner_id = $3"})
     ORDER BY a.created_at DESC
     LIMIT $4 OFFSET $5
   `, [category ?? null, user.role, user.id, limit, offset]);
@@ -95,6 +98,19 @@ assetsRouter.post("/", asyncHandler(async (req, res) => {
         INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, $2, 'asset', $3)
         ON CONFLICT (id) DO NOTHING
       `, [saved.id, user.id, new Date().toISOString()]);
+    } else {
+      const access = await queryOne<{ owner_id: string | null; shared: boolean }>(`
+        SELECT f.owner_id,
+          EXISTS(
+            SELECT 1 FROM assets a
+            WHERE a.image = $1 AND a.deleted_at IS NULL AND a.scope IN ('global','shared')
+          ) AS shared
+        FROM files f WHERE f.id = $2
+      `, [imageUrl, path.basename(imageUrl)]);
+      if (!access || (access.owner_id !== null && access.owner_id !== user.id && user.role !== "admin" && !access.shared)) {
+        res.status(404).json({ error: "image file not found" });
+        return;
+      }
     }
     const id = nanoid(10);
     const createdAt = new Date().toISOString();
@@ -158,6 +174,7 @@ assetsRouter.post("/:id/references", asyncHandler(async (req, res) => {
     const asset = await queryOne<{ id: string }>(`
       SELECT id FROM assets WHERE id = $1 AND deleted_at IS NULL
         AND (scope IN ('global','shared') OR owner_id = $2)
+      FOR KEY SHARE
     `, [req.params.id, user.id], client);
     if (!asset) return false;
     await client.query(`
@@ -176,33 +193,41 @@ assetsRouter.post("/:id/references", asyncHandler(async (req, res) => {
 
 assetsRouter.delete("/:id", asyncHandler(async (req, res) => {
   const user = requestUser(req);
-  const row = await queryOne<{ owner_id: string | null; scope: "global" | "private" | "shared" }>(
-    "SELECT owner_id, scope FROM assets WHERE id = $1 AND deleted_at IS NULL",
-    [req.params.id],
-  );
-  if (!row) {
+  const result = await transaction(async (client) => {
+    const row = await queryOne<{ owner_id: string | null; scope: "global" | "private" | "shared" }>(
+      "SELECT owner_id, scope FROM assets WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+      [req.params.id],
+      client,
+    );
+    if (!row) return { status: "missing" as const };
+    const canManage = row.scope === "global" ? user.role === "admin" : row.owner_id === user.id;
+    if (!canManage) return { status: "forbidden" as const };
+    const ref = await queryOne<{ project_id: string }>(
+      "SELECT project_id FROM project_asset_refs WHERE asset_id = $1 LIMIT 1",
+      [req.params.id],
+      client,
+    );
+    if (ref) return { status: "referenced" as const };
+    const deletedAt = new Date();
+    const purgeAfter = new Date(deletedAt.getTime() + TRASH_DAYS * 24 * 60 * 60 * 1000);
+    await client.query("UPDATE assets SET deleted_at = $1, purge_after = $2 WHERE id = $3", [
+      deletedAt.toISOString(), purgeAfter.toISOString(), req.params.id,
+    ]);
+    return { status: "deleted" as const, purgeAfter: purgeAfter.toISOString() };
+  });
+  if (result.status === "missing") {
     res.status(404).json({ error: "asset not found" });
     return;
   }
-  const canManage = row.scope === "global" ? user.role === "admin" : row.owner_id === user.id;
-  if (!canManage) {
+  if (result.status === "forbidden") {
     res.status(403).json({ error: "无权删除此素材" });
     return;
   }
-  const ref = await queryOne<{ project_id: string }>(
-    "SELECT project_id FROM project_asset_refs WHERE asset_id = $1 LIMIT 1",
-    [req.params.id],
-  );
-  if (ref) {
+  if (result.status === "referenced") {
     res.status(409).json({ error: "素材正在被项目使用，不能删除" });
     return;
   }
-  const deletedAt = new Date();
-  const purgeAfter = new Date(deletedAt.getTime() + TRASH_DAYS * 24 * 60 * 60 * 1000);
-  await query("UPDATE assets SET deleted_at = $1, purge_after = $2 WHERE id = $3", [
-    deletedAt.toISOString(), purgeAfter.toISOString(), req.params.id,
-  ]);
-  res.json({ ok: true, purgeAfter: purgeAfter.toISOString() });
+  res.json({ ok: true, purgeAfter: result.purgeAfter });
 }));
 
 assetsRouter.post("/:id/restore", asyncHandler(async (req, res) => {

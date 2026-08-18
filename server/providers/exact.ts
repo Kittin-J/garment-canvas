@@ -75,7 +75,11 @@ export async function generateExactImages(
         continue;
       }
       failures.push(publicProviderErrorMessage(error));
-      if (error instanceof ProviderError && error.status !== undefined && error.status >= 400 && error.status < 500) break;
+      if (
+        error instanceof ProviderError &&
+        ((error.status !== undefined && error.status >= 400 && error.status < 500) ||
+          ["content_refused", "invalid_request", "model_unavailable", "gateway_authentication"].includes(error.category))
+      ) break;
     }
   }
 

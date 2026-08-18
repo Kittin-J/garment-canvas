@@ -71,12 +71,7 @@ export async function migrateLegacyData(): Promise<void> {
               typeof raw.image !== "string" || !isLocalImageReference(raw.image)) continue;
           const note = typeof raw.sourceNote === "string" ? raw.sourceNote : null;
           const existing = await queryOne<{ id: string }>("SELECT id FROM assets WHERE image = $1 LIMIT 1", [raw.image], client);
-          if (existing) {
-            await client.query(`
-              UPDATE assets SET name = $1, category = $2, source_note = $3, scope = 'global', owner_id = NULL
-              WHERE image = $4
-            `, [raw.name, raw.category, note, raw.image]);
-          } else {
+          if (!existing) {
             await client.query(`
               INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
               VALUES ($1, NULL, 'global', $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING

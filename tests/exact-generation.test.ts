@@ -19,6 +19,7 @@ import {
   postProcessDirectGenerateImages,
   validateDirectGenerateRequest,
 } from "../server/routes/generate";
+import { requestedCountForStep } from "../server/routes/runPlan";
 import { imageExtensionFromReference } from "../src/lib/imageFormat";
 import type { AIProvider } from "../src/types/workflow";
 
@@ -136,6 +137,30 @@ await test("网关诊断日志会移除 Key、URL 和图片数据", async () => 
   assert.ok(diagnostic?.includes("[redacted-image]"));
   assert.ok(!diagnostic?.includes("sk-secret"));
   assert.ok(!diagnostic?.includes("signed.example"));
+});
+
+await test("内容安全拒绝是确定失败，不会为同一输入重复付费调用", async () => {
+  let calls = 0;
+  const provider: AIProvider = {
+    id: "stub",
+    async generate() {
+      calls += 1;
+      throw new ProviderError("内容拒绝", undefined, "stub", "content_refused");
+    },
+    async edit() { throw new Error("unexpected edit"); },
+  };
+  await assert.rejects(() => generateExactImages(provider, { prompt: "被拒绝" }, 4), ProviderError);
+  assert.equal(calls, 1);
+});
+
+await test("印花裂变缺省 requested_count 与实际默认 4 张一致", async () => {
+  assert.equal(requestedCountForStep("print-mutate", {}), 4);
+  assert.equal(requestedCountForStep("print-mutate", { count: 7 }), 7);
+});
+
+await test("直连与 DAG 的 AI 批量生成统一限制为最多 8 张", async () => {
+  assert.equal(requestedCountForStep("sketch-to-render", { batchSize: 8 }), 8);
+  assert.equal(requestedCountForStep("ai-modify", { batchSize: 99 }), 8);
 });
 
 await test("部分成功保留图片并明确记录 N/M", async () => {

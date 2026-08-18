@@ -15,6 +15,16 @@ import { queryOne } from "../lib/database";
 
 export const runPlanRouter = Router();
 
+export function requestedCountForStep(kind: string, params: Record<string, unknown>): number {
+  return kind === "fabric-recolor"
+    ? Math.max(1, Array.isArray(params.colors) ? params.colors.length : 1)
+    : kind === "print-mutate"
+      ? Math.max(1, Math.min(8, Number(params.count) || 4))
+      : kind === "sketch-to-render" || kind === "ai-modify"
+        ? Math.max(1, Math.min(8, Number(params.batchSize) || 1))
+        : 1;
+}
+
 runPlanRouter.post("/", asyncHandler(async (req, res) => {
   const { nodes, edges, onlyNodeId, includeDownstream, projectId, projectName } = req.body as {
     nodes?: unknown[];
@@ -56,19 +66,17 @@ runPlanRouter.post("/", asyncHandler(async (req, res) => {
     const targetStep = plan.steps.find((step) => step.nodeId === onlyNodeId) ?? plan.steps[plan.steps.length - 1];
     const targetNode = flow.nodes.find((node) => node.id === targetStep.nodeId);
     const params = targetStep.params;
-    const requestedCount = targetStep.kind === "fabric-recolor"
-      ? Math.max(1, Array.isArray(params.colors) ? params.colors.length : 1)
-      : targetStep.kind === "print-mutate"
-        ? Math.max(1, Math.min(8, Number(params.count) || 1))
-        : targetStep.kind === "sketch-to-render" || targetStep.kind === "ai-modify"
-          ? Math.max(1, Math.min(4, Number(params.batchSize) || 1))
-          : 1;
+    const requestedCount = requestedCountForStep(targetStep.kind, params);
     const user = requestUser(req);
     if (typeof projectId === "string") {
       const project = await queryOne<{ owner_id: string }>(
         "SELECT owner_id FROM projects WHERE id = $1 AND deleted_at IS NULL",
         [projectId],
       );
+      if (!project) {
+        res.status(404).json({ error: "项目不存在或已删除" });
+        return;
+      }
       if (project && project.owner_id !== user.id) {
         res.status(403).json({ error: "管理员只能查看其他用户项目，不能运行或修改" });
         return;

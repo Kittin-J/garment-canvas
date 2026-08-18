@@ -1,16 +1,14 @@
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import { useFlowStore } from "@/store/flowStore";
-import type { AiModifyNodeData } from "@/types/workflow";
+import { BATCH_SIZES, type AiModifyNodeData } from "@/types/workflow";
 import { NodeFrame, RunButton, Developing, inputClass } from "./NodeFrame";
 import { ImageGrid } from "./ImageGrid";
 
 const ASPECT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9"];
-const BATCH_SIZES = [1, 2, 4] as const;
-
 export function AiModifyNode({ id, data, selected }: NodeProps<Node<AiModifyNodeData>>) {
   const updateNodeData = useFlowStore((s) => s.updateNodeData);
   const runNode = useFlowStore((s) => s.runNode);
-  const running = data.status === "running";
+  const running = data.status === "running" || data.status === "queued";
 
   return (
     <>
@@ -47,7 +45,7 @@ export function AiModifyNode({ id, data, selected }: NodeProps<Node<AiModifyNode
             <select
               value={data.batchSize}
               onChange={(e) =>
-                updateNodeData(id, { batchSize: Number(e.target.value) as 1 | 2 | 4 })
+                updateNodeData(id, { batchSize: Number(e.target.value) as 1 | 2 | 4 | 8 })
               }
               className={inputClass}
             >
@@ -59,7 +57,7 @@ export function AiModifyNode({ id, data, selected }: NodeProps<Node<AiModifyNode
             </select>
           </label>
         </div>
-        <RunButton running={running} onClick={() => void runNode(id)} label={data.label} />
+        <RunButton running={running} queued={data.status === "queued"} onClick={() => void runNode(id)} label={data.label} />
         {running && <Developing />}
         <ImageGrid images={data.outputImages} />
       </NodeFrame>

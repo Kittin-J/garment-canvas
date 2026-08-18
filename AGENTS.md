@@ -82,3 +82,24 @@ This project is indexed by GitNexus as **garment-canvas** (7300 symbols, 15964 r
 - Codex reviews `BASE_COMMIT..CLAUDE_COMMIT`, reruns impact analysis and tests, and decides whether to adopt, rewrite, or reject each change. Never cherry-pick a Claude commit without reviewing its diff and evidence.
 - Every Claude handoff must include `BASE_COMMIT`, worktree path, branch, commit IDs, findings, tests run, affected flows, residual risks, and requested Codex review focus.
 - Refresh stale GitNexus data with `node .gitnexus/run.cjs analyze --index-only --pdg`; keep `--index-only` so generated context does not overwrite these shared rules.
+
+## Codex application-audit handoff (2026-08-18)
+
+- Branch/worktree: `codex/fix-app-review` in `.claude/worktrees/fix-app-review`, based on `main` commit `7859749`.
+- Source reviewed: `CODEX_REVIEW_HANDOFF_APP.md`; findings were reproduced against current code rather than applied blindly.
+- Confirmed and fixed: G1–G4, G6–G8, A1–A2, A4–A6, D1–D6, F1–F2, F4–F5, F7–F9.
+- Key behavior changes:
+  - DAG generation records settle once per whole run, aggregate successful provider requests, and clean files from failed runs.
+  - SSE consumers require a target-node terminal event, reject stale sequence numbers, and preflight run liveness.
+  - Legacy assets are insert-only; existing ownership/scope is never overwritten.
+  - Active account IDs use a partial unique index so soft-deleted login names can be reused.
+  - Forced-password admins cannot call account-management routes before changing the temporary password.
+  - Asset creation validates file access; deletion/reference writes use row locks; deleted listings and history deletion do not leak other users' data.
+  - Initial history merges optimistic records, and pagination is pinned to a stable `before` snapshot.
+- Product decisions implemented after the initial audit:
+  - G5: direct generation and DAG generation now share an 8-image maximum; sketch/render and AI-modify expose 1/2/4/8 choices end to end.
+  - A3: files, generation runs, and usage events receive the same 15-day tombstones as projects/assets; expiry removes database rows plus stored image files.
+  - F3: the product limit remains connection-count based (maximum 8 incoming connections), and each image-upload node has one singular `imageUrl`/single-file picker.
+  - F6: queued/running tabs cannot be closed, so the active SSE can always write results back to the canvas.
+  - F10/F11: selecting a fifth comparison image shows an explicit limit message; queued buttons are disabled and labelled `排队中…` across all AI nodes.
+- Validation completed: `npm run check` passed, `npm run build` passed, and GitNexus compare-mode change detection reviewed the expected generation/provider/auth/history/asset flows (overall graph risk: CRITICAL because shared Provider and SSE hubs changed).

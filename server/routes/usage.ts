@@ -16,6 +16,7 @@ async function queryRows(ownerId: string | null, from: string | null, to: string
     SELECT e.*, u.account_id, u.display_name
     FROM usage_events e JOIN users u ON u.id = e.owner_id
     WHERE ($1::text IS NULL OR e.owner_id = $1)
+      AND e.deleted_at IS NULL
       AND ($2::text IS NULL OR e.created_at >= $2)
       AND ($3::text IS NULL OR e.created_at <= $3)
     ORDER BY e.created_at DESC

@@ -12,7 +12,7 @@ const IMAGE_SIZES = [
 export function UpscaleNode({ id, data, selected }: NodeProps<Node<UpscaleNodeData>>) {
   const updateNodeData = useFlowStore((s) => s.updateNodeData);
   const runNode = useFlowStore((s) => s.runNode);
-  const running = data.status === "running";
+  const running = data.status === "running" || data.status === "queued";
 
   return (
     <>
@@ -40,7 +40,7 @@ export function UpscaleNode({ id, data, selected }: NodeProps<Node<UpscaleNodeDa
             })}
           </div>
         </div>
-        <RunButton running={running} onClick={() => void runNode(id)} label="高清放大" />
+        <RunButton running={running} queued={data.status === "queued"} onClick={() => void runNode(id)} label="高清放大" />
         {running && <Developing />}
         <ImageGrid images={data.outputImages} />
       </NodeFrame>

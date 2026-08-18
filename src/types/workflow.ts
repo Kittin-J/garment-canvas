@@ -24,6 +24,8 @@ export type NodeRunStatus =
 
 /** OpenAI Images Edit 最多支持 16 图；产品端为控制成本与上传体积限制为 8 图。 */
 export const MAX_REFERENCE_IMAGES = 8;
+export const BATCH_SIZES = [1, 2, 4, 8] as const;
+export type BatchSize = (typeof BATCH_SIZES)[number];
 
 // ---------- 节点数据（存 React Flow node.data）----------
 export interface BaseNodeData {
@@ -44,7 +46,7 @@ export interface SketchToRenderNodeData extends BaseNodeData {
   kind: "sketch-to-render";
   prompt: string;
   aspectRatio: string;       // "1:1" | "3:4" | "4:3" | "9:16" | "16:9"
-  batchSize: 1 | 2 | 4;
+  batchSize: BatchSize;
   outputImages: string[];    // 生成结果
 }
 
@@ -52,7 +54,7 @@ export interface AiModifyNodeData extends BaseNodeData {
   kind: "ai-modify";
   prompt: string;
   aspectRatio: string;
-  batchSize: 1 | 2 | 4;            // 改款指令，如"改成娃娃领、袖长改短"
+  batchSize: BatchSize;            // 改款指令，如"改成娃娃领、袖长改短"
   outputImages: string[];
 }
 
