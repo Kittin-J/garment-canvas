@@ -34,6 +34,7 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
     JOIN users u ON u.id = r.owner_id
     LEFT JOIN generation_outputs o ON o.run_id = r.id
     WHERE ($1::text IS NULL OR r.owner_id = $1)
+      AND r.deleted_at IS NULL
       AND r.started_at <= $2
       AND (o.id IS NOT NULL OR r.status IN ('queued','running'))
     ORDER BY r.started_at DESC, o.created_at ASC

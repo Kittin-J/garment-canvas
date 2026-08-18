@@ -91,14 +91,14 @@ function PropertyEditor({ nodeId }: { nodeId: string }) {
         <button
           type="button"
           onClick={() => void runNode(nodeId)}
-          disabled={d.status === "running"}
+          disabled={d.status === "running" || d.status === "queued"}
           className={`w-full rounded-md px-3 py-1.5 text-xs font-medium hover:opacity-90 ${
-            d.status === "running"
+            d.status === "running" || d.status === "queued"
               ? "btn-running-breathe bg-[#3a3226] text-gold"
               : "bg-gold text-ink disabled:opacity-40"
           }`}
         >
-          {d.status === "running" ? "显影中…" : "运行此节点"}
+          {d.status === "queued" ? "排队中…" : d.status === "running" ? "显影中…" : "运行此节点"}
         </button>
       )}
     </div>
