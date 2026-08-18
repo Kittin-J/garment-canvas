@@ -85,6 +85,14 @@ export function thumbnailUrlForImage(ref: string): string {
   return match ? `/api/files/${match[1]}/thumbnail` : ref;
 }
 
+/** 删除仅由失败 run 产生的原图和可重建缩略图缓存。 */
+export function deleteStoredImage(id: string): void {
+  if (!isSupportedImageFile(id) || path.basename(id) !== id) return;
+  for (const filePath of [path.join(uploadsDir(), id), path.join(thumbnailsDir(), `${id}.webp`)]) {
+    try { fs.rmSync(filePath, { force: true }); } catch { /* best-effort cleanup */ }
+  }
+}
+
 /** dataURL 存盘，返回 { id, url } */
 export function saveDataUrl(dataUrl: string): { id: string; url: string } {
   const { mime, buffer } = validateImageDataUrl(dataUrl);

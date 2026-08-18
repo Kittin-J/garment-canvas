@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
-import { useFlowStore } from "@/store/flowStore";
+import { appendSavedAsset, useFlowStore } from "@/store/flowStore";
 import type { PrintExtractNodeData } from "@/types/workflow";
 import { NodeFrame, RunButton, Developing, inputClass } from "./NodeFrame";
 import { ImageGrid } from "./ImageGrid";
@@ -31,7 +31,9 @@ export function PrintExtractNode({ id, data, selected }: NodeProps<Node<PrintExt
         }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      updateNodeData(id, { savedAsAssets: [...saved, url] });
+      const latest = useFlowStore.getState().nodes.find((node) => node.id === id)?.data;
+      const current = latest?.kind === "print-extract" ? latest.savedAsAssets : undefined;
+      updateNodeData(id, { savedAsAssets: appendSavedAsset(current, url) });
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err));
     } finally {

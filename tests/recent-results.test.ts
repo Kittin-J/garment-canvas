@@ -4,7 +4,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   applyRunEventToNode,
   applyRunEventToRecentResults,
+  appendSavedAsset,
   normalizeRunEvent,
+  mergeRecentResults,
   resumeRecentResults,
   useFlowStore,
   type RecentResult,
@@ -95,6 +97,32 @@ test("生成失败也保留点击时的卡片和错误信息", () => {
   assert.equal(result[0].status, "error");
   assert.equal(result[0].error, "上游图片缺失");
   assert.equal(result[0].image, "");
+});
+
+test("首次历史响应与请求期间新增的乐观记录合并且按 id 去重", () => {
+  const optimistic: RecentResult = {
+    ...queued,
+    id: "optimistic",
+    runId: "run-optimistic",
+    status: "running",
+    startedAt: 2_000,
+  };
+  const serverRecord: RecentResult = {
+    ...queued,
+    id: "server-record",
+    runId: "run-server",
+    status: "success",
+    image: "/api/files/server.png",
+  };
+  assert.deepEqual(
+    mergeRecentResults([optimistic], [serverRecord, optimistic]),
+    [optimistic, serverRecord],
+  );
+});
+
+test("并发保存素材按最新状态追加且保持幂等", () => {
+  assert.deepEqual(appendSavedAsset(["a"], "b"), ["a", "b"]);
+  assert.deepEqual(appendSavedAsset(["a", "b"], "b"), ["a", "b"]);
 });
 
 test("异常错误事件即使夹带 images 也不会清空节点原有图片", () => {
@@ -298,6 +326,29 @@ try {
     })),
     firstTerminalCards,
   );
+
+  useFlowStore.setState({ recentResults: [{ ...resumable, id: "done-without-terminal" }] });
+  resumeRecentResults([{ ...resumable, id: "done-without-terminal" }]);
+  await waitFor(() => MockEventSource.instances.length === 4, "缺少终态的恢复连接未建立");
+  MockEventSource.instances[3].emit({ type: "done", seq: 1 }, "1");
+  await waitFor(() => MockEventSource.instances[3].closed, "缺少终态时连接未关闭");
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(useFlowStore.getState().recentResults[0].status, "error");
+
+  useFlowStore.setState({ recentResults: [{ ...resumable, id: "out-of-order", status: "running" }] });
+  resumeRecentResults([{ ...resumable, id: "out-of-order", status: "running" }]);
+  await waitFor(() => MockEventSource.instances.length === 5, "乱序事件恢复连接未建立");
+  MockEventSource.instances[4].emit({
+    type: "node-status", nodeId: resumable.nodeId, status: "success",
+    images: ["/api/files/order.png"], seq: 2,
+  }, "2");
+  MockEventSource.instances[4].emit({
+    type: "node-status", nodeId: resumable.nodeId, status: "running", seq: 1,
+  }, "1");
+  MockEventSource.instances[4].emit({ type: "done", seq: 3 }, "3");
+  await waitFor(() => MockEventSource.instances[4].closed, "乱序事件连接未关闭");
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(useFlowStore.getState().recentResults[0].status, "success");
   passed += 1;
   console.log("  ✓ 重叠历史页去重，释放后重放终态事件仍保持幂等");
 } finally {

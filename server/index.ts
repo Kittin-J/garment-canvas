@@ -120,6 +120,12 @@ async function start(): Promise<void> {
   await migrateLegacyData();
   const initialReadiness = await readiness();
   if (!initialReadiness.ok) throw new Error(`Server is not ready: ${JSON.stringify(initialReadiness.checks)}`);
+  const sessionPruneTimer = setInterval(() => {
+    void pruneExpiredSessions().catch((error) => {
+      console.error("[garment-canvas] session cleanup failed", error);
+    });
+  }, 6 * 60 * 60 * 1000);
+  sessionPruneTimer.unref();
   app.listen(port, () => {
     console.log(`[garment-canvas] server listening on http://localhost:${port} (${initialReadiness.mode})`);
   });

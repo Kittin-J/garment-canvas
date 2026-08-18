@@ -1,7 +1,7 @@
 // server/index.ts
 import express2 from "express";
 import fs8 from "node:fs";
-import path9 from "node:path";
+import path10 from "node:path";
 
 // server/config.ts
 import fs from "node:fs";
@@ -247,6 +247,21 @@ var NotImplementedError = class extends ProviderError {
   }
 };
 async function fetchWithRetry(url, initFactory, opts) {
+  let parsedUrl;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    throw new ProviderError("AI \u7F51\u5173\u5730\u5740\u65E0\u6548\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u68C0\u67E5\u914D\u7F6E", 400, opts?.providerId, "invalid_request");
+  }
+  if (parsedUrl.protocol !== "https:") {
+    throw new ProviderError(
+      "AI \u7F51\u5173\u5FC5\u987B\u4F7F\u7528 HTTPS\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u68C0\u67E5\u914D\u7F6E",
+      400,
+      opts?.providerId,
+      "invalid_request",
+      `Blocked non-HTTPS provider URL with protocol ${parsedUrl.protocol}`
+    );
+  }
   const timeoutMs = opts?.timeoutMs ?? config.aiTimeoutMs();
   const maxRetries = opts?.maxRetries ?? config.aiMaxRetries();
   let lastError;
@@ -804,7 +819,7 @@ async function generateExactImages(provider, request, requestedCount) {
     } catch (error) {
       firstError ??= error;
       failures.push(publicProviderErrorMessage(error));
-      if (error instanceof ProviderError && error.status !== void 0 && error.status >= 400 && error.status < 500) break;
+      if (error instanceof ProviderError && (error.status !== void 0 && error.status >= 400 && error.status < 500 || ["content_refused", "invalid_request", "model_unavailable", "gateway_authentication"].includes(error.category))) break;
     }
   }
   if (images.length === 0) throw firstError instanceof Error ? firstError : new Error(failures[0] ?? "\u6A21\u578B\u672A\u8FD4\u56DE\u56FE\u7247");
@@ -880,6 +895,15 @@ async function ensureThumbnail(id) {
 function thumbnailUrlForImage(ref) {
   const match = /^\/api\/files\/([^/?#]+)$/.exec(ref);
   return match ? `/api/files/${match[1]}/thumbnail` : ref;
+}
+function deleteStoredImage(id) {
+  if (!isSupportedImageFile(id) || path2.basename(id) !== id) return;
+  for (const filePath of [path2.join(uploadsDir(), id), path2.join(thumbnailsDir(), `${id}.webp`)]) {
+    try {
+      fs2.rmSync(filePath, { force: true });
+    } catch {
+    }
+  }
 }
 function saveDataUrl(dataUrl) {
   const { mime, buffer } = validateImageDataUrl(dataUrl);
@@ -1669,6 +1693,17 @@ async function migrate() {
         ["revoked_session_reasons", (/* @__PURE__ */ new Date()).toISOString()]
       );
     }
+    if (!applied.has(4)) {
+      await client.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_id_key");
+      await client.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS users_active_account_id_unique
+        ON users(account_id) WHERE deleted_at IS NULL
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (4, $1, $2)",
+        ["active_account_id_unique", (/* @__PURE__ */ new Date()).toISOString()]
+      );
+    }
     return imported;
   });
   if (importedRows !== void 0) {
@@ -1689,7 +1724,7 @@ async function bootstrapInitialAdmin() {
   await db().query(`
     INSERT INTO users (id, account_id, display_name, role, password_hash, must_change_password, active, created_at, updated_at)
     VALUES ($1, $2, $3, 'admin', $4, 1, 1, $5, $5)
-    ON CONFLICT (account_id) DO NOTHING
+    ON CONFLICT (account_id) WHERE deleted_at IS NULL DO NOTHING
   `, [nanoid2(12), accountId, "\u7BA1\u7406\u5458", hashPassword(password), now]);
 }
 async function hasUsers() {
@@ -1804,7 +1839,11 @@ async function completeGenerationRecord(args) {
   });
 }
 async function failGenerationRecord(runId, error, finishedAt) {
-  await transaction(async (client) => {
+  const generatedFileIds = await transaction(async (client) => {
+    const files = await client.query(
+      "SELECT id FROM files WHERE run_id = $1 FOR UPDATE",
+      [runId]
+    );
     await client.query("UPDATE generation_runs SET status = 'error', error = $1, finished_at = $2 WHERE id = $3", [
       error,
       finishedAt,
@@ -1815,7 +1854,10 @@ async function failGenerationRecord(runId, error, finishedAt) {
       INSERT INTO generation_outputs (id, run_id, image, status, error, created_at)
       SELECT $1, id, '', 'error', $2, $3 FROM generation_runs WHERE id = $4
     `, [nanoid3(12), error, finishedAt, runId]);
+    await client.query("DELETE FROM files WHERE run_id = $1", [runId]);
+    return files.rows.map((row) => row.id);
   });
+  generatedFileIds.forEach(deleteStoredImage);
 }
 
 // server/engine/runner.ts
@@ -1889,32 +1931,40 @@ function emit(run, event) {
 }
 async function executeRun(run) {
   const outputs = /* @__PURE__ */ new Map();
+  let providerRequests = 0;
+  let model;
+  let recordResult;
+  if (run.recordContext) await markGenerationRunning(run.id, Date.now());
+  const failRun = async (message, nodeId, startedAt) => {
+    const finishedAt = Date.now();
+    if (run.recordContext) await failGenerationRecord(run.id, message, finishedAt);
+    if (nodeId) {
+      emit(run, {
+        type: "node-status",
+        nodeId,
+        status: "error",
+        error: message,
+        ...startedAt !== void 0 ? { startedAt } : {},
+        finishedAt
+      });
+    }
+    emit(run, { type: "run-error", ...nodeId ? { nodeId } : {}, error: message, finishedAt });
+  };
   for (const step of run.plan.steps) {
     const inputImages = (step.upstream ?? []).flatMap(
       (u) => outputs.get(u.nodeId) ?? u.images
     );
     if (NODE_SPECS[step.kind].providerId && inputImages.length > MAX_REFERENCE_IMAGES) {
       const message = `Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`;
-      const finishedAt = Date.now();
-      emit(run, { type: "node-status", nodeId: step.nodeId, status: "error", error: message, finishedAt });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      await failRun(message, step.nodeId);
       return;
     }
     if (NODE_SPECS[step.kind].providerId && step.kind !== "sketch-to-render" && inputImages.length === 0) {
       const message = `Node ${step.nodeId} requires an upstream image`;
-      const finishedAt = Date.now();
-      emit(run, {
-        type: "node-status",
-        nodeId: step.nodeId,
-        status: "error",
-        error: message,
-        finishedAt
-      });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      await failRun(message, step.nodeId);
       return;
     }
     const startedAt = Date.now();
-    if (run.recordContext?.nodeId === step.nodeId) await markGenerationRunning(run.id, startedAt);
     emit(run, { type: "node-status", nodeId: step.nodeId, status: "running", startedAt });
     try {
       const result = await executeStep(step, inputImages);
@@ -1924,17 +1974,10 @@ async function executeRun(run) {
       }
       outputs.set(step.nodeId, persisted);
       const finishedAt = Date.now();
+      providerRequests += result.providerRequests;
+      if (result.model) model = result.model;
       if (run.recordContext?.nodeId === step.nodeId) {
-        await completeGenerationRecord({
-          runId: run.id,
-          images: persisted,
-          prompts: result.prompts,
-          failures: result.failures,
-          model: result.model,
-          providerRequests: result.providerRequests,
-          startedAt,
-          finishedAt
-        });
+        recordResult = { images: persisted, prompts: result.prompts, failures: result.failures };
       }
       const partialWarning = result.failures?.length ? `${result.failures.length} \u4E2A\u751F\u6210\u4EFB\u52A1\u5931\u8D25` : void 0;
       emit(run, {
@@ -1951,19 +1994,22 @@ async function executeRun(run) {
       });
     } catch (err) {
       const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
-      const finishedAt = Date.now();
-      if (run.recordContext?.nodeId === step.nodeId) await failGenerationRecord(run.id, message, finishedAt);
-      emit(run, {
-        type: "node-status",
-        nodeId: step.nodeId,
-        status: "error",
-        error: message,
-        startedAt,
-        finishedAt
-      });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      await failRun(message, step.nodeId, startedAt);
       return;
     }
+  }
+  if (run.recordContext) {
+    const finishedAt = Date.now();
+    await completeGenerationRecord({
+      runId: run.id,
+      images: recordResult?.images ?? [],
+      prompts: recordResult?.prompts,
+      failures: recordResult?.failures,
+      model,
+      providerRequests,
+      startedAt: run.createdAt,
+      finishedAt
+    });
   }
   emit(run, { type: "done" });
 }
@@ -2096,19 +2142,21 @@ function cookieValue(req, name) {
   }
   return void 0;
 }
-async function createSession(userId) {
+async function createSession(userId, options = {}) {
   const token = randomBytes2(32).toString("base64url");
   const now = /* @__PURE__ */ new Date();
   const expiresAt = new Date(now.getTime() + SESSION_DAYS * 24 * 60 * 60 * 1e3).toISOString();
   await transaction(async (client) => {
     const lockedUser = await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [userId]);
     if (lockedUser.rowCount !== 1) throw new Error("\u7528\u6237\u4E0D\u5B58\u5728");
-    await client.query(`
-      INSERT INTO revoked_sessions (token_hash, reason, revoked_at, expires_at)
-      SELECT token_hash, 'replaced', $2, expires_at FROM sessions WHERE user_id = $1
-      ON CONFLICT (token_hash) DO UPDATE
-        SET reason = excluded.reason, revoked_at = excluded.revoked_at, expires_at = excluded.expires_at
-    `, [userId, now.toISOString()]);
+    if (options.markExistingAsReplaced !== false) {
+      await client.query(`
+        INSERT INTO revoked_sessions (token_hash, reason, revoked_at, expires_at)
+        SELECT token_hash, 'replaced', $2, expires_at FROM sessions WHERE user_id = $1
+        ON CONFLICT (token_hash) DO UPDATE
+          SET reason = excluded.reason, revoked_at = excluded.revoked_at, expires_at = excluded.expires_at
+      `, [userId, now.toISOString()]);
+    }
     await client.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
     await client.query(
       "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
@@ -2487,60 +2535,60 @@ var WorkflowValidationError = class extends Error {
     this.name = "WorkflowValidationError";
   }
 };
-function fail(path10, message) {
-  throw new WorkflowValidationError(`${path10}: ${message}`);
+function fail(path11, message) {
+  throw new WorkflowValidationError(`${path11}: ${message}`);
 }
-function record(value, path10) {
+function record(value, path11) {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    fail(path10, "must be an object");
+    fail(path11, "must be an object");
   }
   return value;
 }
-function stringValue(value, path10, opts) {
-  if (typeof value !== "string") fail(path10, "must be a string");
-  if (opts?.nonEmpty && value.trim().length === 0) fail(path10, "must not be empty");
-  if (value.length > MAX_TEXT_LENGTH) fail(path10, `must be at most ${MAX_TEXT_LENGTH} characters`);
+function stringValue(value, path11, opts) {
+  if (typeof value !== "string") fail(path11, "must be a string");
+  if (opts?.nonEmpty && value.trim().length === 0) fail(path11, "must not be empty");
+  if (value.length > MAX_TEXT_LENGTH) fail(path11, `must be at most ${MAX_TEXT_LENGTH} characters`);
   return value;
 }
-function optionalString(value, path10) {
-  return value === void 0 ? void 0 : stringValue(value, path10);
+function optionalString(value, path11) {
+  return value === void 0 ? void 0 : stringValue(value, path11);
 }
-function imageReference(value, path10) {
-  const ref = stringValue(value, path10, { nonEmpty: true });
+function imageReference(value, path11) {
+  const ref = stringValue(value, path11, { nonEmpty: true });
   if (ref.startsWith("data:")) {
     try {
       validateImageDataUrl(ref);
     } catch (error) {
-      fail(path10, error instanceof Error ? error.message : "invalid image dataURL");
+      fail(path11, error instanceof Error ? error.message : "invalid image dataURL");
     }
     return ref;
   }
   const isRemote = /^https?:\/\//i.test(ref);
   if (!isLocalImageReference(ref) && !isRemote) {
-    fail(path10, "must be an image dataURL, local /api/files reference, or http(s) URL");
+    fail(path11, "must be an image dataURL, local /api/files reference, or http(s) URL");
   }
   return ref;
 }
-function optionalImageReference(value, path10) {
-  return value === void 0 ? void 0 : imageReference(value, path10);
+function optionalImageReference(value, path11) {
+  return value === void 0 ? void 0 : imageReference(value, path11);
 }
-function finiteNumber(value, path10) {
-  if (typeof value !== "number" || !Number.isFinite(value)) fail(path10, "must be a finite number");
+function finiteNumber(value, path11) {
+  if (typeof value !== "number" || !Number.isFinite(value)) fail(path11, "must be a finite number");
   return value;
 }
-function oneOf(value, allowed, path10) {
-  if (!allowed.includes(value)) fail(path10, `must be one of: ${allowed.join(", ")}`);
+function oneOf(value, allowed, path11) {
+  if (!allowed.includes(value)) fail(path11, `must be one of: ${allowed.join(", ")}`);
   return value;
 }
-function stringArray(value, path10, max = MAX_IMAGE_REFS) {
-  if (!Array.isArray(value)) fail(path10, "must be an array");
-  if (value.length > max) fail(path10, `must contain at most ${max} items`);
-  return value.map((item, index) => stringValue(item, `${path10}[${index}]`, { nonEmpty: true }));
+function stringArray(value, path11, max = MAX_IMAGE_REFS) {
+  if (!Array.isArray(value)) fail(path11, "must be an array");
+  if (value.length > max) fail(path11, `must contain at most ${max} items`);
+  return value.map((item, index) => stringValue(item, `${path11}[${index}]`, { nonEmpty: true }));
 }
-function imageReferenceArray(value, path10, max = MAX_IMAGE_REFS) {
-  if (!Array.isArray(value)) fail(path10, "must be an array");
-  if (value.length > max) fail(path10, `must contain at most ${max} items`);
-  return value.map((item, index) => imageReference(item, `${path10}[${index}]`));
+function imageReferenceArray(value, path11, max = MAX_IMAGE_REFS) {
+  if (!Array.isArray(value)) fail(path11, "must be an array");
+  if (value.length > max) fail(path11, `must contain at most ${max} items`);
+  return value.map((item, index) => imageReference(item, `${path11}[${index}]`));
 }
 function migrateNodeData(kind, raw) {
   switch (kind) {
@@ -2562,87 +2610,87 @@ function migrateNodeData(kind, raw) {
       return { images: [], ...raw };
   }
 }
-function validateData(kind, rawValue, path10) {
-  const input = record(rawValue, path10);
+function validateData(kind, rawValue, path11) {
+  const input = record(rawValue, path11);
   const runtimeStatus = input.status;
   const raw = runtimeStatus === "queued" || runtimeStatus === "running" || runtimeStatus === "error" ? { ...input, status: "idle", error: void 0 } : input;
-  if (raw.kind !== kind) fail(`${path10}.kind`, `must equal node type ${kind}`);
-  stringValue(raw.label, `${path10}.label`, { nonEmpty: true });
-  oneOf(raw.status, STATUSES, `${path10}.status`);
-  optionalString(raw.error, `${path10}.error`);
+  if (raw.kind !== kind) fail(`${path11}.kind`, `must equal node type ${kind}`);
+  stringValue(raw.label, `${path11}.label`, { nonEmpty: true });
+  oneOf(raw.status, STATUSES, `${path11}.status`);
+  optionalString(raw.error, `${path11}.error`);
   switch (kind) {
     case "image-input":
-      oneOf(raw.imageRole, IMAGE_ROLES, `${path10}.imageRole`);
-      optionalImageReference(raw.imageUrl, `${path10}.imageUrl`);
+      oneOf(raw.imageRole, IMAGE_ROLES, `${path11}.imageRole`);
+      optionalImageReference(raw.imageUrl, `${path11}.imageUrl`);
       break;
     case "sketch-to-render":
     case "ai-modify":
-      stringValue(raw.prompt, `${path10}.prompt`);
-      oneOf(raw.aspectRatio, ASPECT_RATIOS, `${path10}.aspectRatio`);
-      oneOf(raw.batchSize, BATCH_SIZES, `${path10}.batchSize`);
-      imageReferenceArray(raw.outputImages, `${path10}.outputImages`);
+      stringValue(raw.prompt, `${path11}.prompt`);
+      oneOf(raw.aspectRatio, ASPECT_RATIOS, `${path11}.aspectRatio`);
+      oneOf(raw.batchSize, BATCH_SIZES, `${path11}.batchSize`);
+      imageReferenceArray(raw.outputImages, `${path11}.outputImages`);
       break;
     case "fabric-recolor": {
-      const colors = stringArray(raw.colors, `${path10}.colors`, 8);
+      const colors = stringArray(raw.colors, `${path11}.colors`, 8);
       for (let i = 0; i < colors.length; i++) {
-        if (!/^#[0-9a-fA-F]{6}$/.test(colors[i])) fail(`${path10}.colors[${i}]`, "must be #RRGGBB");
+        if (!/^#[0-9a-fA-F]{6}$/.test(colors[i])) fail(`${path11}.colors[${i}]`, "must be #RRGGBB");
       }
-      stringValue(raw.prompt, `${path10}.prompt`);
-      optionalImageReference(raw.fabricImageUrl, `${path10}.fabricImageUrl`);
-      imageReferenceArray(raw.outputImages, `${path10}.outputImages`);
+      stringValue(raw.prompt, `${path11}.prompt`);
+      optionalImageReference(raw.fabricImageUrl, `${path11}.fabricImageUrl`);
+      imageReferenceArray(raw.outputImages, `${path11}.outputImages`);
       break;
     }
     case "upscale":
-      oneOf(raw.imageSize, IMAGE_SIZES, `${path10}.imageSize`);
-      imageReferenceArray(raw.outputImages, `${path10}.outputImages`);
+      oneOf(raw.imageSize, IMAGE_SIZES, `${path11}.imageSize`);
+      imageReferenceArray(raw.outputImages, `${path11}.outputImages`);
       break;
     case "print-extract":
-      stringValue(raw.prompt, `${path10}.prompt`);
-      imageReferenceArray(raw.outputImages, `${path10}.outputImages`);
-      imageReferenceArray(raw.savedAsAssets, `${path10}.savedAsAssets`);
+      stringValue(raw.prompt, `${path11}.prompt`);
+      imageReferenceArray(raw.outputImages, `${path11}.outputImages`);
+      imageReferenceArray(raw.savedAsAssets, `${path11}.savedAsAssets`);
       break;
     case "print-mutate":
-      stringValue(raw.prompt, `${path10}.prompt`);
+      stringValue(raw.prompt, `${path11}.prompt`);
       if (!Number.isInteger(raw.count) || raw.count < 1 || raw.count > 8) {
-        fail(`${path10}.count`, "must be an integer from 1 to 8");
+        fail(`${path11}.count`, "must be an integer from 1 to 8");
       }
-      imageReferenceArray(raw.outputImages, `${path10}.outputImages`);
+      imageReferenceArray(raw.outputImages, `${path11}.outputImages`);
       break;
     case "result":
-      imageReferenceArray(raw.images, `${path10}.images`);
-      optionalString(raw.note, `${path10}.note`);
+      imageReferenceArray(raw.images, `${path11}.images`);
+      optionalString(raw.note, `${path11}.note`);
       break;
   }
   return raw;
 }
 function validateNode(value, index, migrateLegacy) {
-  const path10 = `flow.nodes[${index}]`;
-  const raw = record(value, path10);
-  const id = stringValue(raw.id, `${path10}.id`, { nonEmpty: true });
-  if (!SAFE_ID.test(id)) fail(`${path10}.id`, "must contain only letters, digits, underscore or hyphen");
-  const type = oneOf(raw.type, NODE_KINDS, `${path10}.type`);
-  const position = record(raw.position, `${path10}.position`);
-  finiteNumber(position.x, `${path10}.position.x`);
-  finiteNumber(position.y, `${path10}.position.y`);
-  const initialData = record(raw.data, `${path10}.data`);
+  const path11 = `flow.nodes[${index}]`;
+  const raw = record(value, path11);
+  const id = stringValue(raw.id, `${path11}.id`, { nonEmpty: true });
+  if (!SAFE_ID.test(id)) fail(`${path11}.id`, "must contain only letters, digits, underscore or hyphen");
+  const type = oneOf(raw.type, NODE_KINDS, `${path11}.type`);
+  const position = record(raw.position, `${path11}.position`);
+  finiteNumber(position.x, `${path11}.position.x`);
+  finiteNumber(position.y, `${path11}.position.y`);
+  const initialData = record(raw.data, `${path11}.data`);
   const data = validateData(
     type,
     migrateLegacy ? migrateNodeData(type, initialData) : initialData,
-    `${path10}.data`
+    `${path11}.data`
   );
   return { ...raw, id, type, position: { ...position, x: position.x, y: position.y }, data };
 }
 function validateEdge(value, index) {
-  const path10 = `flow.edges[${index}]`;
-  const raw = record(value, path10);
-  const id = stringValue(raw.id, `${path10}.id`, { nonEmpty: true });
-  const source = stringValue(raw.source, `${path10}.source`, { nonEmpty: true });
-  const target = stringValue(raw.target, `${path10}.target`, { nonEmpty: true });
-  if (!SAFE_ID.test(id)) fail(`${path10}.id`, "must contain only letters, digits, underscore or hyphen");
-  if (!SAFE_ID.test(source)) fail(`${path10}.source`, "must be a valid node id");
-  if (!SAFE_ID.test(target)) fail(`${path10}.target`, "must be a valid node id");
-  if (raw.sourceHandle !== void 0 && raw.sourceHandle !== null) stringValue(raw.sourceHandle, `${path10}.sourceHandle`);
-  if (raw.targetHandle !== void 0 && raw.targetHandle !== null) stringValue(raw.targetHandle, `${path10}.targetHandle`);
+  const path11 = `flow.edges[${index}]`;
+  const raw = record(value, path11);
+  const id = stringValue(raw.id, `${path11}.id`, { nonEmpty: true });
+  const source = stringValue(raw.source, `${path11}.source`, { nonEmpty: true });
+  const target = stringValue(raw.target, `${path11}.target`, { nonEmpty: true });
+  if (!SAFE_ID.test(id)) fail(`${path11}.id`, "must contain only letters, digits, underscore or hyphen");
+  if (!SAFE_ID.test(source)) fail(`${path11}.source`, "must be a valid node id");
+  if (!SAFE_ID.test(target)) fail(`${path11}.target`, "must be a valid node id");
+  if (raw.sourceHandle !== void 0 && raw.sourceHandle !== null) stringValue(raw.sourceHandle, `${path11}.sourceHandle`);
+  if (raw.targetHandle !== void 0 && raw.targetHandle !== null) stringValue(raw.targetHandle, `${path11}.targetHandle`);
   return { ...raw, id, source, target };
 }
 function validateAndMigrateFlow(value) {
@@ -2694,6 +2742,9 @@ function asyncHandler(handler) {
 
 // server/routes/runPlan.ts
 var runPlanRouter = Router2();
+function requestedCountForStep(kind, params) {
+  return kind === "fabric-recolor" ? Math.max(1, Array.isArray(params.colors) ? params.colors.length : 1) : kind === "print-mutate" ? Math.max(1, Math.min(8, Number(params.count) || 4)) : kind === "sketch-to-render" || kind === "ai-modify" ? Math.max(1, Math.min(4, Number(params.batchSize) || 1)) : 1;
+}
 runPlanRouter.post("/", asyncHandler(async (req, res) => {
   const { nodes, edges, onlyNodeId, includeDownstream, projectId, projectName } = req.body;
   if (!Array.isArray(nodes) || !Array.isArray(edges)) {
@@ -2727,13 +2778,17 @@ runPlanRouter.post("/", asyncHandler(async (req, res) => {
     const targetStep = plan.steps.find((step) => step.nodeId === onlyNodeId) ?? plan.steps[plan.steps.length - 1];
     const targetNode = flow.nodes.find((node) => node.id === targetStep.nodeId);
     const params = targetStep.params;
-    const requestedCount = targetStep.kind === "fabric-recolor" ? Math.max(1, Array.isArray(params.colors) ? params.colors.length : 1) : targetStep.kind === "print-mutate" ? Math.max(1, Math.min(8, Number(params.count) || 1)) : targetStep.kind === "sketch-to-render" || targetStep.kind === "ai-modify" ? Math.max(1, Math.min(4, Number(params.batchSize) || 1)) : 1;
+    const requestedCount = requestedCountForStep(targetStep.kind, params);
     const user = requestUser(req);
     if (typeof projectId === "string") {
       const project = await queryOne(
         "SELECT owner_id FROM projects WHERE id = $1 AND deleted_at IS NULL",
         [projectId]
       );
+      if (!project) {
+        res.status(404).json({ error: "\u9879\u76EE\u4E0D\u5B58\u5728\u6216\u5DF2\u5220\u9664" });
+        return;
+      }
       if (project && project.owner_id !== user.id) {
         res.status(403).json({ error: "\u7BA1\u7406\u5458\u53EA\u80FD\u67E5\u770B\u5176\u4ED6\u7528\u6237\u9879\u76EE\uFF0C\u4E0D\u80FD\u8FD0\u884C\u6216\u4FEE\u6539" });
         return;
@@ -2905,12 +2960,14 @@ function imageRefs(value, output = /* @__PURE__ */ new Set()) {
   return output;
 }
 async function syncAssetRefs(client, projectId, ownerId, flow) {
-  const refs = imageRefs(flow);
+  const refs = [...imageRefs(flow)];
   const assets = await query(`
     SELECT id, image FROM assets
     WHERE deleted_at IS NULL AND (scope IN ('global','shared') OR owner_id = $1)
-  `, [ownerId], client);
-  const wanted = assets.filter((asset) => refs.has(asset.image)).map((asset) => asset.id);
+      AND image = ANY($2::text[])
+    FOR KEY SHARE
+  `, [ownerId, refs], client);
+  const wanted = assets.map((asset) => asset.id);
   const now = (/* @__PURE__ */ new Date()).toISOString();
   await client.query("DELETE FROM project_asset_refs WHERE project_id = $1", [projectId]);
   for (const assetId of wanted) {
@@ -3507,6 +3564,7 @@ templatesRouter.delete("/:id", (req, res) => {
 // server/routes/assets.ts
 import { Router as Router6 } from "express";
 import { nanoid as nanoid9 } from "nanoid";
+import path7 from "node:path";
 var assetsRouter = Router6();
 var CATEGORIES = ["print", "fabric", "reference"];
 var TRASH_DAYS = 15;
@@ -3549,7 +3607,7 @@ assetsRouter.get("/", asyncHandler(async (req, res) => {
     FROM assets a LEFT JOIN users u ON u.id = a.owner_id
     WHERE ($1::text IS NULL OR a.category = $1)
       AND (${includeDeleted ? "a.deleted_at IS NOT NULL" : "a.deleted_at IS NULL"})
-      AND ($2 = 'admin' OR a.scope IN ('global','shared') OR a.owner_id = $3)
+      AND (${includeDeleted ? "$2 = 'admin' OR a.owner_id = $3" : "$2 = 'admin' OR a.scope IN ('global','shared') OR a.owner_id = $3"})
     ORDER BY a.created_at DESC
     LIMIT $4 OFFSET $5
   `, [category ?? null, user.role, user.id, limit, offset]);
@@ -3581,6 +3639,19 @@ assetsRouter.post("/", asyncHandler(async (req, res) => {
         INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, $2, 'asset', $3)
         ON CONFLICT (id) DO NOTHING
       `, [saved.id, user.id, (/* @__PURE__ */ new Date()).toISOString()]);
+    } else {
+      const access = await queryOne(`
+        SELECT f.owner_id,
+          EXISTS(
+            SELECT 1 FROM assets a
+            WHERE a.image = $1 AND a.deleted_at IS NULL AND a.scope IN ('global','shared')
+          ) AS shared
+        FROM files f WHERE f.id = $2
+      `, [imageUrl, path7.basename(imageUrl)]);
+      if (!access || access.owner_id !== null && access.owner_id !== user.id && user.role !== "admin" && !access.shared) {
+        res.status(404).json({ error: "image file not found" });
+        return;
+      }
     }
     const id = nanoid9(10);
     const createdAt = (/* @__PURE__ */ new Date()).toISOString();
@@ -3644,6 +3715,7 @@ assetsRouter.post("/:id/references", asyncHandler(async (req, res) => {
     const asset = await queryOne(`
       SELECT id FROM assets WHERE id = $1 AND deleted_at IS NULL
         AND (scope IN ('global','shared') OR owner_id = $2)
+      FOR KEY SHARE
     `, [req.params.id, user.id], client);
     if (!asset) return false;
     await client.query(`
@@ -3660,35 +3732,43 @@ assetsRouter.post("/:id/references", asyncHandler(async (req, res) => {
 }));
 assetsRouter.delete("/:id", asyncHandler(async (req, res) => {
   const user = requestUser(req);
-  const row = await queryOne(
-    "SELECT owner_id, scope FROM assets WHERE id = $1 AND deleted_at IS NULL",
-    [req.params.id]
-  );
-  if (!row) {
+  const result = await transaction(async (client) => {
+    const row = await queryOne(
+      "SELECT owner_id, scope FROM assets WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+      [req.params.id],
+      client
+    );
+    if (!row) return { status: "missing" };
+    const canManage = row.scope === "global" ? user.role === "admin" : row.owner_id === user.id;
+    if (!canManage) return { status: "forbidden" };
+    const ref = await queryOne(
+      "SELECT project_id FROM project_asset_refs WHERE asset_id = $1 LIMIT 1",
+      [req.params.id],
+      client
+    );
+    if (ref) return { status: "referenced" };
+    const deletedAt = /* @__PURE__ */ new Date();
+    const purgeAfter = new Date(deletedAt.getTime() + TRASH_DAYS * 24 * 60 * 60 * 1e3);
+    await client.query("UPDATE assets SET deleted_at = $1, purge_after = $2 WHERE id = $3", [
+      deletedAt.toISOString(),
+      purgeAfter.toISOString(),
+      req.params.id
+    ]);
+    return { status: "deleted", purgeAfter: purgeAfter.toISOString() };
+  });
+  if (result.status === "missing") {
     res.status(404).json({ error: "asset not found" });
     return;
   }
-  const canManage = row.scope === "global" ? user.role === "admin" : row.owner_id === user.id;
-  if (!canManage) {
+  if (result.status === "forbidden") {
     res.status(403).json({ error: "\u65E0\u6743\u5220\u9664\u6B64\u7D20\u6750" });
     return;
   }
-  const ref = await queryOne(
-    "SELECT project_id FROM project_asset_refs WHERE asset_id = $1 LIMIT 1",
-    [req.params.id]
-  );
-  if (ref) {
+  if (result.status === "referenced") {
     res.status(409).json({ error: "\u7D20\u6750\u6B63\u5728\u88AB\u9879\u76EE\u4F7F\u7528\uFF0C\u4E0D\u80FD\u5220\u9664" });
     return;
   }
-  const deletedAt = /* @__PURE__ */ new Date();
-  const purgeAfter = new Date(deletedAt.getTime() + TRASH_DAYS * 24 * 60 * 60 * 1e3);
-  await query("UPDATE assets SET deleted_at = $1, purge_after = $2 WHERE id = $3", [
-    deletedAt.toISOString(),
-    purgeAfter.toISOString(),
-    req.params.id
-  ]);
-  res.json({ ok: true, purgeAfter: purgeAfter.toISOString() });
+  res.json({ ok: true, purgeAfter: result.purgeAfter });
 }));
 assetsRouter.post("/:id/restore", asyncHandler(async (req, res) => {
   const user = requestUser(req);
@@ -3804,10 +3884,11 @@ authRouter.post("/change-password", asyncHandler(async (req, res) => {
     now,
     user.id
   ]);
-  const session = await createSession(user.id);
+  const session = await createSession(user.id, { markExistingAsReplaced: false });
   setSessionCookie(res, session.token);
   res.json({ ok: true, user: { ...user, mustChangePassword: false }, expiresAt: session.expiresAt });
 }));
+authRouter.use(requirePasswordChanged);
 authRouter.get("/users", requireAdmin, asyncHandler(async (_req, res) => {
   const rows = await query(`
     SELECT id, account_id, display_name, role, must_change_password, active, created_at
@@ -3918,7 +3999,10 @@ authRouter.delete("/users/:id", requireAdmin, asyncHandler(async (req, res) => {
         await client.query(`UPDATE ${table} SET owner_id = $1 WHERE owner_id = $2`, [transferToUserId, req.params.id]);
       }
     } else {
-      await client.query("UPDATE projects SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3", [nowIso, purgeAfter, req.params.id]);
+      await client.query(
+        "UPDATE projects SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3 AND deleted_at IS NULL",
+        [nowIso, purgeAfter, req.params.id]
+      );
       await client.query(
         "UPDATE assets SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3 AND deleted_at IS NULL",
         [nowIso, purgeAfter, req.params.id]
@@ -3951,6 +4035,8 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
   const ownerId = requestedUserId ?? (user.role === "admin" && req.query.all === "true" ? null : user.id);
   const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 100));
   const offset = Math.max(0, Number(req.query.offset) || 0);
+  const requestedBefore = Number(req.query.before);
+  const before = Number.isFinite(requestedBefore) && requestedBefore >= 0 ? requestedBefore : Date.now();
   const rows = await query(`
     SELECT r.*, o.id AS output_id, o.image, o.prompt AS output_prompt,
       o.status AS output_status, o.error AS output_error, u.display_name AS owner_name
@@ -3958,10 +4044,11 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
     JOIN users u ON u.id = r.owner_id
     LEFT JOIN generation_outputs o ON o.run_id = r.id
     WHERE ($1::text IS NULL OR r.owner_id = $1)
+      AND r.started_at <= $2
       AND (o.id IS NOT NULL OR r.status IN ('queued','running'))
     ORDER BY r.started_at DESC, o.created_at ASC
-    LIMIT $2 OFFSET $3
-  `, [ownerId, limit, offset]);
+    LIMIT $3 OFFSET $4
+  `, [ownerId, before, limit, offset]);
   res.json(rows.map((row) => ({
     id: row.output_id ?? row.id,
     runId: row.id,
@@ -3991,10 +4078,10 @@ historyRouter.delete("/:id", asyncHandler(async (req, res) => {
   const user = requestUser(req);
   const row = await queryOne(`
     SELECT r.owner_id, r.id AS run_id FROM generation_outputs o
-    JOIN generation_runs r ON r.id = o.run_id WHERE o.id = $1
-  `, [req.params.id]);
-  if (!row || row.owner_id !== user.id) {
-    res.status(row ? 403 : 404).json({ error: row ? "\u53EA\u80FD\u5220\u9664\u81EA\u5DF1\u7684\u751F\u6210\u5386\u53F2" : "\u8BB0\u5F55\u4E0D\u5B58\u5728" });
+    JOIN generation_runs r ON r.id = o.run_id WHERE o.id = $1 AND r.owner_id = $2
+  `, [req.params.id, user.id]);
+  if (!row) {
+    res.status(404).json({ error: "\u8BB0\u5F55\u4E0D\u5B58\u5728" });
     return;
   }
   await query("DELETE FROM generation_outputs WHERE id = $1", [req.params.id]);
@@ -4180,7 +4267,7 @@ function createAiDiagnosticsRouter(probeRateLimit) {
 
 // server/lib/legacyMigration.ts
 import fs7 from "node:fs";
-import path7 from "node:path";
+import path8 from "node:path";
 import { nanoid as nanoid11 } from "nanoid";
 async function migrateLegacyData() {
   const admin = await queryOne(`
@@ -4188,11 +4275,11 @@ async function migrateLegacyData() {
   `);
   if (!admin) return;
   const now = (/* @__PURE__ */ new Date()).toISOString();
-  const uploads = path7.join(config.dataDir(), "uploads");
+  const uploads = path8.join(config.dataDir(), "uploads");
   if (fs7.existsSync(uploads)) {
     await transaction(async (client) => {
       for (const file of fs7.readdirSync(uploads)) {
-        const id = path7.basename(file);
+        const id = path8.basename(file);
         await client.query(`
           INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, NULL, 'legacy', $2)
           ON CONFLICT (id) DO NOTHING
@@ -4203,18 +4290,18 @@ async function migrateLegacyData() {
           await client.query(`
             INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
             VALUES ($1, NULL, 'global', $2, 'reference', $3, '\u4ECE\u5347\u7EA7\u524D\u670D\u52A1\u5668\u6587\u4EF6\u8FC1\u79FB', $4)
-          `, [nanoid11(10), `\u5386\u53F2\u7D20\u6750-${path7.parse(id).name}`, image, now]);
+          `, [nanoid11(10), `\u5386\u53F2\u7D20\u6750-${path8.parse(id).name}`, image, now]);
         }
       }
     });
   }
-  const projects = path7.join(config.dataDir(), "projects");
+  const projects = path8.join(config.dataDir(), "projects");
   if (fs7.existsSync(projects)) {
     await transaction(async (client) => {
       for (const file of fs7.readdirSync(projects)) {
         if (!file.endsWith(".json")) continue;
         try {
-          const raw = JSON.parse(fs7.readFileSync(path7.join(projects, file), "utf-8"));
+          const raw = JSON.parse(fs7.readFileSync(path8.join(projects, file), "utf-8"));
           if (typeof raw.id !== "string" || typeof raw.name !== "string") continue;
           const flow = validateAndMigrateFlow(raw.flow);
           const updatedAt = typeof raw.updatedAt === "string" && Number.isFinite(Date.parse(raw.updatedAt)) ? raw.updatedAt : now;
@@ -4227,22 +4314,17 @@ async function migrateLegacyData() {
       }
     });
   }
-  const assets = path7.join(config.dataDir(), "assets");
+  const assets = path8.join(config.dataDir(), "assets");
   if (fs7.existsSync(assets)) {
     await transaction(async (client) => {
       for (const file of fs7.readdirSync(assets)) {
         if (!file.endsWith(".json")) continue;
         try {
-          const raw = JSON.parse(fs7.readFileSync(path7.join(assets, file), "utf-8"));
+          const raw = JSON.parse(fs7.readFileSync(path8.join(assets, file), "utf-8"));
           if (typeof raw.id !== "string" || typeof raw.name !== "string" || !["print", "fabric", "reference"].includes(String(raw.category)) || typeof raw.image !== "string" || !isLocalImageReference(raw.image)) continue;
           const note = typeof raw.sourceNote === "string" ? raw.sourceNote : null;
           const existing = await queryOne("SELECT id FROM assets WHERE image = $1 LIMIT 1", [raw.image], client);
-          if (existing) {
-            await client.query(`
-              UPDATE assets SET name = $1, category = $2, source_note = $3, scope = 'global', owner_id = NULL
-              WHERE image = $4
-            `, [raw.name, raw.category, note, raw.image]);
-          } else {
+          if (!existing) {
             await client.query(`
               INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
               VALUES ($1, NULL, 'global', $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING
@@ -4257,22 +4339,22 @@ async function migrateLegacyData() {
 
 // server/lib/staticFrontend.ts
 import express from "express";
-import path8 from "node:path";
+import path9 from "node:path";
 var HASHED_ASSET = /-[A-Za-z0-9_-]{8,}\.[A-Za-z0-9]+$/;
 function explicitlyAcceptsHtml(req) {
   const accept = req.get("Accept") ?? "";
   return /\btext\/html\b/i.test(accept) && req.accepts("html") === "html";
 }
 function mountProductionFrontend(app2, distDir2) {
-  const distIndex2 = path8.join(distDir2, "index.html");
-  const assetsDir = path8.join(distDir2, "assets") + path8.sep;
+  const distIndex2 = path9.join(distDir2, "index.html");
+  const assetsDir = path9.join(distDir2, "assets") + path9.sep;
   app2.use(express.static(distDir2, {
     index: false,
     fallthrough: true,
     setHeaders: (res, filePath) => {
-      if (path8.resolve(filePath) === path8.resolve(distIndex2)) {
+      if (path9.resolve(filePath) === path9.resolve(distIndex2)) {
         res.setHeader("Cache-Control", "no-store");
-      } else if (filePath.startsWith(assetsDir) && HASHED_ASSET.test(path8.basename(filePath))) {
+      } else if (filePath.startsWith(assetsDir) && HASHED_ASSET.test(path9.basename(filePath))) {
         res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
       } else {
         res.setHeader("Cache-Control", "no-cache");
@@ -4283,7 +4365,7 @@ function mountProductionFrontend(app2, distDir2) {
     res.status(404).type("text/plain").send("Asset not found");
   });
   app2.get("*", (req, res) => {
-    const isResourcePath = path8.extname(req.path) !== "";
+    const isResourcePath = path9.extname(req.path) !== "";
     if (isResourcePath || !explicitlyAcceptsHtml(req)) {
       res.status(404).type("text/plain").send("Not found");
       return;
@@ -4302,11 +4384,11 @@ var aiDiagnosticsRouter = createAiDiagnosticsRouter(aiRateLimit);
 app.get("/api/health", (_req, res) => res.json({ ok: true, status: "alive" }));
 var isProduction = process.env.NODE_ENV === "production";
 var apiOnly = config.apiOnly();
-var distDir = path9.join(ROOT_DIR, "dist");
-var distIndex = path9.join(distDir, "index.html");
+var distDir = path10.join(ROOT_DIR, "dist");
+var distIndex = path10.join(distDir, "index.html");
 function dataDirWritable() {
   const dataDir = config.dataDir();
-  const probePath = path9.join(dataDir, `.readiness-${process.pid}-${Date.now()}`);
+  const probePath = path10.join(dataDir, `.readiness-${process.pid}-${Date.now()}`);
   let fd;
   let writable = false;
   try {
@@ -4378,6 +4460,12 @@ async function start() {
   await migrateLegacyData();
   const initialReadiness = await readiness();
   if (!initialReadiness.ok) throw new Error(`Server is not ready: ${JSON.stringify(initialReadiness.checks)}`);
+  const sessionPruneTimer = setInterval(() => {
+    void pruneExpiredSessions().catch((error) => {
+      console.error("[garment-canvas] session cleanup failed", error);
+    });
+  }, 6 * 60 * 60 * 1e3);
+  sessionPruneTimer.unref();
   app.listen(port, () => {
     console.log(`[garment-canvas] server listening on http://localhost:${port} (${initialReadiness.mode})`);
   });

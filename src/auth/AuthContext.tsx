@@ -39,6 +39,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const sessionEnded = useRef(restoredSessionEndReason !== null);
 
   const refresh = useCallback(async () => {
+    if (sessionEnded.current) return;
     const requestId = ++refreshSequence.current;
     try {
       const response = await fetch("/api/auth/me", { cache: "no-store" });
@@ -56,6 +57,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
             // 整页重载会立即终止工作区和运行中的连接；不删除未保存草稿。
             window.location.reload();
           } else if (action === "clear-user") {
+            sessionEnded.current = true;
             setUser(null);
           }
         }

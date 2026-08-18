@@ -25,6 +25,8 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
   const ownerId = requestedUserId ?? (user.role === "admin" && req.query.all === "true" ? null : user.id);
   const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 100));
   const offset = Math.max(0, Number(req.query.offset) || 0);
+  const requestedBefore = Number(req.query.before);
+  const before = Number.isFinite(requestedBefore) && requestedBefore >= 0 ? requestedBefore : Date.now();
   const rows = await query<Record<string, unknown>>(`
     SELECT r.*, o.id AS output_id, o.image, o.prompt AS output_prompt,
       o.status AS output_status, o.error AS output_error, u.display_name AS owner_name
@@ -32,10 +34,11 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
     JOIN users u ON u.id = r.owner_id
     LEFT JOIN generation_outputs o ON o.run_id = r.id
     WHERE ($1::text IS NULL OR r.owner_id = $1)
+      AND r.started_at <= $2
       AND (o.id IS NOT NULL OR r.status IN ('queued','running'))
     ORDER BY r.started_at DESC, o.created_at ASC
-    LIMIT $2 OFFSET $3
-  `, [ownerId, limit, offset]);
+    LIMIT $3 OFFSET $4
+  `, [ownerId, before, limit, offset]);
   res.json(rows.map((row) => ({
     id: (row.output_id as string | null) ?? (row.id as string),
     runId: row.id,
@@ -66,10 +69,10 @@ historyRouter.delete("/:id", asyncHandler(async (req, res) => {
   const user = requestUser(req);
   const row = await queryOne<{ owner_id: string; run_id: string }>(`
     SELECT r.owner_id, r.id AS run_id FROM generation_outputs o
-    JOIN generation_runs r ON r.id = o.run_id WHERE o.id = $1
-  `, [req.params.id]);
-  if (!row || row.owner_id !== user.id) {
-    res.status(row ? 403 : 404).json({ error: row ? "只能删除自己的生成历史" : "记录不存在" });
+    JOIN generation_runs r ON r.id = o.run_id WHERE o.id = $1 AND r.owner_id = $2
+  `, [req.params.id, user.id]);
+  if (!row) {
+    res.status(404).json({ error: "记录不存在" });
     return;
   }
   await query("DELETE FROM generation_outputs WHERE id = $1", [req.params.id]);

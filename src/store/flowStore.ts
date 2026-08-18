@@ -905,6 +905,25 @@ export function applyRunEventToRecentResults(
   return next.slice(0, 100);
 }
 
+/** 合并服务器历史与请求期间新增的本地记录；同 id 以服务器终态为准。 */
+export function mergeRecentResults(
+  current: RecentResult[],
+  incoming: RecentResult[],
+  limit = 200,
+): RecentResult[] {
+  const incomingById = new Map(incoming.map((record) => [record.id, record]));
+  const currentIds = new Set(current.map((record) => record.id));
+  return [
+    ...current.map((record) => incomingById.get(record.id) ?? record),
+    ...incoming.filter((record) => !currentIds.has(record.id)),
+  ].slice(0, limit);
+}
+
+export function appendSavedAsset(current: string[] | undefined, url: string): string[] {
+  const existing = current ?? [];
+  return existing.includes(url) ? existing : [...existing, url];
+}
+
 function responseErrorMessage(status: number, body: unknown): string {
   if (typeof body === "object" && body !== null && "error" in body) {
     const error = (body as { error?: unknown }).error;
@@ -916,11 +935,14 @@ function responseErrorMessage(status: number, body: unknown): string {
 /** 等待后端 DAG Run 的 SSE 终态；事件自身可重放，因此晚连接不会丢状态。 */
 function consumeRunEvents(
   runId: string,
+  targetNodeId: string,
   onEvent: (event: RunEvent) => void,
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     const source = new EventSource(`/api/run-plan/${encodeURIComponent(runId)}/events`);
     const seenEvents = new Set<string>();
+    let lastSeq = 0;
+    let targetTerminalSeen = false;
     // 绝对兜底上限覆盖 8 色/多批次串行重试的最坏合法耗时。
     const timeout = window.setTimeout(
       () => finish(new Error("运行状态等待超时，请稍后在项目中确认结果")),
@@ -938,10 +960,21 @@ function consumeRunEvents(
     source.onmessage = (message) => {
       try {
         if (message.lastEventId && seenEvents.has(message.lastEventId)) return;
-        if (message.lastEventId) seenEvents.add(message.lastEventId);
         const event = normalizeRunEvent(JSON.parse(message.data) as unknown);
+        if (event.seq !== undefined && event.seq <= lastSeq) return;
+        if (message.lastEventId) seenEvents.add(message.lastEventId);
+        if (event.seq !== undefined) lastSeq = event.seq;
         onEvent(event);
-        if (event.type === "done") finish();
+        if (
+          event.type === "node-status" &&
+          event.nodeId === targetNodeId &&
+          (event.status === "success" || event.status === "error")
+        ) {
+          targetTerminalSeen = true;
+        }
+        if (event.type === "done") {
+          finish(targetTerminalSeen ? undefined : new Error("运行已结束，但目标节点未返回终态"));
+        }
         if (event.type === "run-error") finish(new Error(event.error || "运行失败"));
       } catch {
         finish(new Error("运行事件格式无效"));
@@ -1237,7 +1270,16 @@ export const useFlowStore = create<FlowState>()(
             ),
           }));
 
-          await consumeRunEvents(payload.runId, (event) => {
+          const runStatus = await fetch(`/api/run-plan/${encodeURIComponent(payload.runId)}`);
+          if (!runStatus.ok) {
+            throw new Error(
+              runStatus.status === 404
+                ? "服务已重启或运行状态已丢失，请重新发起任务"
+                : `确认运行状态失败（HTTP ${runStatus.status}）`,
+            );
+          }
+
+          await consumeRunEvents(payload.runId, id, (event) => {
             if (event.type !== "node-status" || event.nodeId !== id) return;
             set((state) => ({
               recentResults: applyRunEventToRecentResults(state.recentResults, recordId, event),
@@ -1423,7 +1465,9 @@ export const useFlowStore = create<FlowState>()(
 
 if (typeof window !== "undefined") {
   let lastTabSessionJson = "";
-  useFlowStore.subscribe((state) => {
+  useFlowStore.subscribe((state, previousState) => {
+    // 活动画布变化会由下一个订阅先同步进 tabs；历史/SSE/viewer 等全局状态无需序列化项目。
+    if (state.tabs === previousState.tabs && state.activeTabId === previousState.activeTabId) return;
     const current = snapshotActiveTab(state);
     const sessionJson = JSON.stringify({
       tabs: replaceTab(state.tabs, current),
@@ -1485,7 +1529,7 @@ export function resumeRecentResults(records: RecentResult[]): void {
               : `恢复任务失败（HTTP ${response.status}）`,
           );
         }
-        await consumeRunEvents(runId, (event) => {
+        await consumeRunEvents(runId, record.nodeId, (event) => {
           if (event.type !== "node-status" || event.nodeId !== record.nodeId) return;
           useFlowStore.setState((state) => ({
             recentResults: applyRunEventToRecentResults(state.recentResults, record.id, event),

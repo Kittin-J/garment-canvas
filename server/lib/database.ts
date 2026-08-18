@@ -291,6 +291,18 @@ async function migrate(): Promise<void> {
       );
     }
 
+    if (!applied.has(4)) {
+      await client.query("ALTER TABLE users DROP CONSTRAINT IF EXISTS users_account_id_key");
+      await client.query(`
+        CREATE UNIQUE INDEX IF NOT EXISTS users_active_account_id_unique
+        ON users(account_id) WHERE deleted_at IS NULL
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (4, $1, $2)",
+        ["active_account_id_unique", new Date().toISOString()],
+      );
+    }
+
     return imported;
   });
   if (importedRows !== undefined) {
@@ -312,7 +324,7 @@ async function bootstrapInitialAdmin(): Promise<void> {
   await db().query(`
     INSERT INTO users (id, account_id, display_name, role, password_hash, must_change_password, active, created_at, updated_at)
     VALUES ($1, $2, $3, 'admin', $4, 1, 1, $5, $5)
-    ON CONFLICT (account_id) DO NOTHING
+    ON CONFLICT (account_id) WHERE deleted_at IS NULL DO NOTHING
   `, [nanoid(12), accountId, "管理员", hashPassword(password), now]);
 }
 

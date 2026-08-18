@@ -31,12 +31,14 @@ async function syncAssetRefs(
   ownerId: string,
   flow: PersistedWorkflow,
 ): Promise<void> {
-  const refs = imageRefs(flow);
+  const refs = [...imageRefs(flow)];
   const assets = await query<{ id: string; image: string }>(`
     SELECT id, image FROM assets
     WHERE deleted_at IS NULL AND (scope IN ('global','shared') OR owner_id = $1)
-  `, [ownerId], client);
-  const wanted = assets.filter((asset) => refs.has(asset.image)).map((asset) => asset.id);
+      AND image = ANY($2::text[])
+    FOR KEY SHARE
+  `, [ownerId, refs], client);
+  const wanted = assets.map((asset) => asset.id);
   const now = new Date().toISOString();
   await client.query("DELETE FROM project_asset_refs WHERE project_id = $1", [projectId]);
   for (const assetId of wanted) {

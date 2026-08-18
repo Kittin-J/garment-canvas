@@ -97,7 +97,7 @@ console.log("  ✓ 导入后不重复创建管理员且原 SQLite 文件保持�
 
 await closeDatabaseForTests();
 
-// 模拟 PostgreSQL 已空启动并完成 migration 2/3，随后才恢复旧 SQLite 数据包。
+// 模拟 PostgreSQL 已空启动并完成全部编号迁移，随后才恢复旧 SQLite 数据包。
 await resetPostgresTestDatabase();
 process.env.SQLITE_IMPORT_FILE = "missing.db";
 process.env.INITIAL_ADMIN_ACCOUNT_ID = "";
@@ -106,7 +106,7 @@ await initializeDatabase();
 const preAppliedVersions = await query<{ version: number }>(
   "SELECT version FROM schema_migrations ORDER BY version",
 );
-assert.deepEqual(preAppliedVersions.map((row) => row.version), [1, 2, 3]);
+assert.deepEqual(preAppliedVersions.map((row) => row.version), [1, 2, 3, 4]);
 assert.equal((await queryOne<{ count: number }>("SELECT COUNT(*)::int AS count FROM users"))?.count, 0);
 await closeDatabaseForTests();
 
@@ -121,7 +121,7 @@ assert.deepEqual(
   `),
   [{ project_id: "legacy-project", asset_id: "legacy-asset" }],
 );
-console.log("  ✓ migration 2/3 已存在时，后挂 SQLite 仍只导入父记录完整的素材引用");
+console.log("  ✓ 编号迁移已存在时，后挂 SQLite 仍只导入父记录完整的素材引用");
 
 await closeDatabaseForTests();
 fs.rmSync(temp, { recursive: true, force: true });

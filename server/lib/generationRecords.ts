@@ -1,6 +1,7 @@
 import { nanoid } from "nanoid";
 import path from "node:path";
 import { query, queryOne, transaction } from "./database";
+import { deleteStoredImage } from "./fileStore";
 
 export interface GenerationRecordContext {
   userId: string;
@@ -117,7 +118,11 @@ export async function completeGenerationRecord(args: {
 }
 
 export async function failGenerationRecord(runId: string, error: string, finishedAt: number): Promise<void> {
-  await transaction(async (client) => {
+  const generatedFileIds = await transaction(async (client) => {
+    const files = await client.query<{ id: string }>(
+      "SELECT id FROM files WHERE run_id = $1 FOR UPDATE",
+      [runId],
+    );
     await client.query("UPDATE generation_runs SET status = 'error', error = $1, finished_at = $2 WHERE id = $3", [
       error, finishedAt, runId,
     ]);
@@ -126,5 +131,8 @@ export async function failGenerationRecord(runId: string, error: string, finishe
       INSERT INTO generation_outputs (id, run_id, image, status, error, created_at)
       SELECT $1, id, '', 'error', $2, $3 FROM generation_runs WHERE id = $4
     `, [nanoid(12), error, finishedAt, runId]);
+    await client.query("DELETE FROM files WHERE run_id = $1", [runId]);
+    return files.rows.map((row) => row.id);
   });
+  generatedFileIds.forEach(deleteStoredImage);
 }

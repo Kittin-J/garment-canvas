@@ -36,7 +36,10 @@ function cookieValue(req: Request, name: string): string | undefined {
   return undefined;
 }
 
-export async function createSession(userId: string): Promise<{ token: string; expiresAt: string }> {
+export async function createSession(
+  userId: string,
+  options: { markExistingAsReplaced?: boolean } = {},
+): Promise<{ token: string; expiresAt: string }> {
   const token = randomBytes(32).toString("base64url");
   const now = new Date();
   const expiresAt = new Date(now.getTime() + SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString();
@@ -45,12 +48,14 @@ export async function createSession(userId: string): Promise<{ token: string; ex
     const lockedUser = await client.query("SELECT id FROM users WHERE id = $1 FOR UPDATE", [userId]);
     if (lockedUser.rowCount !== 1) throw new Error("用户不存在");
     // 单账号单设备：新登录成功后，旧设备会话立即失效。
-    await client.query(`
-      INSERT INTO revoked_sessions (token_hash, reason, revoked_at, expires_at)
-      SELECT token_hash, 'replaced', $2, expires_at FROM sessions WHERE user_id = $1
-      ON CONFLICT (token_hash) DO UPDATE
-        SET reason = excluded.reason, revoked_at = excluded.revoked_at, expires_at = excluded.expires_at
-    `, [userId, now.toISOString()]);
+    if (options.markExistingAsReplaced !== false) {
+      await client.query(`
+        INSERT INTO revoked_sessions (token_hash, reason, revoked_at, expires_at)
+        SELECT token_hash, 'replaced', $2, expires_at FROM sessions WHERE user_id = $1
+        ON CONFLICT (token_hash) DO UPDATE
+          SET reason = excluded.reason, revoked_at = excluded.revoked_at, expires_at = excluded.expires_at
+      `, [userId, now.toISOString()]);
+    }
     await client.query("DELETE FROM sessions WHERE user_id = $1", [userId]);
     await client.query(
       "INSERT INTO sessions (token_hash, user_id, created_at, expires_at) VALUES ($1, $2, $3, $4)",
