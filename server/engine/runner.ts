@@ -213,7 +213,7 @@ async function executeRun(run: Run): Promise<void> {
     if (run.recordContext?.nodeId === step.nodeId) await markGenerationRunning(run.id, startedAt);
     emit(run, { type: "node-status", nodeId: step.nodeId, status: "running", startedAt });
     try {
-      const result = await executeStep(step, inputImages);
+      const result = await executeStep(step, inputImages, getProvider, run.id);
       // 产出统一落盘为 /api/files/:id，避免 base64 大图驻留事件与内存
       const persisted = await persistOutputImages(result.images);
       if (run.recordContext) {
@@ -300,6 +300,7 @@ export async function executeStep(
   step: NodeExecution,
   inputImages: string[],
   resolveProvider: ProviderResolver = getProvider,
+  runId?: string,
 ): Promise<StepResult> {
   switch (step.kind) {
     case "image-input": {
@@ -345,7 +346,7 @@ export async function executeStep(
           for (const color of colors) {
             const prompt = buildRecolorPrompt([color]);
             try {
-              const result = await generateExactImages(provider, { prompt, referenceImages }, 1);
+              const result = await generateExactImages(provider, { prompt, referenceImages }, 1, { runId, nodeId: step.nodeId });
               providerRequests += result.providerRequests;
               model = result.model;
               for (const image of result.images) {
@@ -374,7 +375,7 @@ export async function executeStep(
         const prompt =
           "基于这张印花图案生成风格一致的新变体：保持原有配色体系、艺术风格与笔触质感，重新编排元素的构图与组合方式，纯白背景，适合作为印花素材复用" +
           (extra ? `。补充要求：${extra}` : "");
-        const result = await generateExactImages(provider, { prompt, referenceImages }, count);
+        const result = await generateExactImages(provider, { prompt, referenceImages }, count, { runId, nodeId: step.nodeId });
         const failures = result.failures.map((error) => ({ prompt, error }));
         return {
           images: result.images,
@@ -404,7 +405,7 @@ export async function executeStep(
       const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify"
         ? Math.max(1, Math.min(4, Number(step.params.batchSize) || 1))
         : 1;
-      const result = await generateExactImages(provider, request, requestedCount);
+      const result = await generateExactImages(provider, request, requestedCount, { runId, nodeId: step.nodeId });
       const images = await postProcessGeneratedOutputImages(step.kind, step.params, result.images);
       return {
         images,

@@ -4,7 +4,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   applyRunEventToNode,
   applyRunEventToRecentResults,
+  createQueuedResultCards,
   normalizeRunEvent,
+  requestedResultCount,
   resumeRecentResults,
   useFlowStore,
   type RecentResult,
@@ -58,6 +60,71 @@ test("排队卡收到运行事件后原地更新，不重复新建", () => {
   assert.equal(result[0].status, "running");
   assert.equal(result[0].model, "gpt-image-2");
   assert.equal(result[0].startedAt, 1_200);
+});
+
+test("点击批量生成时立即按用户选择创建对应数量的排队卡", () => {
+  const cards = createQueuedResultCards(queued, 4);
+  assert.equal(cards.length, 4);
+  assert.equal(cards[0].id, queued.id);
+  assert.deepEqual(cards.slice(1).map((record) => record.id), [
+    `${queued.id}:pending:1`,
+    `${queued.id}:pending:2`,
+    `${queued.id}:pending:3`,
+  ]);
+  assert.ok(cards.every((record) => record.status === "queued" && record.requestedCount === 4));
+
+  const running = applyRunEventToRecentResults(cards, queued.id, {
+    type: "node-status",
+    nodeId: queued.nodeId,
+    status: "running",
+    startedAt: 1_500,
+  });
+  assert.ok(running.every((record) => record.status === "running" && record.startedAt === 1_500));
+});
+
+test("各批量节点正确计算用户选择的卡片数量", () => {
+  const modify: AiModifyNodeData = {
+    kind: "ai-modify",
+    label: "AI 改款",
+    status: "idle",
+    prompt: "改款",
+    aspectRatio: "1:1",
+    batchSize: 4,
+    outputImages: [],
+  };
+  assert.equal(requestedResultCount(modify), 4);
+  assert.equal(requestedResultCount({
+    kind: "print-mutate",
+    label: "印花裂变",
+    status: "idle",
+    prompt: "变体",
+    count: 8,
+    outputImages: [],
+  }), 8);
+  assert.equal(requestedResultCount({
+    kind: "fabric-recolor",
+    label: "配色",
+    status: "idle",
+    colors: ["#111111", "#222222", "#333333"],
+    prompt: "",
+    outputImages: [],
+  }), 3);
+});
+
+test("部分成功时用错误卡补足用户选择数量而不增减卡片", () => {
+  const cards = createQueuedResultCards(queued, 4);
+  const result = applyRunEventToRecentResults(cards, queued.id, {
+    type: "node-status",
+    nodeId: queued.nodeId,
+    status: "success",
+    images: ["/api/files/one", "/api/files/two"],
+    failures: [{ error: "模型暂时不可用" }],
+    finishedAt: 4_000,
+  });
+  assert.equal(result.length, 4);
+  assert.deepEqual(result.map((record) => record.status), ["success", "success", "error", "error"]);
+  assert.equal(result[2].error, "模型暂时不可用");
+  assert.equal(result[3].error, "未返回图片");
 });
 
 test("成功后主卡保留原 id，批量图片追加独立可查看卡片", () => {

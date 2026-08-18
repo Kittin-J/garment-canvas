@@ -117,7 +117,7 @@ generateRouter.post("/", async (req, res) => {
         : undefined,
       mask: request.mask ? await normalizeImageRef(request.mask) : undefined,
     };
-    const raw = await generateExactImages(provider, resolved, requestedCount);
+    const raw = await generateExactImages(provider, resolved, requestedCount, { runId, nodeId });
     const processedImages = await postProcessDirectGenerateImages(validation.kind, resolved, raw.images);
     // 结果统一落盘为 /api/files URL：dataURL 与第三方临时 URL 都不进项目 JSON
     const images = await Promise.all(processedImages.map(persistImageRef));
