@@ -61,11 +61,11 @@ function PropertyEditor({ nodeId }: { nodeId: string }) {
             <select
               value={d.batchSize}
               onChange={(e) =>
-                updateNodeData(nodeId, { batchSize: Number(e.target.value) as 1 | 2 | 4 })
+                updateNodeData(nodeId, { batchSize: Number(e.target.value) as 1 | 2 | 4 | 8 })
               }
               className={inputClass}
             >
-              {[1, 2, 4].map((n) => (
+              {[1, 2, 4, 8].map((n) => (
                 <option key={n} value={n}>
                   {n} 张
                 </option>

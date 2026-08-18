@@ -57,10 +57,10 @@ This project is indexed by GitNexus as **garment-canvas** (7300 symbols, 15964 r
   - Forced-password admins cannot call account-management routes before changing the temporary password.
   - Asset creation validates file access; deletion/reference writes use row locks; deleted listings and history deletion do not leak other users' data.
   - Initial history merges optimistic records, and pagination is pinned to a stable `before` snapshot.
-- Deliberately not changed without a product decision:
-  - G5: whether legacy direct `/api/generate` callers may request 8 images when typed DAG nodes cap some kinds at 4.
-  - A3 retention scope: the purge-deadline reset bug is fixed, but adding 15-day tombstones for `files`, `generation_runs`, and `usage_events` needs a retention/schema decision.
-  - F3: backend/runtime already rejects more than 8 actual references; frontend truncation versus connection rejection remains a UX decision.
-  - F6: closing a running tab already requires explicit confirmation; cancellation/persistence semantics are product behavior.
-  - F10/F11: comparison-limit notification and queued-button wording/disabled presentation are low-risk UX choices, not correctness failures (the store already prevents duplicate runs).
+- Product decisions implemented after the initial audit:
+  - G5: direct generation and DAG generation now share an 8-image maximum; sketch/render and AI-modify expose 1/2/4/8 choices end to end.
+  - A3: files, generation runs, and usage events receive the same 15-day tombstones as projects/assets; expiry removes database rows plus stored image files.
+  - F3: the product limit remains connection-count based (maximum 8 incoming connections), and each image-upload node has one singular `imageUrl`/single-file picker.
+  - F6: queued/running tabs cannot be closed, so the active SSE can always write results back to the canvas.
+  - F10/F11: selecting a fifth comparison image shows an explicit limit message; queued buttons are disabled and labelled `排队中…` across all AI nodes.
 - Validation completed: `npm run check` passed, `npm run build` passed, and GitNexus compare-mode change detection reviewed the expected generation/provider/auth/history/asset flows (overall graph risk: CRITICAL because shared Provider and SSE hubs changed).

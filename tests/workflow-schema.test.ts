@@ -110,6 +110,25 @@ async function main() {
     assert.throws(() => validateAndMigrateFlow(flow), /accepts at most 8 incoming image connections/);
   });
 
+  await test("图片上传节点只接受单个 imageUrl 字段", () => {
+    const flow = {
+      nodes: [{
+        id: "upload",
+        type: "image-input",
+        position: { x: 0, y: 0 },
+        data: {
+          kind: "image-input",
+          label: "单图上传",
+          status: "idle",
+          imageRole: "reference",
+          imageUrl: ["/api/files/one.png", "/api/files/two.png"],
+        },
+      }],
+      edges: [],
+    };
+    assert.throws(() => validateAndMigrateFlow(flow), /imageUrl/);
+  });
+
   await test("干净检出也可迁移旧项目，并校验仓库内置模板", () => {
     // 不依赖被 .gitignore 排除的 data/projects；旧项目夹具必须由测试自己提供。
     const legacyProject = {

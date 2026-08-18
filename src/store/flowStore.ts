@@ -451,7 +451,7 @@ function normalizeSessionNode(value: unknown): FlowNode | undefined {
       data.aspectRatio = typeof input.aspectRatio === "string" && ["1:1", "3:4", "4:3", "9:16", "16:9"].includes(input.aspectRatio)
         ? input.aspectRatio
         : kind === "sketch-to-render" ? "3:4" : "1:1";
-      data.batchSize = [1, 2, 4].includes(Number(input.batchSize)) ? Number(input.batchSize) : 1;
+      data.batchSize = [1, 2, 4, 8].includes(Number(input.batchSize)) ? Number(input.batchSize) : 1;
       data.outputImages = stringList(input.outputImages);
       break;
     case "fabric-recolor":
@@ -1038,6 +1038,10 @@ export const useFlowStore = create<FlowState>()(
         const syncedTabs = replaceTab(state.tabs, current);
         const closingIndex = syncedTabs.findIndex((tab) => tab.id === tabId);
         if (closingIndex < 0) return;
+        const closingTab = syncedTabs[closingIndex];
+        if (closingTab.nodes.some((node) => node.data.status === "queued" || node.data.status === "running")) {
+          return;
+        }
         const remaining = syncedTabs.filter((tab) => tab.id !== tabId);
         if (remaining.length === 0) remaining.push(newTab());
         if (tabId !== state.activeTabId) {
@@ -1101,6 +1105,8 @@ export const useFlowStore = create<FlowState>()(
           set({ compareIds: cur.filter((c) => c !== id) });
         } else if (cur.length < 4) {
           set({ compareIds: [...cur, id], selectedResultId: null, selectedNodeId: null });
+        } else if (typeof window !== "undefined") {
+          window.alert("最多选择 4 张图片进行对比");
         }
       },
       clearCompare: () => set({ compareIds: [] }),

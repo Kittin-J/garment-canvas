@@ -21,7 +21,7 @@ export function requestedCountForStep(kind: string, params: Record<string, unkno
     : kind === "print-mutate"
       ? Math.max(1, Math.min(8, Number(params.count) || 4))
       : kind === "sketch-to-render" || kind === "ai-modify"
-        ? Math.max(1, Math.min(4, Number(params.batchSize) || 1))
+        ? Math.max(1, Math.min(8, Number(params.batchSize) || 1))
         : 1;
 }
 

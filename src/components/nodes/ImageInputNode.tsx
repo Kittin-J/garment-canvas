@@ -120,13 +120,14 @@ export function ImageInputNode({ id, data, selected }: NodeProps<Node<ImageInput
                 : "border-[#2a2a2a] text-neutral-500 hover:border-neutral-500"
             }`}
           >
-            {uploading ? "上传中…" : "点击上传 / 拖拽图片到此处\n选中节点后 Ctrl+V 粘贴"}
+            {uploading ? "上传中…" : "每个上传节点仅支持 1 张图\n点击 / 拖拽 / 选中后 Ctrl+V"}
           </div>
         )}
         <input
           ref={fileInputRef}
           type="file"
           accept="image/*"
+          multiple={false}
           className="hidden"
           onChange={(e) => {
             void handleFile(e.target.files?.[0]);

@@ -26,7 +26,7 @@ export function FabricRecolorNode({
   const hasFabricInput = useFlowStore((s) =>
     s.edges.some((e) => e.target === id && e.targetHandle === "fabric"),
   );
-  const running = data.status === "running";
+  const running = data.status === "running" || data.status === "queued";
 
   const colors = data.colors ?? [];
   const [hexInput, setHexInput] = useState("");
@@ -212,6 +212,7 @@ export function FabricRecolorNode({
 
         <RunButton
           running={running}
+          queued={data.status === "queued"}
           onClick={() => void runNode(id)}
           label="替换面料配色"
           disabled={colors.length === 0 && !hasFabricInput}

@@ -99,6 +99,7 @@ import { Router } from "express";
 
 // src/types/workflow.ts
 var MAX_REFERENCE_IMAGES = 8;
+var BATCH_SIZES = [1, 2, 4, 8];
 var WORKFLOW_SCHEMA_VERSION = 1;
 var NODE_SPECS = {
   "image-input": {
@@ -1559,7 +1560,9 @@ async function migrate() {
       project_id TEXT,
       node_id TEXT,
       run_id TEXT,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      deleted_at TEXT,
+      purge_after TEXT
     );
     CREATE INDEX IF NOT EXISTS files_owner_idx ON files(owner_id, created_at DESC);
 
@@ -1602,7 +1605,9 @@ async function migrate() {
       status TEXT NOT NULL CHECK (status IN ('queued','running','success','error')),
       error TEXT,
       started_at BIGINT NOT NULL,
-      finished_at BIGINT
+      finished_at BIGINT,
+      deleted_at TEXT,
+      purge_after TEXT
     );
     CREATE INDEX IF NOT EXISTS generation_runs_owner_idx ON generation_runs(owner_id, started_at DESC);
 
@@ -1627,7 +1632,9 @@ async function migrate() {
       successful_count INTEGER NOT NULL CHECK (successful_count > 0),
       provider_requests INTEGER NOT NULL DEFAULT 1,
       duration_ms INTEGER NOT NULL DEFAULT 0,
-      created_at TEXT NOT NULL
+      created_at TEXT NOT NULL,
+      deleted_at TEXT,
+      purge_after TEXT
     );
     CREATE INDEX IF NOT EXISTS usage_owner_idx ON usage_events(owner_id, created_at DESC);
       `);
@@ -1702,6 +1709,23 @@ async function migrate() {
       await client.query(
         "INSERT INTO schema_migrations (version, name, applied_at) VALUES (4, $1, $2)",
         ["active_account_id_unique", (/* @__PURE__ */ new Date()).toISOString()]
+      );
+    }
+    if (!applied.has(5)) {
+      await client.query(`
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS deleted_at TEXT;
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS purge_after TEXT;
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS deleted_at TEXT;
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS purge_after TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS deleted_at TEXT;
+        ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS purge_after TEXT;
+        CREATE INDEX IF NOT EXISTS files_purge_idx ON files(purge_after);
+        CREATE INDEX IF NOT EXISTS generation_runs_purge_idx ON generation_runs(purge_after);
+        CREATE INDEX IF NOT EXISTS usage_events_purge_idx ON usage_events(purge_after);
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (5, $1, $2)",
+        ["account_data_retention_tombstones", (/* @__PURE__ */ new Date()).toISOString()]
       );
     }
     return imported;
@@ -2106,7 +2130,7 @@ async function executeStep(step, inputImages, resolveProvider = getProvider) {
         batchSize: step.params.batchSize,
         imageSize: step.kind === "upscale" ? normalizeUpscaleSize(step.params.imageSize) : void 0
       };
-      const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify" ? Math.max(1, Math.min(4, Number(step.params.batchSize) || 1)) : 1;
+      const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify" ? Math.max(1, Math.min(8, Number(step.params.batchSize) || 1)) : 1;
       const result = await generateExactImages(provider, request, requestedCount);
       const images = await postProcessGeneratedOutputImages(step.kind, step.params, result.images);
       return {
@@ -2522,7 +2546,6 @@ var NODE_KINDS = [
 var STATUSES = ["idle", "queued", "running", "success", "error"];
 var IMAGE_ROLES = ["default", "sketch", "garment", "fabric", "reference"];
 var ASPECT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9"];
-var BATCH_SIZES = [1, 2, 4];
 var IMAGE_SIZES = ["2K", "4K"];
 var MAX_NODES = 500;
 var MAX_EDGES = 2e3;
@@ -2743,7 +2766,7 @@ function asyncHandler(handler) {
 // server/routes/runPlan.ts
 var runPlanRouter = Router2();
 function requestedCountForStep(kind, params) {
-  return kind === "fabric-recolor" ? Math.max(1, Array.isArray(params.colors) ? params.colors.length : 1) : kind === "print-mutate" ? Math.max(1, Math.min(8, Number(params.count) || 4)) : kind === "sketch-to-render" || kind === "ai-modify" ? Math.max(1, Math.min(4, Number(params.batchSize) || 1)) : 1;
+  return kind === "fabric-recolor" ? Math.max(1, Array.isArray(params.colors) ? params.colors.length : 1) : kind === "print-mutate" ? Math.max(1, Math.min(8, Number(params.count) || 4)) : kind === "sketch-to-render" || kind === "ai-modify" ? Math.max(1, Math.min(8, Number(params.batchSize) || 1)) : 1;
 }
 runPlanRouter.post("/", asyncHandler(async (req, res) => {
   const { nodes, edges, onlyNodeId, includeDownstream, projectId, projectName } = req.body;
@@ -2979,13 +3002,33 @@ async function syncAssetRefs(client, projectId, ownerId, flow) {
 }
 async function purgeExpiredProjects() {
   const now = (/* @__PURE__ */ new Date()).toISOString();
-  await transaction(async (client) => {
+  const expiredFileIds = await transaction(async (client) => {
     await client.query(`
       DELETE FROM project_asset_refs
       WHERE project_id IN (SELECT id FROM projects WHERE purge_after IS NOT NULL AND purge_after <= $1)
     `, [now]);
+    await client.query("DELETE FROM usage_events WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
+    await client.query("DELETE FROM generation_runs WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
+    const files = await client.query(
+      `DELETE FROM files
+       WHERE purge_after IS NOT NULL AND purge_after <= $1
+         AND NOT EXISTS (
+           SELECT 1 FROM assets a
+           JOIN project_asset_refs refs ON refs.asset_id = a.id
+           WHERE a.image = '/api/files/' || files.id
+         )
+       RETURNING id`,
+      [now]
+    );
+    await client.query(`
+      DELETE FROM assets
+      WHERE purge_after IS NOT NULL AND purge_after <= $1
+        AND NOT EXISTS (SELECT 1 FROM project_asset_refs r WHERE r.asset_id = assets.id)
+    `, [now]);
     await client.query("DELETE FROM projects WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
+    return files.rows.map((row) => row.id);
   });
+  expiredFileIds.forEach(deleteStoredImage);
 }
 projectsRouter.post("/", asyncHandler(async (req, res) => {
   const user = requestUser(req);
@@ -4007,6 +4050,12 @@ authRouter.delete("/users/:id", requireAdmin, asyncHandler(async (req, res) => {
         "UPDATE assets SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3 AND deleted_at IS NULL",
         [nowIso, purgeAfter, req.params.id]
       );
+      for (const table of ["files", "generation_runs", "usage_events"]) {
+        await client.query(
+          `UPDATE ${table} SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3 AND deleted_at IS NULL`,
+          [nowIso, purgeAfter, req.params.id]
+        );
+      }
     }
     await client.query("DELETE FROM sessions WHERE user_id = $1", [req.params.id]);
     await client.query("UPDATE users SET active = 0, deleted_at = $1, updated_at = $1 WHERE id = $2", [nowIso, req.params.id]);

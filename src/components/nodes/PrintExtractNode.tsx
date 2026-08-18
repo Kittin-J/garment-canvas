@@ -8,7 +8,7 @@ import { ImageGrid } from "./ImageGrid";
 export function PrintExtractNode({ id, data, selected }: NodeProps<Node<PrintExtractNodeData>>) {
   const updateNodeData = useFlowStore((s) => s.updateNodeData);
   const runNode = useFlowStore((s) => s.runNode);
-  const running = data.status === "running";
+  const running = data.status === "running" || data.status === "queued";
   const [savingUrl, setSavingUrl] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const saved = data.savedAsAssets ?? [];
@@ -56,7 +56,7 @@ export function PrintExtractNode({ id, data, selected }: NodeProps<Node<PrintExt
           />
           <span className="text-[9px] text-neutral-600">可连接 1–8 张参考图，按连线顺序传入</span>
         </label>
-        <RunButton running={running} onClick={() => void runNode(id)} label="提取印花" />
+        <RunButton running={running} queued={data.status === "queued"} onClick={() => void runNode(id)} label="提取印花" />
         {running && <Developing />}
         <ImageGrid
           images={data.outputImages}

@@ -14,6 +14,7 @@ import {
 } from "../src/store/flowStore";
 import type { AiModifyNodeData } from "../src/types/workflow";
 import { ImageGrid } from "../src/components/nodes/ImageGrid";
+import { RunButton } from "../src/components/nodes/NodeFrame";
 
 let passed = 0;
 
@@ -171,6 +172,34 @@ test("图片网格收到损坏的 undefined 数据时显示空状态而不抛错
 test("图片网格使用服务端缩略图但查看器仍保留原图引用", () => {
   const html = renderToStaticMarkup(createElement(ImageGrid, { images: ["/api/files/result.png"] }));
   assert.match(html, /\/api\/files\/result\.png\/thumbnail/);
+});
+
+test("排队中的运行按钮禁用并明确显示排队状态", () => {
+  const html = renderToStaticMarkup(createElement(RunButton, {
+    running: true,
+    queued: true,
+    onClick: () => undefined,
+  }));
+  assert.match(html, /disabled/);
+  assert.match(html, /排队中…/);
+});
+
+test("选择第 5 张对比图时给出上限提示且不改变选择", () => {
+  const previousWindow = globalThis.window;
+  let alertMessage = "";
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { alert: (message: string) => { alertMessage = message; } },
+  });
+  try {
+    useFlowStore.setState({ compareIds: ["a", "b", "c", "d"] });
+    useFlowStore.getState().toggleCompareId("e");
+    assert.equal(alertMessage, "最多选择 4 张图片进行对比");
+    assert.deepEqual(useFlowStore.getState().compareIds, ["a", "b", "c", "d"]);
+  } finally {
+    if (previousWindow === undefined) delete (globalThis as { window?: Window }).window;
+    else Object.defineProperty(globalThis, "window", { configurable: true, value: previousWindow });
+  }
 });
 
 test("部分成功时成功图和失败项都保留", () => {

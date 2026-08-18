@@ -408,7 +408,7 @@ export async function executeStep(
         imageSize: step.kind === "upscale" ? normalizeUpscaleSize(step.params.imageSize) : undefined,
       };
       const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify"
-        ? Math.max(1, Math.min(4, Number(step.params.batchSize) || 1))
+        ? Math.max(1, Math.min(8, Number(step.params.batchSize) || 1))
         : 1;
       const result = await generateExactImages(provider, request, requestedCount);
       const images = await postProcessGeneratedOutputImages(step.kind, step.params, result.images);

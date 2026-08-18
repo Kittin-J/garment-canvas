@@ -25,6 +25,7 @@ assert.deepEqual(versions, [
   { version: 2, name: "project_asset_refs_project_foreign_key" },
   { version: 3, name: "revoked_session_reasons" },
   { version: 4, name: "active_account_id_unique" },
+  { version: 5, name: "account_data_retention_tombstones" },
 ]);
 console.log("  ✓ 新数据库记录全部编号迁移");
 

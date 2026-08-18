@@ -98,12 +98,13 @@ export function NodeFrame({ title, status, error, selected, nodeId, children }: 
 
 interface RunButtonProps {
   running: boolean;
+  queued?: boolean;
   onClick: () => void;
   label?: string;
   disabled?: boolean;
 }
 
-export function RunButton({ running, onClick, label = "运行", disabled }: RunButtonProps) {
+export function RunButton({ running, queued = false, onClick, label = "运行", disabled }: RunButtonProps) {
   return (
     <button
       type="button"
@@ -115,7 +116,7 @@ export function RunButton({ running, onClick, label = "运行", disabled }: RunB
           : "bg-gold text-ink disabled:opacity-40"
       }`}
     >
-      {running ? "显影中…" : label}
+      {running ? (queued ? "排队中…" : "显影中…") : label}
     </button>
   );
 }

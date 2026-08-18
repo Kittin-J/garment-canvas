@@ -18,6 +18,7 @@ await resetPostgresTestDatabase();
 const { closeDatabaseForTests, initializeDatabase, query, queryOne } = await import("../server/lib/database");
 const { authenticateRequest, authenticatedUser, createSession, SESSION_COOKIE } = await import("../server/lib/auth");
 const { authRouter } = await import("../server/routes/auth");
+const { purgeExpiredProjects } = await import("../server/routes/projects");
 const { verifyPassword } = await import("../server/lib/password");
 const {
   completeGenerationRecord, createGenerationRecord, failGenerationRecord, registerGeneratedFiles,
@@ -161,6 +162,122 @@ await test("同一账号并发登录均正常响应且最终仅保留一个有�
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
   }
+});
+
+await test("删除账号时全部业务数据进入 15 天回收期并在到期后清理", async () => {
+  const userId = "retention-user";
+  const createdAt = new Date().toISOString();
+  await query("UPDATE users SET must_change_password = 0 WHERE id = $1", [admin.id]);
+  await query(`
+    INSERT INTO users (id, account_id, display_name, role, password_hash, active, created_at, updated_at)
+    VALUES ($1, 'retention-user', '待删除用户', 'user', 'test-only', 1, $2, $2)
+  `, [userId, createdAt]);
+  await query(`
+    INSERT INTO projects (id, owner_id, name, flow_json, updated_at, created_at)
+    VALUES ('retention-project', $1, '待删除项目', '{"schemaVersion":1,"nodes":[],"edges":[]}', $2, $2)
+  `, [userId, createdAt]);
+  await query(`
+    INSERT INTO files (id, owner_id, source_type, project_id, run_id, created_at)
+    VALUES ('retention.png', $1, 'generated', 'retention-project', 'retention-run', $2)
+  `, [userId, createdAt]);
+  await query(`
+    INSERT INTO assets (id, owner_id, scope, name, category, image, created_at)
+    VALUES ('retention-asset', $1, 'private', '待删除素材', 'reference', '/api/files/retention.png', $2)
+  `, [userId, createdAt]);
+  await query(`
+    INSERT INTO generation_runs (
+      id, owner_id, project_id, node_id, node_label, kind, requested_count,
+      successful_count, provider_requests, status, started_at, finished_at
+    ) VALUES ('retention-run', $1, 'retention-project', 'node', '节点', 'ai-modify', 1, 1, 1, 'success', 1, 2)
+  `, [userId]);
+  await query(`
+    INSERT INTO usage_events (
+      id, owner_id, run_id, project_id, node_id, successful_count,
+      provider_requests, duration_ms, created_at
+    ) VALUES ('retention-usage', $1, 'retention-run', 'retention-project', 'node', 1, 1, 1, $2)
+  `, [userId, createdAt]);
+  const uploads = path.join(temp, "uploads");
+  fs.mkdirSync(uploads, { recursive: true });
+  fs.writeFileSync(path.join(uploads, "retention.png"), "test");
+
+  const adminSession = await createSession(String(admin.id), { markExistingAsReplaced: false });
+  const app = express();
+  app.use(express.json());
+  app.use("/api/auth", authRouter);
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve, reject) => {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  });
+  try {
+    const address = server.address() as AddressInfo;
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/auth/users/${userId}`, {
+      method: "DELETE",
+      headers: {
+        "Content-Type": "application/json",
+        cookie: `${SESSION_COOKIE}=${adminSession.token}`,
+      },
+      body: JSON.stringify({ deleteData: true }),
+    });
+    assert.equal(response.status, 200);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+
+  for (const table of ["projects", "assets", "files", "generation_runs", "usage_events"] as const) {
+    const row = await queryOne<{ deleted_at: string | null; purge_after: string | null }>(
+      `SELECT deleted_at, purge_after FROM ${table} WHERE owner_id = $1`,
+      [userId],
+    );
+    assert.ok(row?.deleted_at, `${table} should be tombstoned`);
+    assert.ok(row?.purge_after, `${table} should have a purge deadline`);
+  }
+
+  const expired = new Date(Date.now() - 1_000).toISOString();
+  for (const table of ["projects", "assets", "files", "generation_runs", "usage_events"] as const) {
+    await query(`UPDATE ${table} SET purge_after = $1 WHERE owner_id = $2`, [expired, userId]);
+  }
+  await purgeExpiredProjects();
+  for (const table of ["projects", "assets", "files", "generation_runs", "usage_events"] as const) {
+    assert.equal((await queryOne<{ count: number }>(
+      `SELECT COUNT(*)::int AS count FROM ${table} WHERE owner_id = $1`,
+      [userId],
+    ))?.count, 0, `${table} should be purged`);
+  }
+  assert.equal(fs.existsSync(path.join(uploads, "retention.png")), false);
+});
+
+await test("到期清理保留仍被其他项目引用的素材文件", async () => {
+  const createdAt = new Date().toISOString();
+  const expired = new Date(Date.now() - 1_000).toISOString();
+  await query(`
+    INSERT INTO users (id, account_id, display_name, role, password_hash, active, created_at, updated_at)
+    VALUES ('retention-consumer', 'retention-consumer', '引用用户', 'user', 'test-only', 1, $1, $1)
+  `, [createdAt]);
+  await query(`
+    INSERT INTO projects (id, owner_id, name, flow_json, updated_at, created_at)
+    VALUES ('retention-consumer-project', 'retention-consumer', '引用项目', '{"schemaVersion":1,"nodes":[],"edges":[]}', $1, $1)
+  `, [createdAt]);
+  await query(`
+    INSERT INTO files (id, owner_id, source_type, created_at, deleted_at, purge_after)
+    VALUES ('referenced-retention.png', 'retention-user', 'asset', $1, $1, $2)
+  `, [createdAt, expired]);
+  await query(`
+    INSERT INTO assets (
+      id, owner_id, scope, name, category, image, created_at, deleted_at, purge_after
+    ) VALUES (
+      'referenced-retention-asset', 'retention-user', 'shared', '仍被引用', 'reference',
+      '/api/files/referenced-retention.png', $1, $1, $2
+    )
+  `, [createdAt, expired]);
+  await query(`
+    INSERT INTO project_asset_refs (project_id, asset_id, created_at)
+    VALUES ('retention-consumer-project', 'referenced-retention-asset', $1)
+  `, [createdAt]);
+
+  await purgeExpiredProjects();
+  assert.ok(await queryOne("SELECT id FROM files WHERE id = 'referenced-retention.png'"));
+  assert.ok(await queryOne("SELECT id FROM assets WHERE id = 'referenced-retention-asset'"));
 });
 
 await test("成功图片写消耗流水，失败任务不写消耗", async () => {

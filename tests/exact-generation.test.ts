@@ -96,6 +96,11 @@ await test("印花裂变缺省 requested_count 与实际默认 4 张一致", asy
   assert.equal(requestedCountForStep("print-mutate", { count: 7 }), 7);
 });
 
+await test("直连与 DAG 的 AI 批量生成统一限制为最多 8 张", async () => {
+  assert.equal(requestedCountForStep("sketch-to-render", { batchSize: 8 }), 8);
+  assert.equal(requestedCountForStep("ai-modify", { batchSize: 99 }), 8);
+});
+
 await test("部分成功保留图片并明确记录 N/M", async () => {
   let calls = 0;
   const provider: AIProvider = {

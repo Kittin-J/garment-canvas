@@ -229,6 +229,12 @@ authRouter.delete("/users/:id", requireAdmin, asyncHandler(async (req, res) => {
         "UPDATE assets SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3 AND deleted_at IS NULL",
         [nowIso, purgeAfter, req.params.id],
       );
+      for (const table of ["files", "generation_runs", "usage_events"] as const) {
+        await client.query(
+          `UPDATE ${table} SET deleted_at = $1, purge_after = $2 WHERE owner_id = $3 AND deleted_at IS NULL`,
+          [nowIso, purgeAfter, req.params.id],
+        );
+      }
     }
     await client.query("DELETE FROM sessions WHERE user_id = $1", [req.params.id]);
     await client.query("UPDATE users SET active = 0, deleted_at = $1, updated_at = $1 WHERE id = $2", [nowIso, req.params.id]);
