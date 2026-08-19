@@ -771,6 +771,33 @@ async function main(): Promise<void> {
     assert.equal(nextCalls, 3);
   });
 
+  await test("单跳反向代理下不同客户端使用独立限流桶", async () => {
+    const app = express();
+    app.set("trust proxy", 1);
+    app.use(createRateLimitMiddleware({ windowMs: 60_000, maxRequests: 1 }));
+    app.get("/limited", (req, res) => res.json({ ip: req.ip }));
+
+    const server = app.listen(0, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => {
+      server.once("listening", resolve);
+      server.once("error", reject);
+    });
+    const address = server.address() as AddressInfo;
+    const url = `http://127.0.0.1:${address.port}/limited`;
+    try {
+      const firstClient = await fetch(url, { headers: { "X-Forwarded-For": "192.168.2.10" } });
+      assert.equal(firstClient.status, 200);
+      assert.deepEqual(await firstClient.json(), { ip: "192.168.2.10" });
+      assert.equal((await fetch(url, { headers: { "X-Forwarded-For": "192.168.2.10" } })).status, 429);
+
+      const secondClient = await fetch(url, { headers: { "X-Forwarded-For": "192.168.2.11" } });
+      assert.equal(secondClient.status, 200);
+      assert.deepEqual(await secondClient.json(), { ip: "192.168.2.11" });
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   console.log(`\n通过 ${passed} 项`);
 }
 

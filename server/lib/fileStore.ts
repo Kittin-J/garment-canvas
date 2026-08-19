@@ -5,7 +5,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import dns from "node:dns/promises";
-import { isIP } from "node:net";
+import { isIP, type LookupFunction } from "node:net";
 import http from "node:http";
 import https from "node:https";
 import { nanoid } from "nanoid";
@@ -240,6 +240,22 @@ async function defaultHostLookup(hostname: string): Promise<readonly string[]> {
 }
 
 /**
+ * 将已通过 SSRF 校验的固定地址交给 Node 的连接器。Node 22 的 Happy Eyeballs
+ * 路径会以 `all: true` 请求地址数组；旧版/单地址路径仍使用 address + family。
+ */
+export function createPinnedLookup(address: string): LookupFunction {
+  const family = isIP(address);
+  if (family !== 4 && family !== 6) throw new Error(`invalid pinned IP address: ${address}`);
+  return (_hostname, options, callback) => {
+    if (options.all) {
+      callback(null, [{ address, family }]);
+      return;
+    }
+    callback(null, address, family);
+  };
+}
+
+/**
  * 生产连接器：校验后固定连接到本次 DNS 解析出的 global 地址，并用原 hostname 做
  * Host/SNI。这样校验与真正连接之间不会再次解析域名，关闭 DNS rebinding 的 TOCTOU。
  */
@@ -256,7 +272,7 @@ async function pinnedFetch(
         method: "GET",
         headers: { accept: "image/*", host: u.host },
         signal: init.signal ?? undefined,
-        lookup: (_hostname, _options, callback) => callback(null, address, isIP(address) as 4 | 6),
+        lookup: createPinnedLookup(address),
         ...(u.protocol === "https:" ? { servername: u.hostname } : {}),
       },
       (response) => {

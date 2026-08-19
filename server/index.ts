@@ -24,6 +24,9 @@ import { mountProductionFrontend } from "./lib/staticFrontend";
 import type { ErrorRequestHandler } from "express";
 
 const app = express();
+// Production traffic reaches Express through exactly one Compose-managed nginx hop.
+// Trust only that hop so req.ip resolves to the LAN client instead of nginx's container IP.
+app.set("trust proxy", 1);
 
 app.use(express.json({ limit: "50mb" }));
 
