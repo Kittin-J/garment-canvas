@@ -32,17 +32,61 @@ console.log("  ✓ 新数据库记录全部编号迁移");
 const admin = await queryOne<{ id: string }>("SELECT id FROM users WHERE account_id = 'migration-admin'");
 assert.ok(admin);
 const now = new Date().toISOString();
+fs.mkdirSync(path.join(temp, "uploads"), { recursive: true });
+fs.writeFileSync(path.join(temp, "uploads", "legacy-rich.png"), "legacy-image");
 await query(`
   INSERT INTO assets (id, owner_id, scope, name, category, image, created_at)
   VALUES ('migration-asset', $1, 'private', '迁移素材', 'reference', '/api/files/migration.png', $2)
 `, [admin.id, now]);
 
 fs.mkdirSync(path.join(temp, "assets"), { recursive: true });
+fs.writeFileSync(path.join(temp, "assets", "legacy-rich.json"), JSON.stringify({
+  id: "legacy-rich", name: "原始面料素材", category: "fabric",
+  image: "/api/files/legacy-rich.png", sourceNote: "原始分类与备注必须保留", createdAt: now,
+}));
 fs.writeFileSync(path.join(temp, "assets", "private.json"), JSON.stringify({
   id: "legacy-private", name: "旧文件名", category: "reference",
   image: "/api/files/migration.png", sourceNote: "旧备注",
 }));
 await migrateLegacyData();
+const migratedAsset = await queryOne<Record<string, unknown>>(`
+  SELECT id, owner_id, scope, name, category, source_note
+  FROM assets WHERE image = '/api/files/legacy-rich.png'
+`);
+assert.deepEqual(migratedAsset, {
+  id: "legacy-rich",
+  owner_id: null,
+  scope: "global",
+  name: "原始面料素材",
+  category: "fabric",
+  source_note: "原始分类与备注必须保留",
+});
+assert.ok(await queryOne("SELECT id FROM files WHERE id = 'legacy-rich.png'"));
+fs.writeFileSync(path.join(temp, "uploads", "legacy-placeholder.png"), "legacy-placeholder");
+fs.writeFileSync(path.join(temp, "assets", "legacy-placeholder.json"), JSON.stringify({
+  id: "legacy-placeholder-original", name: "旧版原始印花", category: "print",
+  image: "/api/files/legacy-placeholder.png", sourceNote: "旧版原始备注", createdAt: now,
+}));
+await query(`
+  INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
+  VALUES ('legacy-placeholder-row', NULL, 'global', '历史素材-legacy-placeholder', 'reference',
+    '/api/files/legacy-placeholder.png', '从升级前服务器文件迁移', $1)
+`, [now]);
+await migrateLegacyData();
+assert.equal((await queryOne<{ count: number }>(
+  "SELECT COUNT(*)::int AS count FROM assets WHERE image = '/api/files/legacy-rich.png'",
+))?.count, 1);
+assert.deepEqual(await queryOne<Record<string, unknown>>(`
+  SELECT id, name, category, source_note FROM assets
+  WHERE image = '/api/files/legacy-placeholder.png'
+`), {
+  id: "legacy-placeholder-row",
+  name: "旧版原始印花",
+  category: "print",
+  source_note: "旧版原始备注",
+});
+console.log("  ✓ legacy 素材 JSON 优先于上传目录占位记录且重复启动保持幂等");
+
 const preserved = await queryOne<Record<string, unknown>>(
   "SELECT owner_id, scope, name, category, source_note FROM assets WHERE image = '/api/files/migration.png'",
 );

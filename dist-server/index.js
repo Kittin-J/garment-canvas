@@ -3050,22 +3050,21 @@ async function purgeExpiredProjects() {
     `, [now]);
     await client.query("DELETE FROM usage_events WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
     await client.query("DELETE FROM generation_runs WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
-    const files = await client.query(
-      `DELETE FROM files
-       WHERE purge_after IS NOT NULL AND purge_after <= $1
-         AND NOT EXISTS (
-           SELECT 1 FROM assets a
-           JOIN project_asset_refs refs ON refs.asset_id = a.id
-           WHERE a.image = '/api/files/' || files.id
-         )
-       RETURNING id`,
-      [now]
-    );
     await client.query(`
       DELETE FROM assets
       WHERE purge_after IS NOT NULL AND purge_after <= $1
         AND NOT EXISTS (SELECT 1 FROM project_asset_refs r WHERE r.asset_id = assets.id)
     `, [now]);
+    const files = await client.query(
+      `DELETE FROM files
+       WHERE purge_after IS NOT NULL AND purge_after <= $1
+         AND NOT EXISTS (
+           SELECT 1 FROM assets a
+           WHERE a.image = '/api/files/' || files.id
+         )
+       RETURNING id`,
+      [now]
+    );
     await client.query("DELETE FROM projects WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
     return files.rows.map((row) => row.id);
   });
@@ -3718,35 +3717,46 @@ assetsRouter.post("/", asyncHandler(async (req, res) => {
     if (sourceNote !== void 0 && (typeof sourceNote !== "string" || sourceNote.length > 2e3)) {
       throw new ImageValidationError("sourceNote must be a string of at most 2000 characters");
     }
+    const finalScope = scope === "global" && user.role === "admin" ? "global" : scope === "shared" ? "shared" : "private";
     const saved = image.startsWith("data:") ? saveDataUrl(image) : void 0;
     const imageUrl = saved?.url ?? (isLocalImageReference(image) ? image : "");
     if (!imageUrl) throw new ImageValidationError("image must be a local image reference or valid image dataURL");
-    if (saved) {
-      await query(`
-        INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, $2, 'asset', $3)
-        ON CONFLICT (id) DO NOTHING
-      `, [saved.id, user.id, (/* @__PURE__ */ new Date()).toISOString()]);
-    } else {
-      const access = await queryOne(`
-        SELECT f.owner_id,
-          EXISTS(
-            SELECT 1 FROM assets a
-            WHERE a.image = $1 AND a.deleted_at IS NULL AND a.scope IN ('global','shared')
-          ) AS shared
-        FROM files f WHERE f.id = $2
-      `, [imageUrl, path7.basename(imageUrl)]);
-      if (!access || access.owner_id !== null && access.owner_id !== user.id && user.role !== "admin" && !access.shared) {
-        res.status(404).json({ error: "image file not found" });
-        return;
-      }
-    }
     const id = nanoid9(10);
     const createdAt = (/* @__PURE__ */ new Date()).toISOString();
-    const finalScope = scope === "global" && user.role === "admin" ? "global" : scope === "shared" ? "shared" : "private";
-    await query(`
-      INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    `, [id, finalScope === "global" ? null : user.id, finalScope, name.trim(), category, imageUrl, sourceNote ?? null, createdAt]);
+    const created = await transaction(async (client) => {
+      if (saved) {
+        await client.query(`
+          INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, $2, 'asset', $3)
+          ON CONFLICT (id) DO NOTHING
+        `, [saved.id, finalScope === "global" ? null : user.id, createdAt]);
+      } else {
+        const access = await queryOne(`
+          SELECT f.owner_id,
+            EXISTS(
+              SELECT 1 FROM assets a
+              WHERE a.image = $1 AND a.deleted_at IS NULL AND a.scope IN ('global','shared')
+            ) AS shared
+          FROM files f WHERE f.id = $2
+        `, [imageUrl, path7.basename(imageUrl)], client);
+        if (!access || access.owner_id !== null && access.owner_id !== user.id && user.role !== "admin" && !access.shared) {
+          return false;
+        }
+      }
+      if (finalScope === "global") {
+        await client.query(`
+          UPDATE files SET owner_id = NULL, deleted_at = NULL, purge_after = NULL WHERE id = $1
+        `, [path7.basename(imageUrl)]);
+      }
+      await client.query(`
+        INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `, [id, finalScope === "global" ? null : user.id, finalScope, name.trim(), category, imageUrl, sourceNote ?? null, createdAt]);
+      return true;
+    });
+    if (!created) {
+      res.status(404).json({ error: "image file not found" });
+      return;
+    }
     res.status(201).json({ ok: true, id });
   } catch (error) {
     res.status(error instanceof ImageValidationError ? 400 : 500).json({ error: error instanceof Error ? error.message : String(error) });
@@ -4110,6 +4120,20 @@ authRouter.delete("/users/:id", requireAdmin, asyncHandler(async (req, res) => {
 // server/routes/history.ts
 import { Router as Router8 } from "express";
 var historyRouter = Router8();
+function encodeCursor(cursor) {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+function decodeCursor(value) {
+  if (value === void 0) return void 0;
+  if (typeof value !== "string" || value.length === 0 || value.length > 2e3) {
+    throw new Error("invalid history cursor");
+  }
+  const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8"));
+  if (!Number.isSafeInteger(decoded.before) || Number(decoded.before) < 0 || !Number.isSafeInteger(decoded.startedAt) || Number(decoded.startedAt) < 0 || typeof decoded.runId !== "string" || !decoded.runId) {
+    throw new Error("invalid history cursor");
+  }
+  return { before: Number(decoded.before), startedAt: Number(decoded.startedAt), runId: decoded.runId };
+}
 function parseJson(value, fallback) {
   if (typeof value !== "string" || !value) return fallback;
   try {
@@ -4127,23 +4151,48 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
   }
   const ownerId = requestedUserId ?? (user.role === "admin" && req.query.all === "true" ? null : user.id);
   const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 100));
-  const offset = Math.max(0, Number(req.query.offset) || 0);
+  let cursor;
+  try {
+    cursor = decodeCursor(req.query.cursor);
+  } catch {
+    res.status(400).json({ error: "\u5386\u53F2\u5206\u9875\u6E38\u6807\u65E0\u6548" });
+    return;
+  }
   const requestedBefore = Number(req.query.before);
-  const before = Number.isFinite(requestedBefore) && requestedBefore >= 0 ? requestedBefore : Date.now();
+  const before = cursor?.before ?? (Number.isFinite(requestedBefore) && requestedBefore >= 0 ? requestedBefore : Date.now());
+  const runCandidates = await query(`
+    SELECT r.id, r.started_at
+    FROM generation_runs r
+    WHERE ($1::text IS NULL OR r.owner_id = $1)
+      AND r.deleted_at IS NULL
+      AND r.started_at <= $2
+      AND (
+        $3::bigint IS NULL OR r.started_at < $3
+        OR (r.started_at = $3 AND r.id < $4)
+      )
+      AND (
+        r.status IN ('queued','running')
+        OR EXISTS (SELECT 1 FROM generation_outputs output WHERE output.run_id = r.id)
+      )
+    ORDER BY r.started_at DESC, r.id DESC
+    LIMIT $5
+  `, [ownerId, before, cursor?.startedAt ?? null, cursor?.runId ?? null, limit + 1]);
+  const hasMore = runCandidates.length > limit;
+  const pageRuns = runCandidates.slice(0, limit);
+  if (pageRuns.length === 0) {
+    res.json({ records: [], nextCursor: null, hasMore: false });
+    return;
+  }
   const rows = await query(`
     SELECT r.*, o.id AS output_id, o.image, o.prompt AS output_prompt,
       o.status AS output_status, o.error AS output_error, u.display_name AS owner_name
     FROM generation_runs r
     JOIN users u ON u.id = r.owner_id
     LEFT JOIN generation_outputs o ON o.run_id = r.id
-    WHERE ($1::text IS NULL OR r.owner_id = $1)
-      AND r.deleted_at IS NULL
-      AND r.started_at <= $2
-      AND (o.id IS NOT NULL OR r.status IN ('queued','running'))
-    ORDER BY r.started_at DESC, o.created_at ASC
-    LIMIT $3 OFFSET $4
-  `, [ownerId, before, limit, offset]);
-  res.json(rows.map((row) => ({
+    WHERE r.id = ANY($1::text[])
+    ORDER BY r.started_at DESC, r.id DESC, o.created_at ASC, o.id ASC
+  `, [pageRuns.map((run) => run.id)]);
+  const records = rows.map((row) => ({
     id: row.output_id ?? row.id,
     runId: row.id,
     image: row.image ?? "",
@@ -4166,7 +4215,13 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
     finishedAt: row.finished_at,
     status: row.output_status ?? row.status,
     error: row.output_error ?? row.error
-  })));
+  }));
+  const lastRun = pageRuns.at(-1);
+  res.json({
+    records,
+    nextCursor: hasMore && lastRun ? encodeCursor({ before, startedAt: lastRun.started_at, runId: lastRun.id }) : null,
+    hasMore
+  });
 }));
 historyRouter.delete("/:id", asyncHandler(async (req, res) => {
   const user = requestUser(req);
@@ -4364,6 +4419,7 @@ function createAiDiagnosticsRouter(probeRateLimit) {
 import fs7 from "node:fs";
 import path8 from "node:path";
 import { nanoid as nanoid11 } from "nanoid";
+var LEGACY_PLACEHOLDER_NOTE = "\u4ECE\u5347\u7EA7\u524D\u670D\u52A1\u5668\u6587\u4EF6\u8FC1\u79FB";
 async function migrateLegacyData() {
   const admin = await queryOne(`
     SELECT id FROM users WHERE role = 'admin' AND deleted_at IS NULL ORDER BY created_at ASC LIMIT 1
@@ -4371,22 +4427,15 @@ async function migrateLegacyData() {
   if (!admin) return;
   const now = (/* @__PURE__ */ new Date()).toISOString();
   const uploads = path8.join(config.dataDir(), "uploads");
-  if (fs7.existsSync(uploads)) {
+  const uploadFiles = fs7.existsSync(uploads) ? fs7.readdirSync(uploads) : [];
+  if (uploadFiles.length > 0) {
     await transaction(async (client) => {
-      for (const file of fs7.readdirSync(uploads)) {
+      for (const file of uploadFiles) {
         const id = path8.basename(file);
         await client.query(`
           INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, NULL, 'legacy', $2)
           ON CONFLICT (id) DO NOTHING
         `, [id, now]);
-        const image = `/api/files/${id}`;
-        const existing = await queryOne("SELECT id FROM assets WHERE image = $1 LIMIT 1", [image], client);
-        if (!existing) {
-          await client.query(`
-            INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
-            VALUES ($1, NULL, 'global', $2, 'reference', $3, '\u4ECE\u5347\u7EA7\u524D\u670D\u52A1\u5668\u6587\u4EF6\u8FC1\u79FB', $4)
-          `, [nanoid11(10), `\u5386\u53F2\u7D20\u6750-${path8.parse(id).name}`, image, now]);
-        }
       }
     });
   }
@@ -4418,14 +4467,43 @@ async function migrateLegacyData() {
           const raw = JSON.parse(fs7.readFileSync(path8.join(assets, file), "utf-8"));
           if (typeof raw.id !== "string" || typeof raw.name !== "string" || !["print", "fabric", "reference"].includes(String(raw.category)) || typeof raw.image !== "string" || !isLocalImageReference(raw.image)) continue;
           const note = typeof raw.sourceNote === "string" ? raw.sourceNote : null;
-          const existing = await queryOne("SELECT id FROM assets WHERE image = $1 LIMIT 1", [raw.image], client);
+          const createdAt = typeof raw.createdAt === "string" ? raw.createdAt : now;
+          const existing = await queryOne(
+            "SELECT id, owner_id, scope, name, source_note FROM assets WHERE image = $1 LIMIT 1",
+            [raw.image],
+            client
+          );
           if (!existing) {
             await client.query(`
               INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
               VALUES ($1, NULL, 'global', $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING
-            `, [raw.id, raw.name, raw.category, raw.image, note, typeof raw.createdAt === "string" ? raw.createdAt : now]);
+            `, [raw.id, raw.name, raw.category, raw.image, note, createdAt]);
+          } else if (existing.owner_id === null && existing.scope === "global" && existing.name === `\u5386\u53F2\u7D20\u6750-${path8.parse(path8.basename(raw.image)).name}` && existing.source_note === LEGACY_PLACEHOLDER_NOTE) {
+            await client.query(`
+              UPDATE assets SET name = $1, category = $2, source_note = $3, created_at = $4
+              WHERE id = $5
+            `, [raw.name, raw.category, note, createdAt, existing.id]);
           }
         } catch {
+        }
+      }
+    });
+  }
+  if (uploadFiles.length > 0) {
+    await transaction(async (client) => {
+      for (const file of uploadFiles) {
+        const id = path8.basename(file);
+        const image = `/api/files/${id}`;
+        const existing = await queryOne(
+          "SELECT id FROM assets WHERE image = $1 LIMIT 1",
+          [image],
+          client
+        );
+        if (!existing) {
+          await client.query(`
+            INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
+            VALUES ($1, NULL, 'global', $2, 'reference', $3, $4, $5)
+          `, [nanoid11(10), `\u5386\u53F2\u7D20\u6750-${path8.parse(id).name}`, image, LEGACY_PLACEHOLDER_NOTE, now]);
         }
       }
     });
