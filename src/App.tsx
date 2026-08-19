@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { ReactFlowProvider } from "@xyflow/react";
 import { nanoid } from "nanoid";
-import { resumeRecentResults, useFlowStore, type FlowNode } from "@/store/flowStore";
+import { mergeRecentResults, resumeRecentResults, useFlowStore, type FlowNode } from "@/store/flowStore";
 import { CanvasFlow } from "@/components/CanvasFlow";
 import { TopBar } from "@/components/panels/TopBar";
 import { ProjectTabs } from "@/components/panels/ProjectTabs";
@@ -11,6 +11,7 @@ import { ResultsPanel } from "@/components/panels/ResultsPanel";
 import { TemplatesDock } from "@/components/panels/TemplatesDock";
 import { CompareOverlay } from "@/components/CompareOverlay";
 import { ImageViewer } from "@/components/ImageViewer";
+import { AssetPickerOverlay } from "@/components/AssetPickerOverlay";
 import { useAuth } from "@/auth/AuthContext";
 import { ChangePasswordPage, LoginPage, SessionEndedPage } from "@/auth/LoginPage";
 
@@ -102,17 +103,20 @@ function Workspace() {
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const historyPageSize = 20;
+  const historyBefore = useRef(Date.now()).current;
 
   useEffect(() => {
     let active = true;
-    fetch(`/api/history?limit=${historyPageSize}&offset=0`)
+    fetch(`/api/history?limit=${historyPageSize}&offset=0&before=${historyBefore}`)
       .then(async (response) => {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return await response.json();
       })
       .then((records) => {
         if (active && Array.isArray(records)) {
-          useFlowStore.setState({ recentResults: records as never });
+          useFlowStore.setState((state) => ({
+            recentResults: mergeRecentResults(state.recentResults, records as never),
+          }));
           resumeRecentResults(records as never);
           setHistoryOffset(records.length);
           setHistoryHasMore(records.length === historyPageSize);
@@ -127,7 +131,7 @@ function Workspace() {
     setHistoryLoading(true);
     try {
       const response = await fetch(
-        `/api/history?limit=${historyPageSize}&offset=${historyOffset}`,
+        `/api/history?limit=${historyPageSize}&offset=${historyOffset}&before=${historyBefore}`,
       );
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const records = await response.json();
@@ -149,7 +153,7 @@ function Workspace() {
     } finally {
       setHistoryLoading(false);
     }
-  }, [historyHasMore, historyLoading, historyOffset]);
+  }, [historyBefore, historyHasMore, historyLoading, historyOffset]);
 
   return (
     <div className="gc-app-shell flex h-full flex-col bg-ink text-neutral-200">
@@ -172,6 +176,7 @@ function Workspace() {
       </div>
       <CompareOverlay />
       <ImageViewer />
+      <AssetPickerOverlay />
     </div>
   );
 }

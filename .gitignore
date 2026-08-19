@@ -1,5 +1,8 @@
 # Dependencies
-node_modules/
+node_modules
+
+# Local agent worktrees
+.claude/worktrees/
 
 # Build and release outputs
 releases/

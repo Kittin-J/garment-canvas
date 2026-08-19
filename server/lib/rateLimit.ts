@@ -16,7 +16,7 @@ interface RateBucket {
  */
 export function createRateLimitMiddleware(options: RateLimitOptions = {}): RequestHandler {
   const windowMs = options.windowMs ?? 60_000;
-  const maxRequests = options.maxRequests ?? 5;
+  const maxRequests = options.maxRequests ?? 100;
   const now = options.now ?? Date.now;
   const buckets = new Map<string, RateBucket>();
 

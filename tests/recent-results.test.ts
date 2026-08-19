@@ -4,7 +4,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   applyRunEventToNode,
   applyRunEventToRecentResults,
+  appendSavedAsset,
+  createQueuedResultCards,
+  mergeRecentResults,
   normalizeRunEvent,
+  requestedResultCount,
   resumeRecentResults,
   useFlowStore,
   type RecentResult,
@@ -12,6 +16,7 @@ import {
 } from "../src/store/flowStore";
 import type { AiModifyNodeData } from "../src/types/workflow";
 import { ImageGrid } from "../src/components/nodes/ImageGrid";
+import { RunButton } from "../src/components/nodes/NodeFrame";
 
 let passed = 0;
 
@@ -60,6 +65,71 @@ test("排队卡收到运行事件后原地更新，不重复新建", () => {
   assert.equal(result[0].startedAt, 1_200);
 });
 
+test("点击批量生成时立即按用户选择创建对应数量的排队卡", () => {
+  const cards = createQueuedResultCards(queued, 4);
+  assert.equal(cards.length, 4);
+  assert.equal(cards[0].id, queued.id);
+  assert.deepEqual(cards.slice(1).map((record) => record.id), [
+    `${queued.id}:pending:1`,
+    `${queued.id}:pending:2`,
+    `${queued.id}:pending:3`,
+  ]);
+  assert.ok(cards.every((record) => record.status === "queued" && record.requestedCount === 4));
+
+  const running = applyRunEventToRecentResults(cards, queued.id, {
+    type: "node-status",
+    nodeId: queued.nodeId,
+    status: "running",
+    startedAt: 1_500,
+  });
+  assert.ok(running.every((record) => record.status === "running" && record.startedAt === 1_500));
+});
+
+test("各批量节点正确计算用户选择的卡片数量", () => {
+  const modify: AiModifyNodeData = {
+    kind: "ai-modify",
+    label: "AI 改款",
+    status: "idle",
+    prompt: "改款",
+    aspectRatio: "1:1",
+    batchSize: 4,
+    outputImages: [],
+  };
+  assert.equal(requestedResultCount(modify), 4);
+  assert.equal(requestedResultCount({
+    kind: "print-mutate",
+    label: "印花裂变",
+    status: "idle",
+    prompt: "变体",
+    count: 8,
+    outputImages: [],
+  }), 8);
+  assert.equal(requestedResultCount({
+    kind: "fabric-recolor",
+    label: "配色",
+    status: "idle",
+    colors: ["#111111", "#222222", "#333333"],
+    prompt: "",
+    outputImages: [],
+  }), 3);
+});
+
+test("部分成功时用错误卡补足用户选择数量而不增减卡片", () => {
+  const cards = createQueuedResultCards(queued, 4);
+  const result = applyRunEventToRecentResults(cards, queued.id, {
+    type: "node-status",
+    nodeId: queued.nodeId,
+    status: "success",
+    images: ["/api/files/one", "/api/files/two"],
+    failures: [{ error: "模型暂时不可用" }],
+    finishedAt: 4_000,
+  });
+  assert.equal(result.length, 4);
+  assert.deepEqual(result.map((record) => record.status), ["success", "success", "error", "error"]);
+  assert.equal(result[2].error, "模型暂时不可用");
+  assert.equal(result[3].error, "未返回图片");
+});
+
 test("成功后主卡保留原 id，批量图片追加独立可查看卡片", () => {
   const result = apply({
     type: "node-status",
@@ -95,6 +165,32 @@ test("生成失败也保留点击时的卡片和错误信息", () => {
   assert.equal(result[0].status, "error");
   assert.equal(result[0].error, "上游图片缺失");
   assert.equal(result[0].image, "");
+});
+
+test("首次历史响应与请求期间新增的乐观记录合并且按 id 去重", () => {
+  const optimistic: RecentResult = {
+    ...queued,
+    id: "optimistic",
+    runId: "run-optimistic",
+    status: "running",
+    startedAt: 2_000,
+  };
+  const serverRecord: RecentResult = {
+    ...queued,
+    id: "server-record",
+    runId: "run-server",
+    status: "success",
+    image: "/api/files/server.png",
+  };
+  assert.deepEqual(
+    mergeRecentResults([optimistic], [serverRecord, optimistic]),
+    [optimistic, serverRecord],
+  );
+});
+
+test("并发保存素材按最新状态追加且保持幂等", () => {
+  assert.deepEqual(appendSavedAsset(["a"], "b"), ["a", "b"]);
+  assert.deepEqual(appendSavedAsset(["a", "b"], "b"), ["a", "b"]);
 });
 
 test("异常错误事件即使夹带 images 也不会清空节点原有图片", () => {
@@ -143,6 +239,34 @@ test("图片网格收到损坏的 undefined 数据时显示空状态而不抛错
 test("图片网格使用服务端缩略图但查看器仍保留原图引用", () => {
   const html = renderToStaticMarkup(createElement(ImageGrid, { images: ["/api/files/result.png"] }));
   assert.match(html, /\/api\/files\/result\.png\/thumbnail/);
+});
+
+test("排队中的运行按钮禁用并明确显示排队状态", () => {
+  const html = renderToStaticMarkup(createElement(RunButton, {
+    running: true,
+    queued: true,
+    onClick: () => undefined,
+  }));
+  assert.match(html, /disabled/);
+  assert.match(html, /排队中…/);
+});
+
+test("选择第 5 张对比图时给出上限提示且不改变选择", () => {
+  const previousWindow = globalThis.window;
+  let alertMessage = "";
+  Object.defineProperty(globalThis, "window", {
+    configurable: true,
+    value: { alert: (message: string) => { alertMessage = message; } },
+  });
+  try {
+    useFlowStore.setState({ compareIds: ["a", "b", "c", "d"] });
+    useFlowStore.getState().toggleCompareId("e");
+    assert.equal(alertMessage, "最多选择 4 张图片进行对比");
+    assert.deepEqual(useFlowStore.getState().compareIds, ["a", "b", "c", "d"]);
+  } finally {
+    if (previousWindow === undefined) delete (globalThis as { window?: Window }).window;
+    else Object.defineProperty(globalThis, "window", { configurable: true, value: previousWindow });
+  }
 });
 
 test("部分成功时成功图和失败项都保留", () => {
@@ -298,6 +422,29 @@ try {
     })),
     firstTerminalCards,
   );
+
+  useFlowStore.setState({ recentResults: [{ ...resumable, id: "done-without-terminal" }] });
+  resumeRecentResults([{ ...resumable, id: "done-without-terminal" }]);
+  await waitFor(() => MockEventSource.instances.length === 4, "缺少终态的恢复连接未建立");
+  MockEventSource.instances[3].emit({ type: "done", seq: 1 }, "1");
+  await waitFor(() => MockEventSource.instances[3].closed, "缺少终态时连接未关闭");
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(useFlowStore.getState().recentResults[0].status, "error");
+
+  useFlowStore.setState({ recentResults: [{ ...resumable, id: "out-of-order", status: "running" }] });
+  resumeRecentResults([{ ...resumable, id: "out-of-order", status: "running" }]);
+  await waitFor(() => MockEventSource.instances.length === 5, "乱序事件恢复连接未建立");
+  MockEventSource.instances[4].emit({
+    type: "node-status", nodeId: resumable.nodeId, status: "success",
+    images: ["/api/files/order.png"], seq: 2,
+  }, "2");
+  MockEventSource.instances[4].emit({
+    type: "node-status", nodeId: resumable.nodeId, status: "running", seq: 1,
+  }, "1");
+  MockEventSource.instances[4].emit({ type: "done", seq: 3 }, "3");
+  await waitFor(() => MockEventSource.instances[4].closed, "乱序事件连接未关闭");
+  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  assert.equal(useFlowStore.getState().recentResults[0].status, "success");
   passed += 1;
   console.log("  ✓ 重叠历史页去重，释放后重放终态事件仍保持幂等");
 } finally {

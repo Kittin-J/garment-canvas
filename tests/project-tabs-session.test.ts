@@ -6,11 +6,14 @@ interface MemoryStorage {
   removeItem(key: string): void;
 }
 
-function memoryStorage(initial: Record<string, string> = {}): MemoryStorage {
+function memoryStorage(initial: Record<string, string> = {}, onSet?: (key: string) => void): MemoryStorage {
   const values = new Map(Object.entries(initial));
   return {
     getItem: (key) => values.get(key) ?? null,
-    setItem: (key, value) => values.set(key, value),
+    setItem: (key, value) => {
+      onSet?.(key);
+      values.set(key, value);
+    },
     removeItem: (key) => values.delete(key),
   };
 }
@@ -82,7 +85,11 @@ const storedRecentResults = [
   },
 ];
 
-const sessionStorage = memoryStorage({ [sessionKey]: JSON.stringify(storedSession) });
+let sessionWrites = 0;
+const sessionStorage = memoryStorage(
+  { [sessionKey]: JSON.stringify(storedSession) },
+  (key) => { if (key === sessionKey) sessionWrites += 1; },
+);
 const localStorage = memoryStorage({ [recentKey]: JSON.stringify(storedRecentResults) });
 Object.assign(globalThis, { window: { sessionStorage, localStorage } });
 
@@ -152,8 +159,10 @@ assert.equal(migrated.tabs[0].dirty, true);
 console.log("  ✓ 旧会话逐节点补齐必需字段，并隔离坏节点和悬空边");
 
 assert.deepEqual(state.recentResults, [], "登录后的历史必须以服务器为准，不能泄露上一账号的 localStorage");
+const writesBeforeHistory = sessionWrites;
 useFlowStore.setState({ recentResults: storedRecentResults as never });
 assert.deepEqual(useFlowStore.getState().recentResults.map((record) => record.id), ["record-project-b", "record-legacy"]);
+assert.equal(sessionWrites, writesBeforeHistory, "历史/SSE 更新不应重新序列化项目页签");
 console.log("  ✓ 忽略本地跨账号缓存，并能渲染服务器恢复的全局历史");
 
 sessionStorage.setItem(sessionKey, JSON.stringify({

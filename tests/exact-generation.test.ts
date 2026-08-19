@@ -14,10 +14,12 @@ import {
   withImageProcessingSlot,
 } from "../server/lib/imageProcessingLimit";
 import { generateExactImages } from "../server/providers/exact";
+import { ProviderError, sanitizedProviderDiagnostic } from "../server/providers/base";
 import {
   postProcessDirectGenerateImages,
   validateDirectGenerateRequest,
 } from "../server/routes/generate";
+import { requestedCountForStep } from "../server/routes/runPlan";
 import { imageExtensionFromReference } from "../src/lib/imageFormat";
 import type { AIProvider } from "../src/types/workflow";
 
@@ -73,6 +75,92 @@ await test("文生图同样补足数量，不只修复图生图节点", async ()
   const result = await generateExactImages(provider, { prompt: "服装效果图" }, 2);
   assert.equal(result.images.length, 2);
   assert.equal(calls, 2);
+});
+
+await test("模型路由临时不可用时退避重试，恢复后不留下失败卡片", async () => {
+  let calls = 0;
+  const provider: AIProvider = {
+    id: "stub",
+    async generate() {
+      calls += 1;
+      if (calls === 1) {
+        throw new ProviderError(
+          "当前 AI 模型不可用，请联系管理员检查模型配置",
+          404,
+          "stub",
+          "model_unavailable",
+          'HTTP 404: {"error":{"message":"model temporarily not available"}}',
+        );
+      }
+      return { images: ["recovered"], model: "stub-model" };
+    },
+    async edit() { throw new Error("unexpected edit"); },
+  };
+  const result = await generateExactImages(
+    provider,
+    { prompt: "重试" },
+    1,
+    { runId: "run-test", transientRetryDelaysMs: [0, 0] },
+  );
+  assert.equal(calls, 2);
+  assert.deepEqual(result.images, ["recovered"]);
+  assert.deepEqual(result.failures, []);
+});
+
+await test("永久参数错误仍立即停止，不额外产生消耗", async () => {
+  let calls = 0;
+  const provider: AIProvider = {
+    id: "stub",
+    async generate() {
+      calls += 1;
+      throw new ProviderError("参数错误", 400, "stub", "invalid_request", "HTTP 400: bad size");
+    },
+    async edit() { throw new Error("unexpected edit"); },
+  };
+  await assert.rejects(
+    generateExactImages(provider, { prompt: "错误参数" }, 1, { transientRetryDelaysMs: [0, 0] }),
+    /参数错误/,
+  );
+  assert.equal(calls, 1);
+});
+
+await test("网关诊断日志会移除 Key、URL 和图片数据", async () => {
+  const diagnostic = sanitizedProviderDiagnostic(new ProviderError(
+    "失败",
+    400,
+    "stub",
+    "invalid_request",
+    'HTTP 400: {"error":{"message":"key sk-secret at https://signed.example/x?token=abc data:image/png;base64,AAAA","type":"invalid_request_error"}}',
+  ));
+  assert.ok(diagnostic?.includes("[redacted-key]"));
+  assert.ok(diagnostic?.includes("[redacted-url]"));
+  assert.ok(diagnostic?.includes("[redacted-image]"));
+  assert.ok(!diagnostic?.includes("sk-secret"));
+  assert.ok(!diagnostic?.includes("signed.example"));
+});
+
+await test("内容安全拒绝是确定失败，不会为同一输入重复付费调用", async () => {
+  let calls = 0;
+  const provider: AIProvider = {
+    id: "stub",
+    async generate() {
+      calls += 1;
+      throw new ProviderError("内容拒绝", undefined, "stub", "content_refused");
+    },
+    async edit() { throw new Error("unexpected edit"); },
+  };
+  await assert.rejects(() => generateExactImages(provider, { prompt: "被拒绝" }, 4), ProviderError);
+  assert.equal(calls, 1);
+});
+
+await test("印花裂变缺省 requested_count 与实际默认 4 张一致", async () => {
+  assert.equal(requestedCountForStep("print-mutate", {}), 4);
+  assert.equal(requestedCountForStep("print-mutate", { count: 7 }), 7);
+});
+
+await test("直连与 DAG 的 AI 批量生成统一限制为最多 8 张", async () => {
+  assert.equal(requestedCountForStep("sketch-to-render", { batchSize: 8 }), 8);
+  assert.equal(requestedCountForStep("ai-modify", { batchSize: 99 }), 8);
 });
 
 await test("部分成功保留图片并明确记录 N/M", async () => {

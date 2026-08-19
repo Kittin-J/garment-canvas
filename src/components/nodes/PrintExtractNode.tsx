@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
-import { useFlowStore } from "@/store/flowStore";
+import { appendSavedAsset, useFlowStore } from "@/store/flowStore";
 import type { PrintExtractNodeData } from "@/types/workflow";
 import { NodeFrame, RunButton, Developing, inputClass } from "./NodeFrame";
 import { ImageGrid } from "./ImageGrid";
@@ -8,7 +8,7 @@ import { ImageGrid } from "./ImageGrid";
 export function PrintExtractNode({ id, data, selected }: NodeProps<Node<PrintExtractNodeData>>) {
   const updateNodeData = useFlowStore((s) => s.updateNodeData);
   const runNode = useFlowStore((s) => s.runNode);
-  const running = data.status === "running";
+  const running = data.status === "running" || data.status === "queued";
   const [savingUrl, setSavingUrl] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const saved = data.savedAsAssets ?? [];
@@ -31,7 +31,9 @@ export function PrintExtractNode({ id, data, selected }: NodeProps<Node<PrintExt
         }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      updateNodeData(id, { savedAsAssets: [...saved, url] });
+      const latest = useFlowStore.getState().nodes.find((node) => node.id === id)?.data;
+      const current = latest?.kind === "print-extract" ? latest.savedAsAssets : undefined;
+      updateNodeData(id, { savedAsAssets: appendSavedAsset(current, url) });
     } catch (err) {
       setSaveError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -54,7 +56,7 @@ export function PrintExtractNode({ id, data, selected }: NodeProps<Node<PrintExt
           />
           <span className="text-[9px] text-neutral-600">可连接 1–8 张参考图，按连线顺序传入</span>
         </label>
-        <RunButton running={running} onClick={() => void runNode(id)} label="提取印花" />
+        <RunButton running={running} queued={data.status === "queued"} onClick={() => void runNode(id)} label="提取印花" />
         {running && <Developing />}
         <ImageGrid
           images={data.outputImages}

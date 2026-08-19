@@ -120,6 +120,15 @@ await test("A 页签后台失败不影响 B 页签且保留 A 的上一版图片
   useFlowStore.getState().switchTab(tabB);
 });
 
+await test("运行中的页签不能关闭，避免任务结果丢失画布回写", () => {
+  useFlowStore.getState().updateNodeData("b-node", { status: "queued" });
+  const count = useFlowStore.getState().tabs.length;
+  useFlowStore.getState().closeTab(tabB);
+  assert.equal(useFlowStore.getState().tabs.length, count);
+  assert.equal(useFlowStore.getState().activeTabId, tabB);
+  useFlowStore.getState().updateNodeData("b-node", { status: "idle" });
+});
+
 await test("关闭当前页签后切换到相邻页签，至少保留一个画布", () => {
   useFlowStore.getState().closeTab(tabB);
   assert.equal(useFlowStore.getState().activeTabId, tabA);

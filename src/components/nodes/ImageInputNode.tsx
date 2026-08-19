@@ -3,6 +3,7 @@ import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import { useFlowStore } from "@/store/flowStore";
 import type { ImageInputNodeData } from "@/types/workflow";
 import { thumbnailImageUrl } from "@/lib/images";
+import { OPEN_ASSET_PICKER_EVENT, type AssetPickerRequest } from "@/components/AssetPickerOverlay";
 import { NodeFrame, inputClass } from "./NodeFrame";
 
 async function uploadFile(file: File): Promise<string> {
@@ -33,6 +34,11 @@ export function ImageInputNode({ id, data, selected }: NodeProps<Node<ImageInput
   const uploadRequestRef = useRef(0);
   const [uploading, setUploading] = useState(false);
   const [dragOver, setDragOver] = useState(false);
+
+  const openAssetPicker = useCallback(() => {
+    const detail: AssetPickerRequest = { tabId: useFlowStore.getState().activeTabId, nodeId: id };
+    window.dispatchEvent(new CustomEvent(OPEN_ASSET_PICKER_EVENT, { detail }));
+  }, [id]);
 
   const handleFile = useCallback(
     async (file: File | undefined | null) => {
@@ -120,13 +126,23 @@ export function ImageInputNode({ id, data, selected }: NodeProps<Node<ImageInput
                 : "border-[#2a2a2a] text-neutral-500 hover:border-neutral-500"
             }`}
           >
-            {uploading ? "上传中…" : "点击上传 / 拖拽图片到此处\n选中节点后 Ctrl+V 粘贴"}
+            {uploading ? "上传中…" : "每个上传节点仅支持 1 张图\n点击 / 拖拽 / 选中后 Ctrl+V"}
           </div>
+        )}
+        {!data.imageUrl && (
+          <button
+            type="button"
+            onClick={openAssetPicker}
+            className="nodrag w-full rounded-md border border-[#262626] py-1 text-[10px] text-neutral-400 hover:border-gold/60 hover:text-gold"
+          >
+            从素材库选择
+          </button>
         )}
         <input
           ref={fileInputRef}
           type="file"
           accept="image/*"
+          multiple={false}
           className="hidden"
           onChange={(e) => {
             void handleFile(e.target.files?.[0]);
@@ -134,13 +150,22 @@ export function ImageInputNode({ id, data, selected }: NodeProps<Node<ImageInput
           }}
         />
         {data.imageUrl && (
-          <button
-            type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="nodrag w-full rounded-md border border-[#262626] py-1 text-[10px] text-neutral-400 hover:border-neutral-500 hover:text-neutral-200"
-          >
-            重新上传
-          </button>
+          <div className="nodrag flex gap-1.5">
+            <button
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              className="flex-1 rounded-md border border-[#262626] py-1 text-[10px] text-neutral-400 hover:border-neutral-500 hover:text-neutral-200"
+            >
+              重新上传
+            </button>
+            <button
+              type="button"
+              onClick={openAssetPicker}
+              className="flex-1 rounded-md border border-[#262626] py-1 text-[10px] text-neutral-400 hover:border-gold/60 hover:text-gold"
+            >
+              素材库
+            </button>
+          </div>
         )}
       </NodeFrame>
       <Handle type="source" position={Position.Right} />

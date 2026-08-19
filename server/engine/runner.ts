@@ -179,6 +179,27 @@ function emit(run: Run, event: RunEvent): void {
 async function executeRun(run: Run): Promise<void> {
   /** 每个节点的产出图片（统一为 /api/files/:id 引用），供下游节点使用 */
   const outputs = new Map<string, string[]>();
+  let providerRequests = 0;
+  let model: string | undefined;
+  let recordResult: Pick<StepResult, "images" | "prompts" | "failures"> | undefined;
+
+  if (run.recordContext) await markGenerationRunning(run.id, Date.now());
+
+  const failRun = async (message: string, nodeId?: string, startedAt?: number): Promise<void> => {
+    const finishedAt = Date.now();
+    if (run.recordContext) await failGenerationRecord(run.id, message, finishedAt);
+    if (nodeId) {
+      emit(run, {
+        type: "node-status",
+        nodeId,
+        status: "error",
+        error: message,
+        ...(startedAt !== undefined ? { startedAt } : {}),
+        finishedAt,
+      });
+    }
+    emit(run, { type: "run-error", ...(nodeId ? { nodeId } : {}), error: message, finishedAt });
+  };
 
   for (const step of run.plan.steps) {
     // 运行时解析真实输入：优先本次 Run 上游产出，范围外上游回退到计划期快照
@@ -188,32 +209,21 @@ async function executeRun(run: Run): Promise<void> {
 
     if (NODE_SPECS[step.kind].providerId && inputImages.length > MAX_REFERENCE_IMAGES) {
       const message = `Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`;
-      const finishedAt = Date.now();
-      emit(run, { type: "node-status", nodeId: step.nodeId, status: "error", error: message, finishedAt });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      await failRun(message, step.nodeId);
       return;
     }
 
     // 运行时最终门禁：即使静态计划中的上游节点实际未产图，也绝不退化成无参考图付费生成。
     if (NODE_SPECS[step.kind].providerId && step.kind !== "sketch-to-render" && inputImages.length === 0) {
       const message = `Node ${step.nodeId} requires an upstream image`;
-      const finishedAt = Date.now();
-      emit(run, {
-        type: "node-status",
-        nodeId: step.nodeId,
-        status: "error",
-        error: message,
-        finishedAt,
-      });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      await failRun(message, step.nodeId);
       return;
     }
 
     const startedAt = Date.now();
-    if (run.recordContext?.nodeId === step.nodeId) await markGenerationRunning(run.id, startedAt);
     emit(run, { type: "node-status", nodeId: step.nodeId, status: "running", startedAt });
     try {
-      const result = await executeStep(step, inputImages);
+      const result = await executeStep(step, inputImages, getProvider, run.id);
       // 产出统一落盘为 /api/files/:id，避免 base64 大图驻留事件与内存
       const persisted = await persistOutputImages(result.images);
       if (run.recordContext) {
@@ -221,17 +231,10 @@ async function executeRun(run: Run): Promise<void> {
       }
       outputs.set(step.nodeId, persisted);
       const finishedAt = Date.now();
+      providerRequests += result.providerRequests;
+      if (result.model) model = result.model;
       if (run.recordContext?.nodeId === step.nodeId) {
-        await completeGenerationRecord({
-          runId: run.id,
-          images: persisted,
-          prompts: result.prompts,
-          failures: result.failures,
-          model: result.model,
-          providerRequests: result.providerRequests,
-          startedAt,
-          finishedAt,
-        });
+        recordResult = { images: persisted, prompts: result.prompts, failures: result.failures };
       }
       const partialWarning = result.failures?.length
         ? `${result.failures.length} 个生成任务失败`
@@ -252,19 +255,22 @@ async function executeRun(run: Run): Promise<void> {
       const message = err instanceof ProviderError
         ? publicProviderErrorMessage(err)
         : err instanceof Error ? err.message : String(err);
-      const finishedAt = Date.now();
-      if (run.recordContext?.nodeId === step.nodeId) await failGenerationRecord(run.id, message, finishedAt);
-      emit(run, {
-        type: "node-status",
-        nodeId: step.nodeId,
-        status: "error",
-        error: message,
-        startedAt,
-        finishedAt,
-      });
-      emit(run, { type: "run-error", nodeId: step.nodeId, error: message, finishedAt });
+      await failRun(message, step.nodeId, startedAt);
       return; // P0：单步失败即终止整个 run
     }
+  }
+  if (run.recordContext) {
+    const finishedAt = Date.now();
+    await completeGenerationRecord({
+      runId: run.id,
+      images: recordResult?.images ?? [],
+      prompts: recordResult?.prompts,
+      failures: recordResult?.failures,
+      model,
+      providerRequests,
+      startedAt: run.createdAt,
+      finishedAt,
+    });
   }
   emit(run, { type: "done" });
 }
@@ -300,6 +306,7 @@ export async function executeStep(
   step: NodeExecution,
   inputImages: string[],
   resolveProvider: ProviderResolver = getProvider,
+  runId?: string,
 ): Promise<StepResult> {
   switch (step.kind) {
     case "image-input": {
@@ -345,7 +352,7 @@ export async function executeStep(
           for (const color of colors) {
             const prompt = buildRecolorPrompt([color]);
             try {
-              const result = await generateExactImages(provider, { prompt, referenceImages }, 1);
+              const result = await generateExactImages(provider, { prompt, referenceImages }, 1, { runId, nodeId: step.nodeId });
               providerRequests += result.providerRequests;
               model = result.model;
               for (const image of result.images) {
@@ -374,7 +381,7 @@ export async function executeStep(
         const prompt =
           "基于这张印花图案生成风格一致的新变体：保持原有配色体系、艺术风格与笔触质感，重新编排元素的构图与组合方式，纯白背景，适合作为印花素材复用" +
           (extra ? `。补充要求：${extra}` : "");
-        const result = await generateExactImages(provider, { prompt, referenceImages }, count);
+        const result = await generateExactImages(provider, { prompt, referenceImages }, count, { runId, nodeId: step.nodeId });
         const failures = result.failures.map((error) => ({ prompt, error }));
         return {
           images: result.images,
@@ -402,9 +409,9 @@ export async function executeStep(
         imageSize: step.kind === "upscale" ? normalizeUpscaleSize(step.params.imageSize) : undefined,
       };
       const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify"
-        ? Math.max(1, Math.min(4, Number(step.params.batchSize) || 1))
+        ? Math.max(1, Math.min(8, Number(step.params.batchSize) || 1))
         : 1;
-      const result = await generateExactImages(provider, request, requestedCount);
+      const result = await generateExactImages(provider, request, requestedCount, { runId, nodeId: step.nodeId });
       const images = await postProcessGeneratedOutputImages(step.kind, step.params, result.images);
       return {
         images,

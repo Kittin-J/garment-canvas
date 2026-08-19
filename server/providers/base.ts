@@ -100,6 +100,32 @@ export function publicProviderErrorMessage(error: unknown): string {
   return "AI 服务暂时不可用，请稍后重试";
 }
 
+/** 将仅供服务端使用的网关诊断压缩并脱敏，避免日志泄露 Key、URL 或图片数据。 */
+export function sanitizedProviderDiagnostic(error: ProviderError): string | undefined {
+  if (!error.diagnostic) return undefined;
+  const redact = (value: string) => value
+    .replace(/(?:bearer\s+)?sk-[a-z0-9_-]+/gi, "[redacted-key]")
+    .replace(/data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=]+/gi, "[redacted-image]")
+    .replace(/https?:\/\/[^\s\"']+/gi, "[redacted-url]")
+    .slice(0, 800);
+  const match = /^HTTP\s+(\d+):\s*([\s\S]*)$/i.exec(error.diagnostic);
+  if (!match) return redact(error.diagnostic);
+  try {
+    const parsed = JSON.parse(match[2]) as { error?: unknown };
+    const source = typeof parsed.error === "object" && parsed.error !== null
+      ? parsed.error as Record<string, unknown>
+      : parsed as Record<string, unknown>;
+    const safe = Object.fromEntries(
+      ["message", "type", "code", "param", "status"]
+        .filter((key) => typeof source[key] === "string" || typeof source[key] === "number")
+        .map((key) => [key, redact(String(source[key]))]),
+    );
+    return `HTTP ${match[1]}: ${JSON.stringify(safe)}`;
+  } catch {
+    return `HTTP ${match[1]}: ${redact(match[2])}`;
+  }
+}
+
 export class NotImplementedError extends ProviderError {
   constructor(feature: string) {
     super(`Not implemented: ${feature}`);
@@ -113,6 +139,21 @@ export async function fetchWithRetry(
   initFactory: () => RequestInit,
   opts?: { timeoutMs?: number; maxRetries?: number; providerId?: string },
 ): Promise<Response> {
+  let parsedUrl: URL;
+  try {
+    parsedUrl = new URL(url);
+  } catch {
+    throw new ProviderError("AI 网关地址无效，请联系管理员检查配置", 400, opts?.providerId, "invalid_request");
+  }
+  if (parsedUrl.protocol !== "https:") {
+    throw new ProviderError(
+      "AI 网关必须使用 HTTPS，请联系管理员检查配置",
+      400,
+      opts?.providerId,
+      "invalid_request",
+      `Blocked non-HTTPS provider URL with protocol ${parsedUrl.protocol}`,
+    );
+  }
   const timeoutMs = opts?.timeoutMs ?? config.aiTimeoutMs();
   const maxRetries = opts?.maxRetries ?? config.aiMaxRetries();
 

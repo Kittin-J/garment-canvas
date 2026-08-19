@@ -4,6 +4,7 @@ import type { PoolClient } from "pg";
 import { requestUser } from "../lib/auth";
 import { asyncHandler } from "../lib/asyncHandler";
 import { query, queryOne, transaction } from "../lib/database";
+import { deleteStoredImage } from "../lib/fileStore";
 import { validateAndMigrateFlow, WorkflowValidationError } from "../lib/workflowSchema";
 import type { PersistedWorkflow } from "../../src/types/workflow";
 
@@ -31,12 +32,14 @@ async function syncAssetRefs(
   ownerId: string,
   flow: PersistedWorkflow,
 ): Promise<void> {
-  const refs = imageRefs(flow);
+  const refs = [...imageRefs(flow)];
   const assets = await query<{ id: string; image: string }>(`
     SELECT id, image FROM assets
     WHERE deleted_at IS NULL AND (scope IN ('global','shared') OR owner_id = $1)
-  `, [ownerId], client);
-  const wanted = assets.filter((asset) => refs.has(asset.image)).map((asset) => asset.id);
+      AND image = ANY($2::text[])
+    FOR KEY SHARE
+  `, [ownerId, refs], client);
+  const wanted = assets.map((asset) => asset.id);
   const now = new Date().toISOString();
   await client.query("DELETE FROM project_asset_refs WHERE project_id = $1", [projectId]);
   for (const assetId of wanted) {
@@ -47,15 +50,35 @@ async function syncAssetRefs(
   }
 }
 
-async function purgeExpiredProjects(): Promise<void> {
+export async function purgeExpiredProjects(): Promise<void> {
   const now = new Date().toISOString();
-  await transaction(async (client) => {
+  const expiredFileIds = await transaction(async (client) => {
     await client.query(`
       DELETE FROM project_asset_refs
       WHERE project_id IN (SELECT id FROM projects WHERE purge_after IS NOT NULL AND purge_after <= $1)
     `, [now]);
+    await client.query("DELETE FROM usage_events WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
+    await client.query("DELETE FROM generation_runs WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
+    const files = await client.query<{ id: string }>(
+      `DELETE FROM files
+       WHERE purge_after IS NOT NULL AND purge_after <= $1
+         AND NOT EXISTS (
+           SELECT 1 FROM assets a
+           JOIN project_asset_refs refs ON refs.asset_id = a.id
+           WHERE a.image = '/api/files/' || files.id
+         )
+       RETURNING id`,
+      [now],
+    );
+    await client.query(`
+      DELETE FROM assets
+      WHERE purge_after IS NOT NULL AND purge_after <= $1
+        AND NOT EXISTS (SELECT 1 FROM project_asset_refs r WHERE r.asset_id = assets.id)
+    `, [now]);
     await client.query("DELETE FROM projects WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
+    return files.rows.map((row) => row.id);
   });
+  expiredFileIds.forEach(deleteStoredImage);
 }
 
 projectsRouter.post("/", asyncHandler(async (req, res) => {

@@ -61,11 +61,11 @@ function PropertyEditor({ nodeId }: { nodeId: string }) {
             <select
               value={d.batchSize}
               onChange={(e) =>
-                updateNodeData(nodeId, { batchSize: Number(e.target.value) as 1 | 2 | 4 })
+                updateNodeData(nodeId, { batchSize: Number(e.target.value) as 1 | 2 | 4 | 8 })
               }
               className={inputClass}
             >
-              {[1, 2, 4].map((n) => (
+              {[1, 2, 4, 8].map((n) => (
                 <option key={n} value={n}>
                   {n} 张
                 </option>
@@ -91,14 +91,14 @@ function PropertyEditor({ nodeId }: { nodeId: string }) {
         <button
           type="button"
           onClick={() => void runNode(nodeId)}
-          disabled={d.status === "running"}
+          disabled={d.status === "running" || d.status === "queued"}
           className={`w-full rounded-md px-3 py-1.5 text-xs font-medium hover:opacity-90 ${
-            d.status === "running"
+            d.status === "running" || d.status === "queued"
               ? "btn-running-breathe bg-[#3a3226] text-gold"
               : "bg-gold text-ink disabled:opacity-40"
           }`}
         >
-          {d.status === "running" ? "显影中…" : "运行此节点"}
+          {d.status === "queued" ? "排队中…" : d.status === "running" ? "显影中…" : "运行此节点"}
         </button>
       )}
     </div>
