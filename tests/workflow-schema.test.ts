@@ -5,6 +5,7 @@ import path from "node:path";
 import { writeJsonAtomicSync } from "../server/lib/atomicJson";
 import {
   assertUrlAllowed,
+  createPinnedLookup,
   downloadImageToDataUrl,
   ensureThumbnail,
   isGlobalIpAddress,
@@ -282,6 +283,31 @@ async function main() {
     );
     const allowed = await assertUrlAllowed("https://images.example/a.png", async () => ["93.184.216.34"]);
     assert.equal(allowed.hostname, "images.example");
+  });
+
+  await test("固定 DNS lookup 兼容 Node 22 的 all 地址模式", async () => {
+    const lookup = createPinnedLookup("93.184.216.34");
+    const result = await new Promise<unknown>((resolve, reject) => {
+      lookup("images.example", { all: true }, (error, address, family) => {
+        if (error) reject(error);
+        else resolve({ address, family });
+      });
+    });
+    assert.deepEqual(result, {
+      address: [{ address: "93.184.216.34", family: 4 }],
+      family: undefined,
+    });
+  });
+
+  await test("固定 DNS lookup 保留单地址模式", async () => {
+    const lookup = createPinnedLookup("2001:4860:4860::8888");
+    const result = await new Promise<unknown>((resolve, reject) => {
+      lookup("images.example", { all: false }, (error, address, family) => {
+        if (error) reject(error);
+        else resolve({ address, family });
+      });
+    });
+    assert.deepEqual(result, { address: "2001:4860:4860::8888", family: 6 });
   });
 
   await test("手动重定向在请求下一跳前重新解析并阻断私网", async () => {
