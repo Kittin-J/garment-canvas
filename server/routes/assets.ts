@@ -54,17 +54,21 @@ assetsRouter.get("/", asyncHandler(async (req, res) => {
   const includeDeleted = req.query.deleted === "true";
   const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 20));
   const offset = Math.max(0, Number(req.query.offset) || 0);
+  // 名称模糊搜索：转义 LIKE 通配符（%、_、\），按字面子串匹配整库。
+  const search = typeof req.query.search === "string" ? req.query.search.trim() : "";
+  const searchPattern = search ? `%${search.replace(/[\\%_]/g, "\\$&")}%` : null;
   const rows = await query<AssetRow>(`
     SELECT a.*, u.display_name AS owner_name
     FROM assets a LEFT JOIN users u ON u.id = a.owner_id
     WHERE ($1::text IS NULL OR a.category = $1)
+      AND ($6::text IS NULL OR a.name ILIKE $6)
       AND (${includeDeleted ? "a.deleted_at IS NOT NULL" : "a.deleted_at IS NULL"})
       AND (${includeDeleted
         ? "$2 = 'admin' OR a.owner_id = $3"
         : "$2 = 'admin' OR a.scope IN ('global','shared') OR a.owner_id = $3"})
     ORDER BY a.created_at DESC
     LIMIT $4 OFFSET $5
-  `, [category ?? null, user.role, user.id, limit, offset]);
+  `, [category ?? null, user.role, user.id, limit, offset, searchPattern]);
   res.json(rows.map((row) => ({
     ...mapAsset(row, user.id),
     canManage: row.scope === "global" ? user.role === "admin" : row.owner_id === user.id,

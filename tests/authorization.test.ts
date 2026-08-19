@@ -238,6 +238,43 @@ await test("普通用户的回收站只显示自己删除的素材", async () =>
   assert.equal(rows.some((row) => row.id === "other-deleted-shared"), false);
 });
 
+await test("素材名称搜索按字面子串匹配，且不绕过 scope 权限过滤", async () => {
+  await query(`
+    INSERT INTO assets (id, owner_id, scope, name, category, image, created_at)
+    VALUES
+      ('search-own-print', $1, 'private', '花朵印花A', 'print', '/api/files/search-a.png', $3),
+      ('search-other-private', $2, 'private', '花朵印花B', 'print', '/api/files/search-b.png', $3)
+  `, [users.owner.id, users.other.id, now]);
+  const response = await request("/assets?search=%E8%8A%B1%E6%9C%B5", "owner");
+  assert.equal(response.status, 200);
+  const ids = (await response.json() as Array<{ id: string }>).map((row) => row.id);
+  assert.equal(ids.includes("search-own-print"), true);
+  assert.equal(ids.includes("search-other-private"), false);
+});
+
+await test("素材名称搜索把 % 和 _ 当字面字符而非 LIKE 通配符", async () => {
+  await query(`
+    INSERT INTO assets (id, owner_id, scope, name, category, image, created_at)
+    VALUES
+      ('search-percent', $1, 'private', 'A%B', 'reference', '/api/files/search-p.png', $2),
+      ('search-plain', $1, 'private', 'AB', 'reference', '/api/files/search-q.png', $2),
+      ('search-underscore', $1, 'private', 'A_C', 'reference', '/api/files/search-u.png', $2),
+      ('search-anychar', $1, 'private', 'AXC', 'reference', '/api/files/search-x.png', $2)
+  `, [users.owner.id, now]);
+
+  const percent = await request("/assets?search=A%25B", "owner");
+  assert.equal(percent.status, 200);
+  const percentIds = (await percent.json() as Array<{ id: string }>).map((row) => row.id);
+  assert.equal(percentIds.includes("search-percent"), true);
+  assert.equal(percentIds.includes("search-plain"), false);
+
+  const underscore = await request("/assets?search=A_C", "owner");
+  assert.equal(underscore.status, 200);
+  const underscoreIds = (await underscore.json() as Array<{ id: string }>).map((row) => row.id);
+  assert.equal(underscoreIds.includes("search-underscore"), true);
+  assert.equal(underscoreIds.includes("search-anychar"), false);
+});
+
 await test("不存在或已删除的 projectId 不能污染运行历史元数据", async () => {
   const response = await request("/run-plan", "owner", {
     method: "POST",

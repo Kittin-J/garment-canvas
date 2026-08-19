@@ -11,6 +11,7 @@ import { ResultsPanel } from "@/components/panels/ResultsPanel";
 import { TemplatesDock } from "@/components/panels/TemplatesDock";
 import { CompareOverlay } from "@/components/CompareOverlay";
 import { ImageViewer } from "@/components/ImageViewer";
+import { AssetPickerOverlay } from "@/components/AssetPickerOverlay";
 import { useAuth } from "@/auth/AuthContext";
 import { ChangePasswordPage, LoginPage, SessionEndedPage } from "@/auth/LoginPage";
 
@@ -175,6 +176,7 @@ function Workspace() {
       </div>
       <CompareOverlay />
       <ImageViewer />
+      <AssetPickerOverlay />
     </div>
   );
 }
