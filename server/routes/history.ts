@@ -6,6 +6,30 @@ import { thumbnailUrlForImage } from "../lib/fileStore";
 
 export const historyRouter = Router();
 
+interface HistoryCursor {
+  before: number;
+  startedAt: number;
+  runId: string;
+}
+
+function encodeCursor(cursor: HistoryCursor): string {
+  return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function decodeCursor(value: unknown): HistoryCursor | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || value.length === 0 || value.length > 2_000) {
+    throw new Error("invalid history cursor");
+  }
+  const decoded = JSON.parse(Buffer.from(value, "base64url").toString("utf8")) as Partial<HistoryCursor>;
+  if (!Number.isSafeInteger(decoded.before) || Number(decoded.before) < 0 ||
+      !Number.isSafeInteger(decoded.startedAt) || Number(decoded.startedAt) < 0 ||
+      typeof decoded.runId !== "string" || !decoded.runId) {
+    throw new Error("invalid history cursor");
+  }
+  return { before: Number(decoded.before), startedAt: Number(decoded.startedAt), runId: decoded.runId };
+}
+
 function parseJson<T>(value: unknown, fallback: T): T {
   if (typeof value !== "string" || !value) return fallback;
   try {
@@ -24,23 +48,48 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
   }
   const ownerId = requestedUserId ?? (user.role === "admin" && req.query.all === "true" ? null : user.id);
   const limit = Math.max(1, Math.min(200, Number(req.query.limit) || 100));
-  const offset = Math.max(0, Number(req.query.offset) || 0);
+  let cursor: HistoryCursor | undefined;
+  try {
+    cursor = decodeCursor(req.query.cursor);
+  } catch {
+    res.status(400).json({ error: "历史分页游标无效" });
+    return;
+  }
   const requestedBefore = Number(req.query.before);
-  const before = Number.isFinite(requestedBefore) && requestedBefore >= 0 ? requestedBefore : Date.now();
+  const before = cursor?.before ?? (Number.isFinite(requestedBefore) && requestedBefore >= 0 ? requestedBefore : Date.now());
+  const runCandidates = await query<{ id: string; started_at: number }>(`
+    SELECT r.id, r.started_at
+    FROM generation_runs r
+    WHERE ($1::text IS NULL OR r.owner_id = $1)
+      AND r.deleted_at IS NULL
+      AND r.started_at <= $2
+      AND (
+        $3::bigint IS NULL OR r.started_at < $3
+        OR (r.started_at = $3 AND r.id < $4)
+      )
+      AND (
+        r.status IN ('queued','running')
+        OR EXISTS (SELECT 1 FROM generation_outputs output WHERE output.run_id = r.id)
+      )
+    ORDER BY r.started_at DESC, r.id DESC
+    LIMIT $5
+  `, [ownerId, before, cursor?.startedAt ?? null, cursor?.runId ?? null, limit + 1]);
+  const hasMore = runCandidates.length > limit;
+  const pageRuns = runCandidates.slice(0, limit);
+  if (pageRuns.length === 0) {
+    res.json({ records: [], nextCursor: null, hasMore: false });
+    return;
+  }
   const rows = await query<Record<string, unknown>>(`
     SELECT r.*, o.id AS output_id, o.image, o.prompt AS output_prompt,
       o.status AS output_status, o.error AS output_error, u.display_name AS owner_name
     FROM generation_runs r
     JOIN users u ON u.id = r.owner_id
     LEFT JOIN generation_outputs o ON o.run_id = r.id
-    WHERE ($1::text IS NULL OR r.owner_id = $1)
-      AND r.deleted_at IS NULL
-      AND r.started_at <= $2
-      AND (o.id IS NOT NULL OR r.status IN ('queued','running'))
-    ORDER BY r.started_at DESC, o.created_at ASC
-    LIMIT $3 OFFSET $4
-  `, [ownerId, before, limit, offset]);
-  res.json(rows.map((row) => ({
+    WHERE r.id = ANY($1::text[])
+    ORDER BY r.started_at DESC, r.id DESC, o.created_at ASC, o.id ASC
+  `, [pageRuns.map((run) => run.id)]);
+  const records = rows.map((row) => ({
     id: (row.output_id as string | null) ?? (row.id as string),
     runId: row.id,
     image: (row.image as string | null) ?? "",
@@ -63,7 +112,15 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
     finishedAt: row.finished_at,
     status: (row.output_status as string | null) ?? row.status,
     error: (row.output_error as string | null) ?? row.error,
-  })));
+  }));
+  const lastRun = pageRuns.at(-1);
+  res.json({
+    records,
+    nextCursor: hasMore && lastRun
+      ? encodeCursor({ before, startedAt: lastRun.started_at, runId: lastRun.id })
+      : null,
+    hasMore,
+  });
 }));
 
 historyRouter.delete("/:id", asyncHandler(async (req, res) => {

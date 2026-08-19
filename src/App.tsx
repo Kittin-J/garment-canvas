@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { ReactFlowProvider } from "@xyflow/react";
 import { nanoid } from "nanoid";
-import { mergeRecentResults, resumeRecentResults, useFlowStore, type FlowNode } from "@/store/flowStore";
+import {
+  mergeRecentResults, resumeRecentResults, useFlowStore, type FlowNode, type RecentResult,
+} from "@/store/flowStore";
 import { CanvasFlow } from "@/components/CanvasFlow";
 import { TopBar } from "@/components/panels/TopBar";
 import { ProjectTabs } from "@/components/panels/ProjectTabs";
@@ -17,6 +19,23 @@ import { ChangePasswordPage, LoginPage, SessionEndedPage } from "@/auth/LoginPag
 
 /** 剪贴板里的节点快照（仅内存，跨项目/刷新不保留） */
 let nodeClipboard: { data: FlowNode["data"]; type: string } | null = null;
+
+interface HistoryPage {
+  records: RecentResult[];
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+function parseHistoryPage(value: unknown): HistoryPage {
+  if (!value || typeof value !== "object") throw new Error("历史记录格式无效");
+  const page = value as Partial<HistoryPage>;
+  if (!Array.isArray(page.records) ||
+      (page.nextCursor !== null && typeof page.nextCursor !== "string") ||
+      typeof page.hasMore !== "boolean") {
+    throw new Error("历史记录格式无效");
+  }
+  return { records: page.records, nextCursor: page.nextCursor ?? null, hasMore: page.hasMore };
+}
 
 function useGlobalShortcuts() {
   const undo = useFlowStore((s) => s.undo);
@@ -99,7 +118,7 @@ export default function App() {
 function Workspace() {
   useGlobalShortcuts();
   const activeTabId = useFlowStore((state) => state.activeTabId);
-  const [historyOffset, setHistoryOffset] = useState(0);
+  const [historyCursor, setHistoryCursor] = useState<string | null>(null);
   const [historyHasMore, setHistoryHasMore] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(false);
   const historyPageSize = 20;
@@ -112,14 +131,15 @@ function Workspace() {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return await response.json();
       })
-      .then((records) => {
-        if (active && Array.isArray(records)) {
+      .then((value) => {
+        if (active) {
+          const page = parseHistoryPage(value);
           useFlowStore.setState((state) => ({
-            recentResults: mergeRecentResults(state.recentResults, records as never),
+            recentResults: mergeRecentResults(state.recentResults, page.records),
           }));
-          resumeRecentResults(records as never);
-          setHistoryOffset(records.length);
-          setHistoryHasMore(records.length === historyPageSize);
+          resumeRecentResults(page.records);
+          setHistoryCursor(page.nextCursor);
+          setHistoryHasMore(page.hasMore);
         }
       })
       .catch(() => undefined);
@@ -127,33 +147,31 @@ function Workspace() {
   }, []);
 
   const loadMoreHistory = useCallback(async () => {
-    if (historyLoading || !historyHasMore) return;
+    if (historyLoading || !historyHasMore || !historyCursor) return;
     setHistoryLoading(true);
     try {
-      const response = await fetch(
-        `/api/history?limit=${historyPageSize}&offset=${historyOffset}&before=${historyBefore}`,
-      );
+      const params = new URLSearchParams({ limit: String(historyPageSize), cursor: historyCursor });
+      const response = await fetch(`/api/history?${params.toString()}`);
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const records = await response.json();
-      if (!Array.isArray(records)) throw new Error("历史记录格式无效");
+      const page = parseHistoryPage(await response.json());
       useFlowStore.setState((state) => {
         const existingIds = new Set(state.recentResults.map((record) => record.id));
         return {
           recentResults: [
             ...state.recentResults,
-            ...records.filter((record) => !existingIds.has(record.id)),
+            ...page.records.filter((record) => !existingIds.has(record.id)),
           ].slice(0, 200) as never,
         };
       });
-      resumeRecentResults(records as never);
-      setHistoryOffset((offset) => offset + records.length);
-      setHistoryHasMore(records.length === historyPageSize);
+      resumeRecentResults(page.records);
+      setHistoryCursor(page.nextCursor);
+      setHistoryHasMore(page.hasMore);
     } catch {
       // 保留“加载更多”入口，瞬时网络错误后用户可以再次重试。
     } finally {
       setHistoryLoading(false);
     }
-  }, [historyBefore, historyHasMore, historyLoading, historyOffset]);
+  }, [historyCursor, historyHasMore, historyLoading]);
 
   return (
     <div className="gc-app-shell flex h-full flex-col bg-ink text-neutral-200">

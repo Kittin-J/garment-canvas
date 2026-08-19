@@ -280,6 +280,59 @@ await test("到期清理保留仍被其他项目引用的素材文件", async ()
   assert.ok(await queryOne("SELECT id FROM assets WHERE id = 'referenced-retention-asset'"));
 });
 
+await test("删除管理员后仍保留有效通用素材及其底层文件", async () => {
+  const ownerId = "global-asset-admin";
+  const fileId = "global-retention.png";
+  const createdAt = new Date().toISOString();
+  await query(`
+    INSERT INTO users (id, account_id, display_name, role, password_hash, active, created_at, updated_at)
+    VALUES ($1, 'global-asset-admin', '素材管理员', 'admin', 'test-only', 1, $2, $2)
+  `, [ownerId, createdAt]);
+  await query(`
+    INSERT INTO files (id, owner_id, source_type, created_at)
+    VALUES ($1, $2, 'asset', $3)
+  `, [fileId, ownerId, createdAt]);
+  await query(`
+    INSERT INTO assets (id, owner_id, scope, name, category, image, created_at)
+    VALUES ('global-retention-asset', NULL, 'global', '有效通用素材', 'reference', $1, $2)
+  `, [`/api/files/${fileId}`, createdAt]);
+  const uploads = path.join(temp, "uploads");
+  fs.mkdirSync(uploads, { recursive: true });
+  fs.writeFileSync(path.join(uploads, fileId), "global");
+
+  const adminSession = await createSession(String(admin.id), { markExistingAsReplaced: false });
+  const app = express();
+  app.use(express.json());
+  app.use("/api/auth", authRouter);
+  const server = app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve, reject) => {
+    server.once("listening", resolve);
+    server.once("error", reject);
+  });
+  try {
+    const address = server.address() as AddressInfo;
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/auth/users/${ownerId}`, {
+      method: "DELETE",
+      headers: {
+        "Content-Type": "application/json",
+        cookie: `${SESSION_COOKIE}=${adminSession.token}`,
+      },
+      body: JSON.stringify({ deleteData: true }),
+    });
+    assert.equal(response.status, 200, await response.text());
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+  }
+
+  const expired = new Date(Date.now() - 1_000).toISOString();
+  await query("UPDATE files SET purge_after = $1 WHERE id = $2", [expired, fileId]);
+  await purgeExpiredProjects();
+
+  assert.ok(await queryOne("SELECT id FROM assets WHERE id = 'global-retention-asset' AND deleted_at IS NULL"));
+  assert.ok(await queryOne("SELECT id FROM files WHERE id = $1", [fileId]));
+  assert.equal(fs.existsSync(path.join(uploads, fileId)), true);
+});
+
 await test("成功图片写消耗流水，失败任务不写消耗", async () => {
   await createGenerationRecord("run-success", {
     userId: String(admin.id), nodeId: "node", nodeLabel: "AI 改款", kind: "ai-modify", requestedCount: 2,

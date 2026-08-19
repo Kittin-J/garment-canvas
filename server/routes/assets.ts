@@ -94,35 +94,46 @@ assetsRouter.post("/", asyncHandler(async (req, res) => {
     if (sourceNote !== undefined && (typeof sourceNote !== "string" || sourceNote.length > 2_000)) {
       throw new ImageValidationError("sourceNote must be a string of at most 2000 characters");
     }
+    const finalScope = scope === "global" && user.role === "admin" ? "global" : scope === "shared" ? "shared" : "private";
     const saved = image.startsWith("data:") ? saveDataUrl(image) : undefined;
     const imageUrl = saved?.url ?? (isLocalImageReference(image) ? image : "");
     if (!imageUrl) throw new ImageValidationError("image must be a local image reference or valid image dataURL");
-    if (saved) {
-      await query(`
-        INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, $2, 'asset', $3)
-        ON CONFLICT (id) DO NOTHING
-      `, [saved.id, user.id, new Date().toISOString()]);
-    } else {
-      const access = await queryOne<{ owner_id: string | null; shared: boolean }>(`
-        SELECT f.owner_id,
-          EXISTS(
-            SELECT 1 FROM assets a
-            WHERE a.image = $1 AND a.deleted_at IS NULL AND a.scope IN ('global','shared')
-          ) AS shared
-        FROM files f WHERE f.id = $2
-      `, [imageUrl, path.basename(imageUrl)]);
-      if (!access || (access.owner_id !== null && access.owner_id !== user.id && user.role !== "admin" && !access.shared)) {
-        res.status(404).json({ error: "image file not found" });
-        return;
-      }
-    }
     const id = nanoid(10);
     const createdAt = new Date().toISOString();
-    const finalScope = scope === "global" && user.role === "admin" ? "global" : scope === "shared" ? "shared" : "private";
-    await query(`
-      INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-    `, [id, finalScope === "global" ? null : user.id, finalScope, name.trim(), category, imageUrl, sourceNote ?? null, createdAt]);
+    const created = await transaction(async (client) => {
+      if (saved) {
+        await client.query(`
+          INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, $2, 'asset', $3)
+          ON CONFLICT (id) DO NOTHING
+        `, [saved.id, finalScope === "global" ? null : user.id, createdAt]);
+      } else {
+        const access = await queryOne<{ owner_id: string | null; shared: boolean }>(`
+          SELECT f.owner_id,
+            EXISTS(
+              SELECT 1 FROM assets a
+              WHERE a.image = $1 AND a.deleted_at IS NULL AND a.scope IN ('global','shared')
+            ) AS shared
+          FROM files f WHERE f.id = $2
+        `, [imageUrl, path.basename(imageUrl)], client);
+        if (!access || (access.owner_id !== null && access.owner_id !== user.id && user.role !== "admin" && !access.shared)) {
+          return false;
+        }
+      }
+      if (finalScope === "global") {
+        await client.query(`
+          UPDATE files SET owner_id = NULL, deleted_at = NULL, purge_after = NULL WHERE id = $1
+        `, [path.basename(imageUrl)]);
+      }
+      await client.query(`
+        INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `, [id, finalScope === "global" ? null : user.id, finalScope, name.trim(), category, imageUrl, sourceNote ?? null, createdAt]);
+      return true;
+    });
+    if (!created) {
+      res.status(404).json({ error: "image file not found" });
+      return;
+    }
     res.status(201).json({ ok: true, id });
   } catch (error) {
     res.status(error instanceof ImageValidationError ? 400 : 500)

@@ -59,22 +59,21 @@ export async function purgeExpiredProjects(): Promise<void> {
     `, [now]);
     await client.query("DELETE FROM usage_events WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
     await client.query("DELETE FROM generation_runs WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
-    const files = await client.query<{ id: string }>(
-      `DELETE FROM files
-       WHERE purge_after IS NOT NULL AND purge_after <= $1
-         AND NOT EXISTS (
-           SELECT 1 FROM assets a
-           JOIN project_asset_refs refs ON refs.asset_id = a.id
-           WHERE a.image = '/api/files/' || files.id
-         )
-       RETURNING id`,
-      [now],
-    );
     await client.query(`
       DELETE FROM assets
       WHERE purge_after IS NOT NULL AND purge_after <= $1
         AND NOT EXISTS (SELECT 1 FROM project_asset_refs r WHERE r.asset_id = assets.id)
     `, [now]);
+    const files = await client.query<{ id: string }>(
+      `DELETE FROM files
+       WHERE purge_after IS NOT NULL AND purge_after <= $1
+         AND NOT EXISTS (
+           SELECT 1 FROM assets a
+           WHERE a.image = '/api/files/' || files.id
+         )
+       RETURNING id`,
+      [now],
+    );
     await client.query("DELETE FROM projects WHERE purge_after IS NOT NULL AND purge_after <= $1", [now]);
     return files.rows.map((row) => row.id);
   });

@@ -196,6 +196,32 @@ await test("所有鉴权图片禁止缓存，撤回共享后立即恢复访问�
   }
 });
 
+await test("管理员创建通用素材时解除底层文件的个人归属", async () => {
+  const upload = await request("/files", "admin", {
+    method: "POST",
+    body: JSON.stringify({
+      dataUrl: "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==",
+    }),
+  });
+  const uploaded = await upload.json() as { id: string; url: string; error?: string };
+  assert.equal(upload.status, 200, uploaded.error);
+
+  const create = await request("/assets", "admin", {
+    method: "POST",
+    body: JSON.stringify({
+      name: "通用素材", category: "reference", scope: "global", image: uploaded.url,
+    }),
+  });
+  assert.equal(create.status, 201, await create.text());
+  assert.deepEqual(
+    await queryOne<{ owner_id: string | null; deleted_at: string | null; purge_after: string | null }>(
+      "SELECT owner_id, deleted_at, purge_after FROM files WHERE id = $1",
+      [uploaded.id],
+    ),
+    { owner_id: null, deleted_at: null, purge_after: null },
+  );
+});
+
 await query(`
   INSERT INTO assets (id, owner_id, scope, name, category, image, created_at)
   VALUES
@@ -339,7 +365,13 @@ await test("删除他人的历史记录统一返回 404，不泄露记录是否�
   assert.equal((await request("/history/missing-output", "owner", { method: "DELETE" })).status, 404);
 });
 
-await test("历史分页固定在首次快照，期间新增记录不会推移 offset 造成缺口", async () => {
+interface HistoryPage {
+  records: Array<{ id: string; runId: string }>;
+  nextCursor: string | null;
+  hasMore: boolean;
+}
+
+await test("历史分页固定在首次快照，期间新增记录不会推移游标造成缺口", async () => {
   for (const [id, startedAt] of [["snapshot-3", 3_000], ["snapshot-2", 2_000], ["snapshot-1", 1_000]] as const) {
     await query(`
       INSERT INTO generation_runs (
@@ -351,9 +383,12 @@ await test("历史分页固定在首次快照，期间新增记录不会推移 o
       VALUES ($1, $2, '', 'error', '失败', $3)
     `, [`${id}-output`, id, startedAt]);
   }
-  const first = await request("/history?limit=1&offset=0&before=2500", "owner");
+  const first = await request("/history?limit=1&before=2500", "owner");
   assert.equal(first.status, 200);
-  assert.equal(((await first.json()) as Array<{ runId: string }>)[0].runId, "snapshot-2");
+  const firstPage = await first.json() as HistoryPage;
+  assert.equal(firstPage.records[0].runId, "snapshot-2");
+  assert.equal(firstPage.hasMore, true);
+  assert.ok(firstPage.nextCursor);
   await query(`
     INSERT INTO generation_runs (
       id, owner_id, node_id, node_label, kind, requested_count, status, started_at, finished_at
@@ -363,9 +398,57 @@ await test("历史分页固定在首次快照，期间新增记录不会推移 o
     INSERT INTO generation_outputs (id, run_id, image, status, error, created_at)
     VALUES ('snapshot-new-output', 'snapshot-new', '', 'error', '失败', 4000)
   `);
-  const second = await request("/history?limit=1&offset=1&before=2500", "owner");
+  const second = await request(
+    `/history?limit=1&cursor=${encodeURIComponent(firstPage.nextCursor ?? "")}`,
+    "owner",
+  );
   assert.equal(second.status, 200);
-  assert.equal(((await second.json()) as Array<{ runId: string }>)[0].runId, "snapshot-1");
+  assert.equal(((await second.json()) as HistoryPage).records[0].runId, "snapshot-1");
+});
+
+await test("运行任务完成并展开为多条输出时不会令下一页漏项或重复", async () => {
+  for (const [id, startedAt, status] of [
+    ["cursor-running", 7_000, "running"],
+    ["cursor-second", 6_000, "error"],
+    ["cursor-third", 5_000, "error"],
+  ] as const) {
+    await query(`
+      INSERT INTO generation_runs (
+        id, owner_id, node_id, node_label, kind, requested_count, status, started_at, finished_at
+      ) VALUES ($1, $2, 'node', '节点', 'ai-modify', 2, $3, $4, $4)
+    `, [id, users.owner.id, status, startedAt]);
+    if (status === "error") {
+      await query(`
+        INSERT INTO generation_outputs (id, run_id, image, status, error, created_at)
+        VALUES ($1, $2, '', 'error', '失败', $3)
+      `, [`${id}-output`, id, startedAt]);
+    }
+  }
+
+  const first = await request("/history?limit=2&before=7500", "owner");
+  assert.equal(first.status, 200);
+  const firstPage = await first.json() as HistoryPage;
+  assert.deepEqual(firstPage.records.map((record) => record.runId), ["cursor-running", "cursor-second"]);
+  assert.ok(firstPage.nextCursor);
+
+  await query(`
+    INSERT INTO generation_outputs (id, run_id, image, status, created_at) VALUES
+      ('cursor-running-output-1', 'cursor-running', '/api/files/cursor-1.png', 'success', 7100),
+      ('cursor-running-output-2', 'cursor-running', '/api/files/cursor-2.png', 'success', 7101)
+  `);
+  await query(
+    "UPDATE generation_runs SET status = 'success', successful_count = 2, finished_at = 7101 WHERE id = 'cursor-running'",
+  );
+
+  const second = await request(
+    `/history?limit=2&cursor=${encodeURIComponent(firstPage.nextCursor ?? "")}`,
+    "owner",
+  );
+  assert.equal(second.status, 200);
+  const secondPage = await second.json() as HistoryPage;
+  assert.equal(secondPage.records[0].runId, "cursor-third");
+  assert.equal(secondPage.records.some((record) => record.runId === "cursor-running"), false);
+  assert.equal(secondPage.records.some((record) => record.runId === "cursor-second"), false);
 });
 
 await query("UPDATE users SET display_name = $1 WHERE id = $2", [
