@@ -16,6 +16,7 @@ releases/
 *.key
 
 # Runtime data (built-in templates remain versioned)
+.docker-data/
 data/uploads/
 data/thumbnails/
 data/projects/

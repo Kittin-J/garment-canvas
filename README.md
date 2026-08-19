@@ -2,22 +2,26 @@
 
 ## Docker 启动（推荐）
 
-要求 Docker Desktop / Docker Engine + Compose。先复制 `.env.example` 为私有
-`.env`，至少替换 PostgreSQL 密码、AI 网关和首次管理员配置，然后执行：
+要求 Docker Desktop / Docker Engine + Compose。当前本机部署使用 Docker 自带的
+`postgres:18-alpine`。先复制 `.env.example` 为私有 `.env`，至少替换 PostgreSQL
+密码、AI 网关和首次管理员配置，然后执行：
 
 ```bash
 docker compose up -d --build --wait
 ```
 
-网页默认为 `http://localhost:3002`。PostgreSQL 18 数据保存在 Docker 命名卷
-`garment-canvas_postgres_data`，上传和生成文件仍保存在 `data/`。
+网页入口默认为 `http://localhost`（nginx 端口 80），应用诊断端口
+`http://127.0.0.1:3001` 只绑定本机回环。PostgreSQL 数据保存在 Docker 命名卷
+`garment-canvas_postgres_data`，上传、生成文件和旧 SQLite 保存在被 Git 忽略的
+`.docker-data/`。
 
 PostgreSQL 18 官方镜像的卷挂载点是 `/var/lib/postgresql`。从 17 升级时不能直接
 复用 17 的数据目录，必须先用 `pg_dump` 导出，再在新建的 18 卷中恢复。
 
-如果 `data/garment-canvas.db` 存在且 PostgreSQL 还没有用户，首次启动会自动导入
-旧 SQLite 中的用户、会话、项目、素材、生成记录和消耗流水。导入成功后原
-SQLite 文件会保留，便于回退核对。
+如果绑定的数据目录中存在 `garment-canvas.db`（当前 Docker 部署对应
+`.docker-data/garment-canvas.db`），且 PostgreSQL 还没有用户，首次启动会自动导入
+旧 SQLite 中的用户、会话、项目、素材、生成记录和消耗流水。导入成功后原 SQLite
+文件会保留，便于回退核对。
 
 ## 本地开发
 
@@ -87,7 +91,8 @@ INITIAL_ADMIN_PASSWORD=your-temporary-password
 
 `/api/ready` 还会检查 AI 网关已配置：必须提供非空的
 `CHANGE2PRO_API_KEY`（或 `NANOBANANA_API_KEY`）以及 HTTPS
-`CHANGE2PRO_BASE_URL`。该检查不会主动调用外部模型，不会产生费用。
+`CHANGE2PRO_BASE_URL`，并明确设置 `IMAGE2_MODEL` 与 `NANOBANANA_MODEL`。
+该检查不会主动调用外部模型，不会产生费用。
 
 生成和工作流执行接口使用进程内限流：同一 IP 每分钟最多请求 5 次；服务重启后计数重置。
 
