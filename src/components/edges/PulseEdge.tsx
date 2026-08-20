@@ -1,5 +1,6 @@
 import { BaseEdge, getBezierPath, type EdgeProps } from "@xyflow/react";
 import { useFlowStore } from "@/store/flowStore";
+import { isNodeRunActive } from "@/types/workflow";
 
 /**
  * 脉冲光点连线：金色光珠沿贝塞尔路径奔跑，指示数据流向。
@@ -25,7 +26,10 @@ export function PulseEdge({
     targetPosition,
   });
   const running = useFlowStore(
-    (s) => s.nodes.find((n) => n.id === source)?.data.status === "running",
+    (s) => {
+      const status = s.nodes.find((n) => n.id === source)?.data.status;
+      return status ? isNodeRunActive(status) : false;
+    },
   );
 
   const baseStroke = selected

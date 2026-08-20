@@ -26,8 +26,68 @@ assert.deepEqual(versions, [
   { version: 3, name: "revoked_session_reasons" },
   { version: 4, name: "active_account_id_unique" },
   { version: 5, name: "account_data_retention_tombstones" },
+  { version: 6, name: "durable_generation_queue" },
+  { version: 7, name: "provider_output_size_metadata" },
+  { version: 8, name: "normalized_upload_metadata" },
 ]);
 console.log("  ✓ 新数据库记录全部编号迁移");
+
+const queueTables = await query<{ table_name: string }>(`
+  SELECT table_name FROM information_schema.tables
+  WHERE table_schema = 'public'
+    AND table_name IN ('generation_run_steps','generation_jobs','generation_run_events')
+  ORDER BY table_name
+`);
+assert.deepEqual(queueTables, [
+  { table_name: "generation_jobs" },
+  { table_name: "generation_run_events" },
+  { table_name: "generation_run_steps" },
+]);
+const runStatusConstraint = await queryOne<{ definition: string }>(`
+  SELECT pg_get_constraintdef(oid) AS definition
+  FROM pg_constraint
+  WHERE conname = 'generation_runs_status_check'
+`);
+assert.match(runStatusConstraint?.definition ?? "", /retry_wait/);
+assert.match(runStatusConstraint?.definition ?? "", /outcome_unknown/);
+const retryConstraint = await queryOne<{ definition: string }>(`
+  SELECT pg_get_constraintdef(oid) AS definition
+  FROM pg_constraint
+  WHERE conrelid = 'generation_jobs'::regclass
+    AND contype = 'c'
+    AND pg_get_constraintdef(oid) LIKE '%retry_count%'
+`);
+assert.match(retryConstraint?.definition ?? "", /retry_count.*(?:0|2)/);
+assert.match(retryConstraint?.definition ?? "", />= 0/);
+assert.match(retryConstraint?.definition ?? "", /<= 2/);
+console.log("  ✓ 持久队列表、状态约束与最多两次重试约束已建立");
+const sizeColumns = await query<{ table_name: string; column_name: string }>(`
+  SELECT table_name, column_name FROM information_schema.columns
+  WHERE table_schema = 'public' AND (
+    (table_name = 'generation_run_steps' AND column_name = 'provider_output_sizes_json') OR
+    (table_name = 'generation_outputs' AND column_name = 'provider_output_size')
+  )
+  ORDER BY table_name, column_name
+`);
+assert.deepEqual(sizeColumns, [
+  { table_name: "generation_outputs", column_name: "provider_output_size" },
+  { table_name: "generation_run_steps", column_name: "provider_output_sizes_json" },
+]);
+console.log("  ✓ 上游实际输出尺寸元数据列已建立");
+const uploadColumns = await query<{ column_name: string }>(`
+  SELECT column_name FROM information_schema.columns
+  WHERE table_schema = 'public' AND table_name = 'files'
+    AND column_name IN ('mime_type','width','height','byte_length','normalized')
+  ORDER BY column_name
+`);
+assert.deepEqual(uploadColumns, [
+  { column_name: "byte_length" },
+  { column_name: "height" },
+  { column_name: "mime_type" },
+  { column_name: "normalized" },
+  { column_name: "width" },
+]);
+console.log("  ✓ 用户上传标准化元数据列已建立");
 
 const admin = await queryOne<{ id: string }>("SELECT id FROM users WHERE account_id = 'migration-admin'");
 assert.ok(admin);

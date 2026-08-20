@@ -6,16 +6,33 @@ import { thumbnailImageUrl } from "@/lib/images";
 import { OPEN_ASSET_PICKER_EVENT, type AssetPickerRequest } from "@/components/AssetPickerOverlay";
 import { NodeFrame, inputClass } from "./NodeFrame";
 
-async function uploadFile(file: File): Promise<string> {
+interface NormalizedUploadResponse {
+  id: string;
+  url: string;
+  mimeType: "image/png" | "image/jpeg";
+  width: number;
+  height: number;
+  byteLength: number;
+  normalized: true;
+}
+
+async function uploadFile(file: File): Promise<NormalizedUploadResponse> {
   const dataUrl = await readAsDataURL(file);
   const res = await fetch("/api/files", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ dataUrl }),
   });
-  if (!res.ok) throw new Error(`上传失败 HTTP ${res.status}`);
-  const data = (await res.json()) as { url: string };
-  return data.url;
+  const data = await res.json().catch(() => ({})) as Partial<NormalizedUploadResponse> & { error?: string };
+  if (!res.ok) throw new Error(data.error || `上传失败 HTTP ${res.status}`);
+  if (
+    data.normalized !== true || typeof data.url !== "string" || !data.url ||
+    (data.mimeType !== "image/png" && data.mimeType !== "image/jpeg") ||
+    !Number.isInteger(data.width) || !Number.isInteger(data.height) || !Number.isInteger(data.byteLength)
+  ) {
+    throw new Error("服务端未完成素材标准化，请重试");
+  }
+  return data as NormalizedUploadResponse;
 }
 
 function readAsDataURL(file: File): Promise<string> {
@@ -47,14 +64,14 @@ export function ImageInputNode({ id, data, selected }: NodeProps<Node<ImageInput
       const tabId = useFlowStore.getState().activeTabId;
       setUploading(true);
       try {
-        const url = await uploadFile(file);
+        const upload = await uploadFile(file);
         if (
           requestId !== uploadRequestRef.current ||
           !useFlowStore.getState().tabs.some((tab) =>
             tab.id === tabId && tab.nodes.some((node) => node.id === id),
           )
         ) return;
-        updateNodeDataInTab(tabId, id, { imageUrl: url, status: "success", error: undefined });
+        updateNodeDataInTab(tabId, id, { imageUrl: upload.url, status: "success", error: undefined });
       } catch (err) {
         if (requestId !== uploadRequestRef.current) return;
         const message = err instanceof Error ? err.message : String(err);
@@ -126,7 +143,7 @@ export function ImageInputNode({ id, data, selected }: NodeProps<Node<ImageInput
                 : "border-[#2a2a2a] text-neutral-500 hover:border-neutral-500"
             }`}
           >
-            {uploading ? "上传中…" : "每个上传节点仅支持 1 张图\n点击 / 拖拽 / 选中后 Ctrl+V"}
+            {uploading ? "素材处理中…" : "每个上传节点仅支持 1 张图\n点击 / 拖拽 / 选中后 Ctrl+V"}
           </div>
         )}
         {!data.imageUrl && (

@@ -309,7 +309,7 @@ async function main() {
       { prompt, aspectRatio: "3:4", batchSize: 2 },
       [SEED_DATA_URL],
     );
-    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.deepStrictEqual(providerIds, ["gpt-image-2-vip"]);
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].method, "edit");
     assert.deepStrictEqual(calls[0].request.referenceImages, [SEED_DATA_URL]);
@@ -328,7 +328,7 @@ async function main() {
       { prompt, aspectRatio: "16:9", batchSize: 2 },
       [],
     );
-    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.deepStrictEqual(providerIds, ["gpt-image-2-vip"]);
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].method, "generate");
     assert.strictEqual(calls[0].request.referenceImages, undefined);
@@ -345,7 +345,7 @@ async function main() {
       { prompt, aspectRatio: "1:1", batchSize: 4 },
       [SEED_DATA_URL, SECOND_DATA_URL],
     );
-    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.deepStrictEqual(providerIds, ["gpt-image-2-vip"]);
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].method, "edit");
     assert.deepStrictEqual(calls[0].request.referenceImages, [SEED_DATA_URL, SECOND_DATA_URL]);
@@ -363,7 +363,7 @@ async function main() {
       { colors, fabricImageUrl: SECOND_DATA_URL },
       [SEED_DATA_URL],
     );
-    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.deepStrictEqual(providerIds, ["gpt-image-2-vip"]);
     assert.strictEqual(calls.length, colors.length);
     assert.ok(calls.every((call) => call.method === "edit"));
     assert.ok(calls.every((call) => call.request.batchSize === 1));
@@ -383,7 +383,7 @@ async function main() {
       { imageSize: "2K" },
       [SEED_DATA_URL],
     );
-    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.deepStrictEqual(providerIds, ["gpt-image-2-vip"]);
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].method, "edit");
     assert.deepStrictEqual(calls[0].request.referenceImages, [SEED_DATA_URL]);
@@ -401,7 +401,7 @@ async function main() {
       { prompt: extra },
       [SEED_DATA_URL],
     );
-    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.deepStrictEqual(providerIds, ["gpt-image-2-vip"]);
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].method, "edit");
     assert.deepStrictEqual(calls[0].request.referenceImages, [SEED_DATA_URL]);
@@ -412,6 +412,19 @@ async function main() {
     assert.strictEqual(result.providerRequests, 1);
   });
 
+  await ok("runner 严格使用节点保存的模型与模型原生参数", async () => {
+    const modelOptions = { width: 1024, height: 768, outputFormat: "png" };
+    const { calls, providerIds } = await runRecordedAiStep(
+      "print-extract",
+      { prompt: "提取主图案", modelId: "flux-2-pro", modelOptions },
+      [SEED_DATA_URL],
+    );
+    assert.deepStrictEqual(providerIds, ["flux-2-pro"]);
+    assert.strictEqual(calls.length, 1);
+    assert.strictEqual(calls[0].method, "edit");
+    assert.deepStrictEqual(calls[0].request.modelOptions, modelOptions);
+  });
+
   await ok("runner 印花裂变：参考图走 edit，按 count 返回且合并提示词", async () => {
     const extra = "转为水墨风格";
     const { calls, providerIds, result } = await runRecordedAiStep(
@@ -419,7 +432,7 @@ async function main() {
       { prompt: extra, count: 3 },
       [SEED_DATA_URL],
     );
-    assert.deepStrictEqual(providerIds, ["gpt-image-2"]);
+    assert.deepStrictEqual(providerIds, ["gpt-image-2-vip"]);
     assert.strictEqual(calls.length, 1);
     assert.strictEqual(calls[0].method, "edit");
     assert.deepStrictEqual(calls[0].request.referenceImages, [SEED_DATA_URL]);

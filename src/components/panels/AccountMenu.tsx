@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { useAuth, type CurrentUser } from "@/auth/AuthContext";
+import type { ImageModelId } from "@/types/imageModels";
 
 interface ManagedUser extends CurrentUser {
   active: boolean;
@@ -12,15 +13,19 @@ interface UsageItem {
 }
 
 interface AiDiagnosticProvider {
-  providerId: "nanobanana" | "gpt-image-2";
+  providerId: ImageModelId;
   model: string;
+  label: string;
+  channel: string;
+  probes: Array<"generate" | "edit">;
   configured: boolean;
   error?: string;
   capabilities?: {
-    supportsBatchN: boolean;
-    maxBatchSize: number;
-    supportsMultiReference: boolean;
+    supportsGeneration: boolean;
+    supportsEdit: boolean;
     maxReferenceImages: number;
+    maxImagesPerRequest: number;
+    timeoutMs: number;
   };
 }
 
@@ -41,14 +46,16 @@ export function AccountMenu() {
   return (
     <div ref={root} className="relative">
       <button type="button" onClick={() => setOpen((value) => !value)}
-        className="flex items-center gap-2 rounded-full border border-[var(--gc-border)] px-3 py-1.5 text-[10px] text-[var(--gc-text-muted)] hover:border-[var(--gc-accent)]">
+        aria-label={`账户菜单：${user.displayName}`}
+        title={`账户菜单：${user.displayName}`}
+        className="flex h-8 w-8 items-center justify-center gap-2 rounded-full border border-[var(--gc-border)] px-0 text-[10px] text-[var(--gc-text-muted)] hover:border-[var(--gc-accent)] sm:h-auto sm:w-auto sm:px-3 sm:py-1.5">
         <span className="flex h-5 w-5 items-center justify-center rounded-full bg-[var(--gc-accent)] text-[9px] font-semibold text-white">
           {user.displayName.slice(0, 1)}
         </span>
-        {user.displayName}
+        <span className="hidden sm:inline">{user.displayName}</span>
       </button>
       {open && (
-        <div className="absolute right-0 top-full z-50 mt-1.5 w-44 rounded-lg border border-[var(--gc-border)] bg-[var(--gc-panel)] p-1.5 shadow-xl">
+        <div className="fixed right-2 top-12 z-50 w-44 rounded-lg border border-[var(--gc-border)] bg-[var(--gc-panel)] p-1.5 shadow-xl sm:absolute sm:right-0 sm:top-full sm:mt-1.5">
           <button className="w-full rounded px-2.5 py-2 text-left text-[11px] hover:bg-[var(--gc-panel-hover)]"
             onClick={() => { setPanel("usage"); setOpen(false); }}>消耗记录</button>
           {user.role === "admin" && (
@@ -105,7 +112,7 @@ function AccountPanel({ initialTab, onClose }: { initialTab: AccountPanelTab; on
     void Promise.all([loadUsers(), loadUsage(), loadDiagnostics()]).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, [selectedUser]);
 
-  const runProbe = async (providerId: AiDiagnosticProvider["providerId"], mode: "model" | "generate" | "edit") => {
+  const runProbe = async (providerId: AiDiagnosticProvider["providerId"], mode: "generate" | "edit") => {
     const key = `${providerId}:${mode}`;
     setProbing(key);
     setError(null);
@@ -221,28 +228,34 @@ function AccountPanel({ initialTab, onClose }: { initialTab: AccountPanelTab; on
         ) : (
           <div className="min-h-0 flex-1 overflow-auto p-5">
             <p className="mb-4 text-xs text-[var(--gc-text-muted)]">
-              网关：{diagnostics?.gateway ?? "读取中…"}。模型检查不产生图片；生成与改图检查会各发起一次真实 AI 请求，可能产生少量消耗。
+              网关：{diagnostics?.gateway ?? "读取中…"}。配置状态来自本地 API易契约；文生图与改图检查会各发起一次真实 AI 请求，可能产生少量消耗。
             </p>
             <div className="space-y-3">
               {diagnostics?.providers.map((provider) => (
                 <section key={provider.providerId} className="rounded-lg border border-[var(--gc-border)] p-4 text-xs">
                   <div className="mb-2 flex items-center gap-2">
-                    <strong>{provider.providerId}</strong>
-                    <span className="text-[var(--gc-text-muted)]">{provider.model || provider.error || "未配置模型"}</span>
+                    <strong>{provider.label}</strong>
+                    <span className="text-[var(--gc-text-muted)]">
+                      {provider.model} · {provider.channel === "official" ? "官转" : "Codex 官逆"}
+                    </span>
                     <span className={provider.configured ? "ml-auto text-emerald-400" : "ml-auto text-red-400"}>
                       {provider.configured ? "配置完整" : "配置缺失"}
                     </span>
                   </div>
+                  {!provider.configured && provider.error && (
+                    <p className="mb-3 text-[11px] text-red-400">{provider.error}</p>
+                  )}
                   {provider.capabilities && (
                     <p className="mb-3 text-[11px] text-[var(--gc-text-muted)]">
-                      批量参数：{provider.capabilities.supportsBatchN ? `支持，单次最多 ${provider.capabilities.maxBatchSize} 张` : "不发送，由系统循环补足"}
-                      ；多参考图：{provider.capabilities.supportsMultiReference ? `支持，最多 ${provider.capabilities.maxReferenceImages} 张` : "不支持"}
+                      文生图：{provider.capabilities.supportsGeneration ? "支持" : "不支持"}
+                      ；参考图编辑：{provider.capabilities.supportsEdit ? `支持，最多 ${provider.capabilities.maxReferenceImages} 张` : "不支持"}
+                      ；单次最多 {provider.capabilities.maxImagesPerRequest} 张；超时 {Math.round(provider.capabilities.timeoutMs / 1000)} 秒
                     </p>
                   )}
                   <div className="flex flex-wrap gap-2">
-                    {(["model", "generate", "edit"] as const).map((mode) => {
+                    {provider.probes.map((mode) => {
                       const key = `${provider.providerId}:${mode}`;
-                      const label = mode === "model" ? "检查模型" : mode === "generate" ? "检查文生图" : "检查改图";
+                      const label = mode === "generate" ? "检查文生图" : "检查改图";
                       return (
                         <button key={mode} disabled={!provider.configured || probing !== null}
                           onClick={() => void runProbe(provider.providerId, mode)}

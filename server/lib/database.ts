@@ -150,6 +150,11 @@ async function migrate(): Promise<void> {
       project_id TEXT,
       node_id TEXT,
       run_id TEXT,
+      mime_type TEXT,
+      width INTEGER,
+      height INTEGER,
+      byte_length INTEGER,
+      normalized BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TEXT NOT NULL,
       deleted_at TEXT,
       purge_after TEXT
@@ -324,6 +329,120 @@ async function migrate(): Promise<void> {
       await client.query(
         "INSERT INTO schema_migrations (version, name, applied_at) VALUES (5, $1, $2)",
         ["account_data_retention_tombstones", new Date().toISOString()],
+      );
+    }
+
+    if (!applied.has(6)) {
+      await client.query(`
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS plan_json TEXT;
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS target_step_id TEXT;
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS run_type TEXT NOT NULL DEFAULT 'workflow';
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS updated_at BIGINT;
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS cancel_requested_at BIGINT;
+        UPDATE generation_runs SET updated_at = COALESCE(updated_at, finished_at, started_at);
+        ALTER TABLE generation_runs DROP CONSTRAINT IF EXISTS generation_runs_status_check;
+        ALTER TABLE generation_runs ADD CONSTRAINT generation_runs_status_check CHECK (status IN (
+          'queued','running','retry_wait','cancel_requested','cancelled',
+          'succeeded','failed','outcome_unknown','success','error'
+        ));
+        ALTER TABLE generation_runs DROP CONSTRAINT IF EXISTS generation_runs_run_type_check;
+        ALTER TABLE generation_runs ADD CONSTRAINT generation_runs_run_type_check
+          CHECK (run_type IN ('workflow','direct'));
+
+        CREATE TABLE IF NOT EXISTS generation_run_steps (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+          step_index INTEGER NOT NULL,
+          node_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          step_json TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN (
+            'queued','running','retry_wait','cancel_requested','cancelled',
+            'succeeded','failed','outcome_unknown'
+          )),
+          model TEXT,
+          output_images_json TEXT NOT NULL DEFAULT '[]',
+          prompts_json TEXT NOT NULL DEFAULT '[]',
+          failures_json TEXT NOT NULL DEFAULT '[]',
+          provider_requests INTEGER NOT NULL DEFAULT 0,
+          error TEXT,
+          started_at BIGINT,
+          finished_at BIGINT,
+          UNIQUE (run_id, step_index),
+          UNIQUE (run_id, node_id)
+        );
+        CREATE INDEX IF NOT EXISTS generation_run_steps_run_idx
+          ON generation_run_steps(run_id, step_index);
+
+        CREATE TABLE IF NOT EXISTS generation_jobs (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+          step_id TEXT NOT NULL UNIQUE REFERENCES generation_run_steps(id) ON DELETE CASCADE,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          status TEXT NOT NULL CHECK (status IN (
+            'queued','running','retry_wait','cancel_requested','cancelled',
+            'succeeded','failed','outcome_unknown'
+          )),
+          retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count BETWEEN 0 AND 2),
+          available_at BIGINT NOT NULL,
+          worker_id TEXT,
+          lease_expires_at BIGINT,
+          attempt_started_at BIGINT,
+          last_error TEXT,
+          created_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS generation_jobs_claim_idx
+          ON generation_jobs(status, available_at, lease_expires_at);
+        CREATE INDEX IF NOT EXISTS generation_jobs_run_idx ON generation_jobs(run_id);
+
+        CREATE TABLE IF NOT EXISTS generation_run_events (
+          run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+          seq INTEGER NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at BIGINT NOT NULL,
+          PRIMARY KEY (run_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS generation_run_events_created_idx
+          ON generation_run_events(run_id, created_at);
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (6, $1, $2)",
+        ["durable_generation_queue", new Date().toISOString()],
+      );
+    }
+
+    if (!applied.has(7)) {
+      await client.query(`
+        ALTER TABLE generation_run_steps
+          ADD COLUMN IF NOT EXISTS provider_output_sizes_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE generation_outputs
+          ADD COLUMN IF NOT EXISTS provider_output_size TEXT;
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (7, $1, $2)",
+        ["provider_output_size_metadata", new Date().toISOString()],
+      );
+    }
+
+    if (!applied.has(8)) {
+      await client.query(`
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS mime_type TEXT;
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS width INTEGER;
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS height INTEGER;
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS byte_length INTEGER;
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS normalized BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE files DROP CONSTRAINT IF EXISTS files_normalized_metadata_check;
+        ALTER TABLE files ADD CONSTRAINT files_normalized_metadata_check CHECK (
+          normalized = FALSE OR (
+            mime_type IN ('image/png', 'image/jpeg') AND
+            width > 0 AND height > 0 AND byte_length > 0
+          )
+        );
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (8, $1, $2)",
+        ["normalized_upload_metadata", new Date().toISOString()],
       );
     }
 

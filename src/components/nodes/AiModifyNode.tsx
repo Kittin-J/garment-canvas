@@ -1,14 +1,17 @@
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import { useFlowStore } from "@/store/flowStore";
-import { BATCH_SIZES, type AiModifyNodeData } from "@/types/workflow";
+import { BATCH_SIZES, isNodeRunActive, type AiModifyNodeData } from "@/types/workflow";
+import { imageModelOptionsForAspectRatio } from "@/types/imageModels";
 import { NodeFrame, RunButton, Developing, inputClass } from "./NodeFrame";
 import { ImageGrid } from "./ImageGrid";
+import { ModelControls } from "./ModelControls";
 
 const ASPECT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9"];
 export function AiModifyNode({ id, data, selected }: NodeProps<Node<AiModifyNodeData>>) {
   const updateNodeData = useFlowStore((s) => s.updateNodeData);
   const runNode = useFlowStore((s) => s.runNode);
-  const running = data.status === "running" || data.status === "queued";
+  const cancelNodeRun = useFlowStore((s) => s.cancelNodeRun);
+  const running = isNodeRunActive(data.status);
 
   return (
     <>
@@ -30,7 +33,13 @@ export function AiModifyNode({ id, data, selected }: NodeProps<Node<AiModifyNode
             <span className="text-[10px] text-neutral-500">画幅比例</span>
             <select
               value={data.aspectRatio}
-              onChange={(e) => updateNodeData(id, { aspectRatio: e.target.value })}
+              onChange={(e) => {
+                const aspectRatio = e.target.value;
+                updateNodeData(id, {
+                  aspectRatio,
+                  modelOptions: imageModelOptionsForAspectRatio(data.modelId ?? "gpt-image-2-vip", data.modelOptions, aspectRatio),
+                });
+              }}
               className={inputClass}
             >
               {ASPECT_RATIOS.map((r) => (
@@ -57,7 +66,8 @@ export function AiModifyNode({ id, data, selected }: NodeProps<Node<AiModifyNode
             </select>
           </label>
         </div>
-        <RunButton running={running} queued={data.status === "queued"} onClick={() => void runNode(id)} label={data.label} />
+        <ModelControls nodeId={id} modelId={data.modelId} modelOptions={data.modelOptions} preferredAspectRatio={data.aspectRatio} disabled={running} />
+        <RunButton status={data.status} onClick={() => void runNode(id)} onCancel={() => void cancelNodeRun(id)} label={data.label} />
         {running && <Developing />}
         <ImageGrid images={data.outputImages} />
       </NodeFrame>

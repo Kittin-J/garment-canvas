@@ -13,9 +13,12 @@ import {
   type NodeRunStatus,
 } from "../../src/types/workflow";
 import { getProvider } from "../providers";
-import { ProviderError, publicProviderErrorMessage } from "../providers/base";
+import { ProviderError, publicProviderErrorMessage, toDataUrl } from "../providers/base";
 import { generateExactImages } from "../providers/exact";
 import { normalizeImageRef, persistImageRef } from "../lib/fileStore";
+import { isLocalImageReference } from "../lib/imageValidation";
+import { normalizeUploadImageDataUrl } from "../lib/uploadImageNormalization";
+import { query } from "../lib/database";
 import {
   fitGeneratedImageToAspect,
   normalizeExactAspectRatio,
@@ -23,6 +26,15 @@ import {
   upscaleImageToLongEdge,
 } from "../lib/imagePostProcessing";
 import { buildRecolorPrompt } from "../../src/lib/colors";
+import {
+  DEFAULT_GENERATION_MODEL_ID,
+  MASK_REDRAW_MODEL_ID,
+  isImageModelId,
+  isModelAllowedForNode,
+  modelMaxReferenceImages,
+  type ImageModelOptions,
+} from "../../src/types/imageModels";
+import { compositeMaskedEdit } from "../lib/maskProcessing";
 import {
   completeGenerationRecord,
   createGenerationRecord,
@@ -44,6 +56,8 @@ interface RunEventMeta {
   model?: string;
   /** 每张成功图片对应的实际提示词；顺序与 images 一致。 */
   prompts?: string[];
+  /** 上游声明的逐图实际输出尺寸；顺序与 images 一致。 */
+  providerOutputSizes?: Array<string | null>;
   failures?: RunFailure[];
   startedAt?: number;
   finishedAt?: number;
@@ -72,10 +86,11 @@ export type RunEvent =
   | { seq?: number; type: "done" }
   | { seq?: number; type: "run-error"; nodeId?: string; error: string; finishedAt?: number };
 
-interface StepResult {
+export interface StepResult {
   images: string[];
   model?: string;
   prompts?: string[];
+  providerOutputSizes?: Array<string | null>;
   failures?: RunFailure[];
   providerRequests: number;
 }
@@ -181,7 +196,7 @@ async function executeRun(run: Run): Promise<void> {
   const outputs = new Map<string, string[]>();
   let providerRequests = 0;
   let model: string | undefined;
-  let recordResult: Pick<StepResult, "images" | "prompts" | "failures"> | undefined;
+  let recordResult: Pick<StepResult, "images" | "prompts" | "providerOutputSizes" | "failures"> | undefined;
 
   if (run.recordContext) await markGenerationRunning(run.id, Date.now());
 
@@ -234,7 +249,12 @@ async function executeRun(run: Run): Promise<void> {
       providerRequests += result.providerRequests;
       if (result.model) model = result.model;
       if (run.recordContext?.nodeId === step.nodeId) {
-        recordResult = { images: persisted, prompts: result.prompts, failures: result.failures };
+        recordResult = {
+          images: persisted,
+          prompts: result.prompts,
+          providerOutputSizes: result.providerOutputSizes,
+          failures: result.failures,
+        };
       }
       const partialWarning = result.failures?.length
         ? `${result.failures.length} 个生成任务失败`
@@ -247,6 +267,7 @@ async function executeRun(run: Run): Promise<void> {
         error: partialWarning,
         model: result.model,
         prompts: result.prompts,
+        providerOutputSizes: result.providerOutputSizes,
         failures: result.failures,
         startedAt,
         finishedAt,
@@ -265,6 +286,7 @@ async function executeRun(run: Run): Promise<void> {
       runId: run.id,
       images: recordResult?.images ?? [],
       prompts: recordResult?.prompts,
+      providerOutputSizes: recordResult?.providerOutputSizes,
       failures: recordResult?.failures,
       model,
       providerRequests,
@@ -302,12 +324,20 @@ export async function postProcessGeneratedOutputImages(
 
 export type ProviderResolver = (id: string) => AIProvider;
 
+export interface ExecuteStepOptions {
+  runId?: string;
+  beforeProviderCall?: (providerRequest: number) => void | Promise<void>;
+}
+
 export async function executeStep(
   step: NodeExecution,
   inputImages: string[],
   resolveProvider: ProviderResolver = getProvider,
-  runId?: string,
+  runIdOrOptions?: string | ExecuteStepOptions,
 ): Promise<StepResult> {
+  const options: ExecuteStepOptions = typeof runIdOrOptions === "string"
+    ? { runId: runIdOrOptions }
+    : runIdOrOptions ?? {};
   switch (step.kind) {
     case "image-input": {
       const imageUrl = step.params.imageUrl as string | undefined;
@@ -322,9 +352,22 @@ export async function executeStep(
     case "fabric-recolor":
     case "upscale":
     case "print-extract":
-    case "print-mutate": {
-      const spec = NODE_SPECS[step.kind];
-      const provider = resolveProvider(spec.providerId!);
+    case "print-mutate":
+    case "mask-redraw": {
+      const modelId = isImageModelId(step.params.modelId)
+        ? step.params.modelId
+        : step.kind === "mask-redraw" ? MASK_REDRAW_MODEL_ID : DEFAULT_GENERATION_MODEL_ID;
+      if (!isModelAllowedForNode(modelId, step.kind)) {
+        throw new Error(`Model ${modelId} is not allowed for node ${step.nodeId}`);
+      }
+      const provider = resolveProvider(modelId);
+      const modelOptions = step.params.modelOptions as ImageModelOptions | undefined;
+      if (
+        step.kind === "mask-redraw" &&
+        (typeof step.params.maskSourceRef !== "string" || step.params.maskSourceRef !== inputImages[0])
+      ) {
+        throw new Error("蒙版对应的原图已变化，请重新绘制蒙版");
+      }
       const referenceImages = await resolveImageRefs(inputImages);
 
       // fabric-recolor 的面料参考图（可能不是边连入，而是节点参数）
@@ -332,8 +375,9 @@ export async function executeStep(
       if (step.kind === "fabric-recolor" && fabricImageUrl) {
         referenceImages.push(...(await resolveImageRefs([fabricImageUrl])));
       }
-      if (referenceImages.length > MAX_REFERENCE_IMAGES) {
-        throw new Error(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
+      const maxReferences = Math.min(MAX_REFERENCE_IMAGES, modelMaxReferenceImages(modelId));
+      if (referenceImages.length > maxReferences) {
+        throw new Error(`Node ${step.nodeId} accepts at most ${maxReferences} reference images for ${modelId}`);
       }
 
       const extra = ((step.params.prompt as string) ?? "").trim();
@@ -346,32 +390,56 @@ export async function executeStep(
         if (colors.length > 0) {
           const images: string[] = [];
           const prompts: string[] = [];
+          const providerOutputSizes: Array<string | null> = [];
           const failures: RunFailure[] = [];
           let model: string | undefined;
           let providerRequests = 0;
+          let firstError: unknown;
           for (const color of colors) {
             const prompt = buildRecolorPrompt([color]);
             try {
-              const result = await generateExactImages(provider, { prompt, referenceImages }, 1, { runId, nodeId: step.nodeId });
+              const result = await generateExactImages(
+                provider,
+                { prompt, referenceImages, modelOptions },
+                1,
+                { ...options, nodeId: step.nodeId },
+              );
               providerRequests += result.providerRequests;
               model = result.model;
-              for (const image of result.images) {
+              for (const [index, image] of result.images.entries()) {
                 images.push(image);
                 prompts.push(prompt);
+                providerOutputSizes.push(result.providerOutputSizes?.[index] ?? null);
               }
             } catch (err) {
+              firstError ??= err;
+              if (err instanceof ProviderError && err.category === "outcome_unknown") throw err;
               failures.push({
                 prompt,
                 error: err instanceof ProviderError
                   ? publicProviderErrorMessage(err)
                   : err instanceof Error ? err.message : String(err),
               });
+              if (images.length > 0) break;
+              if (err instanceof ProviderError && (
+                err.status === 429 || err.status === 503 ||
+                ["gateway_authentication", "invalid_request", "model_unavailable"].includes(err.category)
+              )) throw err;
             }
           }
           if (images.length === 0) {
-            throw new Error(failures[0]?.error ?? "全部配色生成失败");
+            throw firstError instanceof Error ? firstError : new Error(failures[0]?.error ?? "全部配色生成失败");
           }
-          return { images, prompts, model, providerRequests, failures: failures.length ? failures : undefined };
+          return {
+            images,
+            prompts,
+            model,
+            providerRequests,
+            providerOutputSizes: providerOutputSizes.some((size) => size !== null)
+              ? providerOutputSizes
+              : undefined,
+            failures: failures.length ? failures : undefined,
+          };
         }
       }
 
@@ -381,13 +449,19 @@ export async function executeStep(
         const prompt =
           "基于这张印花图案生成风格一致的新变体：保持原有配色体系、艺术风格与笔触质感，重新编排元素的构图与组合方式，纯白背景，适合作为印花素材复用" +
           (extra ? `。补充要求：${extra}` : "");
-        const result = await generateExactImages(provider, { prompt, referenceImages }, count, { runId, nodeId: step.nodeId });
+        const result = await generateExactImages(
+          provider,
+          { prompt, referenceImages, modelOptions },
+          count,
+          { ...options, nodeId: step.nodeId },
+        );
         const failures = result.failures.map((error) => ({ prompt, error }));
         return {
           images: result.images,
           prompts: result.images.map(() => prompt),
           model: result.model,
           providerRequests: result.providerRequests,
+          providerOutputSizes: result.providerOutputSizes,
           failures: failures.length ? failures : undefined,
         };
       }
@@ -398,7 +472,17 @@ export async function executeStep(
           : step.kind === "print-extract"
             ? "提取这件衣服上的印花图案：将印花完整抠出并平铺展开为规整的矩形图案，纯白背景，去除衣身、褶皱、阴影和穿着效果，印花的比例、细节和色彩与原图保持一致，适合作为印花素材复用" +
               (extra ? `。补充要求：${extra}` : "")
-            : extra || DEFAULT_PROMPTS[step.kind] || NODE_SPECS[step.kind].description;
+            : step.kind === "mask-redraw"
+              ? extra
+              : extra || DEFAULT_PROMPTS[step.kind] || NODE_SPECS[step.kind].description;
+      if (step.kind === "mask-redraw" && !prompt) {
+        throw new Error("蒙版局部重绘必须填写修改说明");
+      }
+      const maskReference = step.kind === "mask-redraw" ? step.params.mask : undefined;
+      if (step.kind === "mask-redraw" && (typeof maskReference !== "string" || !maskReference)) {
+        throw new Error("蒙版局部重绘必须先保存 PNG 蒙版");
+      }
+      const mask = typeof maskReference === "string" ? await normalizeImageRef(maskReference) : undefined;
       const request = {
         prompt,
         referenceImages: referenceImages.length ? referenceImages : undefined,
@@ -407,17 +491,28 @@ export async function executeStep(
           : step.params.aspectRatio as string | undefined,
         batchSize: step.params.batchSize as number | undefined,
         imageSize: step.kind === "upscale" ? normalizeUpscaleSize(step.params.imageSize) : undefined,
+        modelOptions,
+        mask,
       };
       const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify"
         ? Math.max(1, Math.min(8, Number(step.params.batchSize) || 1))
         : 1;
-      const result = await generateExactImages(provider, request, requestedCount, { runId, nodeId: step.nodeId });
-      const images = await postProcessGeneratedOutputImages(step.kind, step.params, result.images);
+      const result = await generateExactImages(
+        provider,
+        request,
+        requestedCount,
+        { ...options, nodeId: step.nodeId },
+      );
+      const providerImages = step.kind === "mask-redraw"
+        ? await Promise.all(result.images.map((image) => compositeMaskedEdit(referenceImages[0], mask!, image)))
+        : result.images;
+      const images = await postProcessGeneratedOutputImages(step.kind, step.params, providerImages);
       return {
         images,
         model: result.model,
         prompts: images.map(() => prompt),
         providerRequests: result.providerRequests,
+        providerOutputSizes: result.providerOutputSizes,
         failures: result.failures.length ? result.failures.map((error) => ({ prompt, error })) : undefined,
       };
     }
@@ -425,11 +520,29 @@ export async function executeStep(
 }
 
 /**
- * 将节点图片引用统一解析为 dataURL：
- * - data:... 原样返回
- * - /api/files/:id 从 DATA_DIR/uploads 读取转 dataURL
- * - http(s) URL 原样返回（provider 端不支持的由 provider 报错）
+ * 将节点图片引用统一解析为 Provider 输入 dataURL。
+ * 已标准化上传与生成结果直接复用；旧素材或缺少元数据的本地文件只标准化请求副本。
  */
 export async function resolveImageRefs(refs: string[]): Promise<string[]> {
-  return Promise.all(refs.map(normalizeImageRef));
+  const localIds = Array.from(new Set(
+    refs.filter(isLocalImageReference).map((ref) => ref.slice("/api/files/".length)),
+  ));
+  const storedInputs = localIds.length === 0
+    ? []
+    : await query<{ id: string; source_type: string; normalized: boolean }>(`
+        SELECT id, source_type, normalized FROM files WHERE id = ANY($1::text[])
+      `, [localIds]);
+  const metadataById = new Map(storedInputs.map((row) => [row.id, row]));
+
+  return Promise.all(refs.map(async (ref) => {
+    const resolved = await normalizeImageRef(ref);
+    if (!isLocalImageReference(ref)) return resolved;
+
+    const id = ref.slice("/api/files/".length);
+    const metadata = metadataById.get(id);
+    if (metadata?.normalized || metadata?.source_type === "generation") return resolved;
+
+    const normalized = await normalizeUploadImageDataUrl(resolved);
+    return toDataUrl(normalized.buffer.toString("base64"), normalized.mimeType);
+  }));
 }

@@ -11,6 +11,14 @@ import type {
 } from "../../src/types/workflow";
 import { NODE_SPECS } from "../../src/types/workflow";
 import { MAX_REFERENCE_IMAGES } from "../../src/types/workflow";
+import {
+  DEFAULT_GENERATION_MODEL_ID,
+  MASK_REDRAW_MODEL_ID,
+  defaultImageModelOptions,
+  isImageModelId,
+  isModelAllowedForNode,
+  modelMaxReferenceImages,
+} from "../../src/types/imageModels";
 
 /** React Flow 节点/边的最小结构（前端传入） */
 export interface FlowNode {
@@ -40,11 +48,18 @@ export function assertPlanInputs(plan: ExecutionPlan, edges: FlowEdge[]): void {
   for (const step of plan.steps) {
     const spec = NODE_SPECS[step.kind];
     if (!spec.providerId) continue;
+    const modelId = isImageModelId(step.params.modelId)
+      ? step.params.modelId
+      : step.kind === "mask-redraw" ? MASK_REDRAW_MODEL_ID : DEFAULT_GENERATION_MODEL_ID;
+    if (!isModelAllowedForNode(modelId, step.kind)) {
+      throw new DagError(`Model ${modelId} is not allowed for node ${step.nodeId}`);
+    }
     const usableImages = (step.upstream ?? []).flatMap((upstream) =>
       executingNodeIds.has(upstream.nodeId) ? ["__runtime_output__"] : upstream.images,
     );
-    if (usableImages.length > MAX_REFERENCE_IMAGES) {
-      throw new DagError(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
+    const maxReferences = Math.min(MAX_REFERENCE_IMAGES, modelMaxReferenceImages(modelId));
+    if (usableImages.length > maxReferences) {
+      throw new DagError(`Node ${step.nodeId} accepts at most ${maxReferences} reference images for ${modelId}`);
     }
     if (step.kind === "sketch-to-render" && usableImages.length === 0) {
       // sketch-to-render 同时承担文生款式，只有 prompt 时允许无图片执行。
@@ -64,6 +79,16 @@ export function assertPlanInputs(plan: ExecutionPlan, edges: FlowEdge[]): void {
         );
       if (garmentImages.length === 0) {
         throw new DagError(`Node ${step.nodeId} requires a garment image`);
+      }
+      continue;
+    }
+    if (step.kind === "mask-redraw") {
+      if (usableImages.length === 0) throw new DagError(`Node ${step.nodeId} requires an upstream image`);
+      if (typeof step.params.mask !== "string" || !step.params.mask) {
+        throw new DagError(`Node ${step.nodeId} requires a saved PNG mask`);
+      }
+      if (typeof step.params.maskSourceRef !== "string" || step.params.maskSourceRef !== usableImages[0]) {
+        throw new DagError(`Node ${step.nodeId} mask does not match its current source image`);
       }
       continue;
     }
@@ -177,6 +202,7 @@ function extractOutputImages(data: WorkflowNodeData): string[] {
     case "upscale":
     case "print-extract":
     case "print-mutate":
+    case "mask-redraw":
       return data.outputImages ?? [];
     case "result":
       return data.images ?? [];
@@ -185,25 +211,49 @@ function extractOutputImages(data: WorkflowNodeData): string[] {
 
 /** 提取节点执行参数（prompt / aspectRatio / batchSize / fabricImageUrl 等） */
 function extractParams(data: WorkflowNodeData): Record<string, unknown> {
+  const modelFields = (preferredAspectRatio = "1:1") => {
+    if (!NODE_SPECS[data.kind].providerId) return {};
+    const modelId = "modelId" in data && isImageModelId(data.modelId)
+      ? data.modelId
+      : data.kind === "mask-redraw" ? MASK_REDRAW_MODEL_ID : DEFAULT_GENERATION_MODEL_ID;
+    return {
+      modelId,
+      modelOptions: "modelOptions" in data && data.modelOptions
+        ? data.modelOptions
+        : defaultImageModelOptions(modelId, preferredAspectRatio),
+    };
+  };
   switch (data.kind) {
     case "image-input":
       return { imageUrl: data.imageUrl, imageRole: data.imageRole };
     case "sketch-to-render":
-      return { prompt: data.prompt, aspectRatio: data.aspectRatio, batchSize: data.batchSize };
+      return {
+        prompt: data.prompt, aspectRatio: data.aspectRatio, batchSize: data.batchSize,
+        ...modelFields(data.aspectRatio),
+      };
     case "ai-modify":
-      return { prompt: data.prompt, aspectRatio: data.aspectRatio, batchSize: data.batchSize };
+      return {
+        prompt: data.prompt, aspectRatio: data.aspectRatio, batchSize: data.batchSize,
+        ...modelFields(data.aspectRatio),
+      };
     case "fabric-recolor":
       return {
         prompt: data.prompt,
         colors: data.colors,
         fabricImageUrl: data.fabricImageUrl,
+        ...modelFields(),
       };
     case "upscale":
-      return { imageSize: data.imageSize };
+      return { imageSize: data.imageSize, ...modelFields() };
     case "print-extract":
-      return { prompt: data.prompt };
+      return { prompt: data.prompt, ...modelFields() };
     case "print-mutate":
-      return { prompt: data.prompt, count: data.count };
+      return { prompt: data.prompt, count: data.count, ...modelFields() };
+    case "mask-redraw":
+      return {
+        prompt: data.prompt, mask: data.mask, maskSourceRef: data.maskSourceRef,
+        modelId: MASK_REDRAW_MODEL_ID, modelOptions: {},
+      };
     case "result":
       return { note: data.note };
   }

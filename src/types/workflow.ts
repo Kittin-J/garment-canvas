@@ -1,17 +1,19 @@
 /**
  * 工作流核心类型契约 —— 团队共用，改动需通知全员
- * P0 MVP：无限画布 + 节点 DAG + 双模型（nanobanana / gpt-image-2）
+ * 无限画布 + 节点 DAG + 节点级图片模型选择。
  */
+import type { GenerationImageModelId, ImageModelOptions } from "./imageModels";
 
 // ---------- 节点类型 ----------
 export type NodeKind =
   | "image-input"        // 图片上传（草图/款式图/面料参考）
-  | "sketch-to-render"   // 草图→效果图（nanobanana）
+  | "sketch-to-render"   // 草图→效果图（节点内选择 API易模型）
   | "ai-modify"          // AI 改款/变体（gpt-image-2）
   | "fabric-recolor"     // 面料/配色替换（gpt-image-2）
-  | "upscale"            // 高清放大（nanobanana，2K/4K）
+  | "upscale"            // 高清放大（节点内选择 API易模型，业务侧 2K/4K）
   | "print-extract"      // 印花提取（gpt-image-2，抠出印花平铺展开）
   | "print-mutate"       // 印花裂变（gpt-image-2，1~8 张风格一致变体）
+  | "mask-redraw"        // GPT Image 2 蒙版局部重绘
   | "result";            // 结果展示/管理
 
 // ---------- 节点执行状态机 ----------
@@ -19,8 +21,12 @@ export type NodeRunStatus =
   | "idle"
   | "queued"
   | "running"
+  | "retry_wait"
+  | "cancel_requested"
   | "success"
-  | "error";
+  | "error"
+  | "outcome_unknown"
+  | "cancelled";
 
 /** OpenAI Images Edit 最多支持 16 图；产品端为控制成本与上传体积限制为 8 图。 */
 export const MAX_REFERENCE_IMAGES = 8;
@@ -35,6 +41,20 @@ export interface BaseNodeData {
   [key: string]: unknown;
 }
 
+export interface ModelSelectableNodeData {
+  /** v0/v1 读取期间可缺省；v2 服务端校验后一定存在。 */
+  modelId?: GenerationImageModelId;
+  modelOptions?: ImageModelOptions;
+}
+
+export function isNodeRunActive(status: NodeRunStatus): boolean {
+  return status === "queued" || status === "running" || status === "retry_wait" || status === "cancel_requested";
+}
+
+export function isNodeRunTerminal(status: NodeRunStatus): boolean {
+  return status === "success" || status === "error" || status === "outcome_unknown" || status === "cancelled";
+}
+
 export interface ImageInputNodeData extends BaseNodeData {
   kind: "image-input";
   /** dataURL 或 /api/files/xxx 路径 */
@@ -42,7 +62,7 @@ export interface ImageInputNodeData extends BaseNodeData {
   imageRole: "default" | "sketch" | "garment" | "fabric" | "reference";
 }
 
-export interface SketchToRenderNodeData extends BaseNodeData {
+export interface SketchToRenderNodeData extends BaseNodeData, ModelSelectableNodeData {
   kind: "sketch-to-render";
   prompt: string;
   aspectRatio: string;       // "1:1" | "3:4" | "4:3" | "9:16" | "16:9"
@@ -50,7 +70,7 @@ export interface SketchToRenderNodeData extends BaseNodeData {
   outputImages: string[];    // 生成结果
 }
 
-export interface AiModifyNodeData extends BaseNodeData {
+export interface AiModifyNodeData extends BaseNodeData, ModelSelectableNodeData {
   kind: "ai-modify";
   prompt: string;
   aspectRatio: string;
@@ -58,7 +78,7 @@ export interface AiModifyNodeData extends BaseNodeData {
   outputImages: string[];
 }
 
-export interface FabricRecolorNodeData extends BaseNodeData {
+export interface FabricRecolorNodeData extends BaseNodeData, ModelSelectableNodeData {
   kind: "fabric-recolor";
   /** 选中的配色（hex 数组，最多 8 个，一色出一张图），prompt 由它自动组装 */
   colors: string[];
@@ -67,14 +87,14 @@ export interface FabricRecolorNodeData extends BaseNodeData {
   outputImages: string[];
 }
 
-export interface UpscaleNodeData extends BaseNodeData {
+export interface UpscaleNodeData extends BaseNodeData, ModelSelectableNodeData {
   kind: "upscale";
   /** 最终输出长边：2K=2048px，4K=4096px。 */
   imageSize: "2K" | "4K";
   outputImages: string[];
 }
 
-export interface PrintExtractNodeData extends BaseNodeData {
+export interface PrintExtractNodeData extends BaseNodeData, ModelSelectableNodeData {
   kind: "print-extract";
   /** 补充说明（可选），如"只要胸前那朵花" */
   prompt: string;
@@ -84,12 +104,22 @@ export interface PrintExtractNodeData extends BaseNodeData {
   savedAsAssets: string[];
 }
 
-export interface PrintMutateNodeData extends BaseNodeData {
+export interface PrintMutateNodeData extends BaseNodeData, ModelSelectableNodeData {
   kind: "print-mutate";
   /** 裂变方向补充说明（可选），如"改成水墨风格" */
   prompt: string;
   /** 裂变数量（1~8） */
   count: number;
+  outputImages: string[];
+}
+
+export interface MaskRedrawNodeData extends BaseNodeData {
+  kind: "mask-redraw";
+  modelId: "gpt-image-2";
+  modelOptions: ImageModelOptions;
+  prompt: string;
+  mask?: string;
+  maskSourceRef?: string;
   outputImages: string[];
 }
 
@@ -107,14 +137,15 @@ export type WorkflowNodeData =
   | UpscaleNodeData
   | PrintExtractNodeData
   | PrintMutateNodeData
+  | MaskRedrawNodeData
   | ResultNodeData;
 
 // ---------- 持久化工作流（项目 / 模板共用）----------
 /**
- * 版本 1 是首个显式、可校验的磁盘格式。读取无版本的历史文件时，服务端会先按
- * v0 迁移（补齐后来新增的节点默认字段），再返回 v1；新版本不得静默降级读取。
+ * 版本 2 增加节点级模型参数和蒙版节点。读取 v0/v1 时服务端会确定性迁移；
+ * 新版本不得静默降级读取。
  */
-export const WORKFLOW_SCHEMA_VERSION = 1 as const;
+export const WORKFLOW_SCHEMA_VERSION = 2 as const;
 export type WorkflowSchemaVersion = typeof WORKFLOW_SCHEMA_VERSION;
 
 export interface PersistedWorkflowNode {
@@ -150,6 +181,8 @@ export interface ImageGenRequest {
   batchSize?: number;
   /** 业务输出档位：保持比例，2K/4K 分别将最终图片长边处理为 2048/4096 像素。 */
   imageSize?: string;
+  /** 模型原生参数；由本地知识库契约严格校验。 */
+  modelOptions?: ImageModelOptions;
   /** 局部编辑蒙版（dataURL），P0 可选 */
   mask?: string;
 }
@@ -158,10 +191,13 @@ export interface ImageGenResult {
   images: string[];          // dataURL 或可访问 URL
   model: string;
   usageNote?: string;
+  /** 上游声明的逐图实际输出尺寸；顺序与 images 一致，未知项为 null。 */
+  providerOutputSizes?: Array<string | null>;
 }
 
 export interface AIProvider {
-  readonly id: string;                 // "nanobanana" | "gpt-image-2" | "comfyui-local"(预留)
+  readonly id: string;                 // API易模型 ID；与本地模型知识库一致
+  validate?(req: ImageGenRequest, mode: "generate" | "edit"): void | Promise<void>;
   generate(req: ImageGenRequest): Promise<ImageGenResult>;
   edit(req: ImageGenRequest): Promise<ImageGenResult>;
 }
@@ -256,24 +292,24 @@ export const NODE_SPECS: Record<NodeKind, NodeSpec> = {
   "sketch-to-render": {
     kind: "sketch-to-render",
     title: "草图→效果图",
-    description: "AI 将线稿渲染为服装效果图",
-    providerId: "gpt-image-2",
+    description: "选择模型，将线稿渲染为服装效果图",
+    providerId: "apiyi",
     inputs: MAX_REFERENCE_IMAGES,
     outputs: "images",
   },
   "ai-modify": {
     kind: "ai-modify",
     title: "AI 改款",
-    description: "gpt-image-2 改领型/袖型/长度/细节",
-    providerId: "gpt-image-2",
+    description: "选择模型修改领型、袖型、长度与细节",
+    providerId: "apiyi",
     inputs: MAX_REFERENCE_IMAGES,
     outputs: "images",
   },
   "fabric-recolor": {
     kind: "fabric-recolor",
     title: "面料/配色替换",
-    description: "gpt-image-2 替换面料纹理与配色",
-    providerId: "gpt-image-2",
+    description: "选择模型替换面料纹理与配色",
+    providerId: "apiyi",
     inputs: MAX_REFERENCE_IMAGES,
     outputs: "images",
   },
@@ -281,23 +317,31 @@ export const NODE_SPECS: Record<NodeKind, NodeSpec> = {
     kind: "upscale",
     title: "高清放大",
     description: "AI 放大至 2K/4K，精修细节",
-    providerId: "gpt-image-2",
+    providerId: "apiyi",
     inputs: 1,
     outputs: "images",
   },
   "print-extract": {
     kind: "print-extract",
     title: "印花提取",
-    description: "gpt-image-2 从服装上抠出印花，平铺展开存素材",
-    providerId: "gpt-image-2",
+    description: "选择模型从服装上提取印花并平铺展开",
+    providerId: "apiyi",
     inputs: MAX_REFERENCE_IMAGES,
     outputs: "images",
   },
   "print-mutate": {
     kind: "print-mutate",
     title: "印花裂变",
-    description: "gpt-image-2 基于印花生成 1~8 张风格一致的变体",
-    providerId: "gpt-image-2",
+    description: "选择模型生成 1~8 张风格一致的印花变体",
+    providerId: "apiyi",
+    inputs: MAX_REFERENCE_IMAGES,
+    outputs: "images",
+  },
+  "mask-redraw": {
+    kind: "mask-redraw",
+    title: "蒙版局部重绘",
+    description: "用 GPT Image 2 只修改蒙版选中的区域",
+    providerId: "apiyi",
     inputs: MAX_REFERENCE_IMAGES,
     outputs: "images",
   },

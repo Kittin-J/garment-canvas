@@ -1,15 +1,23 @@
 import { useFlowStore, type RecentResult } from "@/store/flowStore";
-import { NODE_SPECS, type ImageInputNodeData } from "@/types/workflow";
-import { inputClass, STATUS_TEXT } from "../nodes/NodeFrame";
+import { NODE_SPECS, isNodeRunActive, type ImageInputNodeData } from "@/types/workflow";
+import { inputClass, RunButton, STATUS_TEXT } from "../nodes/NodeFrame";
+import { ModelControls } from "../nodes/ModelControls";
 import { thumbnailImageUrl } from "@/lib/images";
+import { isImageModelId, type GenerationImageModelId, type ImageModelOptions } from "@/types/imageModels";
 
 function PropertyEditor({ nodeId }: { nodeId: string }) {
   const node = useFlowStore((s) => s.nodes.find((n) => n.id === nodeId));
   const updateNodeData = useFlowStore((s) => s.updateNodeData);
   const runNode = useFlowStore((s) => s.runNode);
+  const cancelNodeRun = useFlowStore((s) => s.cancelNodeRun);
   if (!node) return null;
   const d = node.data;
   const spec = NODE_SPECS[d.kind];
+  const selectedModelId: GenerationImageModelId | undefined =
+    "modelId" in d && isImageModelId(d.modelId) && d.modelId !== "gpt-image-2" ? d.modelId : undefined;
+  const selectedModelOptions = "modelOptions" in d && typeof d.modelOptions === "object" && d.modelOptions !== null
+    ? d.modelOptions as ImageModelOptions
+    : undefined;
 
   return (
     <div className="space-y-3">
@@ -87,19 +95,23 @@ function PropertyEditor({ nodeId }: { nodeId: string }) {
         </label>
       )}
 
+      {spec.providerId && d.kind !== "mask-redraw" && selectedModelId && (
+        <ModelControls
+          nodeId={nodeId}
+          modelId={selectedModelId}
+          modelOptions={selectedModelOptions}
+          preferredAspectRatio={"aspectRatio" in d && typeof d.aspectRatio === "string" ? d.aspectRatio : undefined}
+          disabled={isNodeRunActive(d.status)}
+        />
+      )}
+
       {spec.providerId && (
-        <button
-          type="button"
+        <RunButton
+          status={d.status}
           onClick={() => void runNode(nodeId)}
-          disabled={d.status === "running" || d.status === "queued"}
-          className={`w-full rounded-md px-3 py-1.5 text-xs font-medium hover:opacity-90 ${
-            d.status === "running" || d.status === "queued"
-              ? "btn-running-breathe bg-[#3a3226] text-gold"
-              : "bg-gold text-ink disabled:opacity-40"
-          }`}
-        >
-          {d.status === "queued" ? "排队中…" : d.status === "running" ? "显影中…" : "运行此节点"}
-        </button>
+          onCancel={() => void cancelNodeRun(nodeId)}
+          label="运行此节点"
+        />
       )}
     </div>
   );
@@ -114,14 +126,22 @@ function ResultRecordDetail({ resultId }: { resultId: string }) {
   const statusText: Record<RecentResult["status"], string> = {
     queued: "排队中",
     running: "生成中",
+    retry_wait: "等待重试",
+    cancel_requested: "取消请求中",
     success: "成功",
     error: "失败",
+    outcome_unknown: "结果未知",
+    cancelled: "已取消",
   };
   const statusColor: Record<RecentResult["status"], string> = {
     queued: "text-yellow-400",
     running: "text-blue-400",
+    retry_wait: "text-amber-400",
+    cancel_requested: "text-orange-400",
     success: "text-emerald-400",
     error: "text-red-400",
+    outcome_unknown: "text-orange-500",
+    cancelled: "text-neutral-500",
   };
 
   return (
@@ -162,6 +182,12 @@ function ResultRecordDetail({ resultId }: { resultId: string }) {
           <div className="flex justify-between">
             <dt className="text-neutral-500">模型</dt>
             <dd className="font-mono text-neutral-300">{record.model}</dd>
+          </div>
+        )}
+        {record.providerOutputSize && (
+          <div className="flex justify-between">
+            <dt className="text-neutral-500">上游实际尺寸</dt>
+            <dd className="font-mono text-neutral-300">{record.providerOutputSize}</dd>
           </div>
         )}
         <div className="flex justify-between">

@@ -77,34 +77,21 @@ await test("文生图同样补足数量，不只修复图生图节点", async ()
   assert.equal(calls, 2);
 });
 
-await test("模型路由临时不可用时退避重试，恢复后不留下失败卡片", async () => {
+await test("明确 429 交由持久队列重试，精确批量层只调用一次", async () => {
   let calls = 0;
   const provider: AIProvider = {
     id: "stub",
     async generate() {
       calls += 1;
-      if (calls === 1) {
-        throw new ProviderError(
-          "当前 AI 模型不可用，请联系管理员检查模型配置",
-          404,
-          "stub",
-          "model_unavailable",
-          'HTTP 404: {"error":{"message":"model temporarily not available"}}',
-        );
-      }
-      return { images: ["recovered"], model: "stub-model" };
+      throw new ProviderError("AI 服务当前繁忙，请稍后重试", 429, "stub", "rate_limited");
     },
     async edit() { throw new Error("unexpected edit"); },
   };
-  const result = await generateExactImages(
-    provider,
-    { prompt: "重试" },
-    1,
-    { runId: "run-test", transientRetryDelaysMs: [0, 0] },
+  await assert.rejects(
+    () => generateExactImages(provider, { prompt: "重试" }, 1, { runId: "run-test" }),
+    (error: unknown) => error instanceof ProviderError && error.status === 429,
   );
-  assert.equal(calls, 2);
-  assert.deepEqual(result.images, ["recovered"]);
-  assert.deepEqual(result.failures, []);
+  assert.equal(calls, 1);
 });
 
 await test("永久参数错误仍立即停止，不额外产生消耗", async () => {
@@ -118,7 +105,7 @@ await test("永久参数错误仍立即停止，不额外产生消耗", async ()
     async edit() { throw new Error("unexpected edit"); },
   };
   await assert.rejects(
-    generateExactImages(provider, { prompt: "错误参数" }, 1, { transientRetryDelaysMs: [0, 0] }),
+    generateExactImages(provider, { prompt: "错误参数" }, 1),
     /参数错误/,
   );
   assert.equal(calls, 1);
@@ -177,6 +164,29 @@ await test("部分成功保留图片并明确记录 N/M", async () => {
   const result = await generateExactImages(provider, { prompt: "四张" }, 4);
   assert.deepEqual(result.images, ["ok-1", "ok-2"]);
   assert.ok(result.failures.some((message) => message.includes("2/4")));
+});
+
+await test("部分成功后若后续请求结果未知，整步进入未知状态而不是伪装成功", async () => {
+  let calls = 0;
+  const provider: AIProvider = {
+    id: "stub",
+    async generate() {
+      calls += 1;
+      if (calls === 1) return { images: ["known-image"], model: "stub-model" };
+      throw new ProviderError(
+        "AI 请求已超时，结果可能已经生成；为避免重复计费，系统不会自动重试",
+        504,
+        "stub",
+        "outcome_unknown",
+      );
+    },
+    async edit() { throw new Error("unexpected edit"); },
+  };
+  await assert.rejects(
+    () => generateExactImages(provider, { prompt: "两张" }, 2),
+    (error: unknown) => error instanceof ProviderError && error.category === "outcome_unknown",
+  );
+  assert.equal(calls, 2);
 });
 
 await test("五种用户画幅均输出精确像素尺寸和比例", async () => {

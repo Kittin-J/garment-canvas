@@ -1,5 +1,7 @@
 # 灵眸 GPT Image 2 接口基准
 
+> 已弃用：本文描述灵眸网关，不适用于当前 API易接入。新实现必须以 docs/ai/apiyi/README.md、model-contracts.json 和对应模型文档为准。
+
 来源：https://docs.lmuai.com/docs/api/gpt-image
 最后核对：2026-08-15（上游文档标注最后更新 2026-07-26）
 

@@ -2,6 +2,8 @@ import { useState } from "react";
 import { useFlowStore } from "@/store/flowStore";
 import { OPEN_COMPARE_EVENT } from "@/components/CompareOverlay";
 import { thumbnailImageUrl } from "@/lib/images";
+import { isNodeRunActive } from "@/types/workflow";
+import { STATUS_TEXT } from "@/components/nodes/NodeFrame";
 
 interface ResultsPanelProps {
   hasMore?: boolean;
@@ -19,13 +21,14 @@ export function ResultsPanel({ hasMore = false, loadingMore = false, onLoadMore 
   const toggleCompareId = useFlowStore((s) => s.toggleCompareId);
   const openViewer = useFlowStore((s) => s.openViewer);
   const [collapsed, setCollapsed] = useState(false);
+  const resultCardClass = "h-20 w-20 sm:h-24 sm:w-24";
 
   return (
     <div className="gc-panel shrink-0 border-t border-[#262626] bg-[#141414]">
       <button
         type="button"
         onClick={() => setCollapsed((c) => !c)}
-        className="flex w-full items-center gap-2 px-4 py-2 text-left"
+        className="flex min-w-0 w-full items-center gap-2 px-3 py-2 text-left sm:px-4"
       >
         <span
           className={`inline-block text-[10px] text-neutral-500 transition-transform ${collapsed ? "" : "rotate-90"}`}
@@ -36,7 +39,7 @@ export function ResultsPanel({ hasMore = false, loadingMore = false, onLoadMore 
           最近生成
         </span>
         <span className="text-[10px] text-neutral-600">{recentResults.length} 条</span>
-        <span className="ml-auto flex items-center gap-3">
+        <span className="ml-auto flex min-w-0 shrink-0 items-center gap-3">
           {compareIds.length >= 2 && (
             <span
               role="button"
@@ -56,13 +59,13 @@ export function ResultsPanel({ hasMore = false, loadingMore = false, onLoadMore 
               对比 {compareIds.length} 张
             </span>
           )}
-          <span className="text-[9px] text-neutral-700">
+          <span className="hidden text-[9px] text-neutral-700 sm:inline">
             点击状态卡看记录 · 成功图可查看/对比
           </span>
         </span>
       </button>
       {!collapsed && (
-        <div className="max-h-40 overflow-y-auto px-4 pb-3">
+        <div className="max-h-40 overflow-y-auto px-3 pb-3 sm:px-4">
           {recentResults.length === 0 ? (
             <p className="py-3 text-center text-[10px] text-neutral-600">
               运行 AI 节点后，生成结果与运行记录会汇总在这里
@@ -70,39 +73,43 @@ export function ResultsPanel({ hasMore = false, loadingMore = false, onLoadMore 
           ) : (
             <div className="flex flex-wrap gap-2">
               {recentResults.map((r) =>
-                r.status === "queued" || r.status === "running" ? (
+                isNodeRunActive(r.status) ? (
                   <button
                     key={r.id}
                     type="button"
                     onClick={() => setSelectedResultId(r.id)}
-                    className={`flex h-24 w-24 flex-col items-center justify-center gap-2 rounded-md border bg-[#0f0f0f] px-1 ${
+                    className={`flex ${resultCardClass} flex-col items-center justify-center gap-2 rounded-md border bg-[#0f0f0f] px-1 ${
                       selectedResultId === r.id
                         ? "border-gold"
                         : "border-[#3a3226] hover:border-gold/60"
                     }`}
-                    title={r.status === "queued" ? "任务排队中" : "图片生成中"}
+                    title={STATUS_TEXT[r.status]}
                   >
                     <span className="h-5 w-5 animate-spin rounded-full border-2 border-gold/30 border-t-gold" />
                     <span className="text-[10px] text-gold">
-                      {r.status === "queued" ? "排队中" : "生成中"}
+                      {STATUS_TEXT[r.status]}
                     </span>
                     <span className="w-full truncate text-center text-[9px] text-neutral-500">
                       {r.nodeLabel}
                     </span>
                   </button>
-                ) : r.status === "error" ? (
+                ) : r.status !== "success" ? (
                   <button
                     key={r.id}
                     type="button"
                     onClick={() => setSelectedResultId(r.id)}
-                    className={`flex h-24 w-24 flex-col items-center justify-center gap-1 rounded-md border bg-[#0f0f0f] px-1 ${
+                    className={`flex ${resultCardClass} flex-col items-center justify-center gap-1 rounded-md border bg-[#0f0f0f] px-1 ${
                       selectedResultId === r.id
-                        ? "border-red-400"
-                        : "border-red-900/50 hover:border-red-400/60"
+                        ? r.status === "cancelled" ? "border-neutral-500" : "border-red-400"
+                        : r.status === "cancelled"
+                          ? "border-neutral-700 hover:border-neutral-500"
+                          : "border-red-900/50 hover:border-red-400/60"
                     }`}
-                    title={r.error ?? "生成失败"}
+                    title={r.error ?? STATUS_TEXT[r.status]}
                   >
-                    <span className="text-[10px] text-red-400">✕ 失败</span>
+                    <span className={`text-[10px] ${r.status === "cancelled" ? "text-neutral-500" : "text-red-400"}`}>
+                      {STATUS_TEXT[r.status]}
+                    </span>
                     <span className="w-full truncate text-center text-[9px] text-neutral-500">
                       {r.nodeLabel}
                     </span>
@@ -137,7 +144,7 @@ export function ResultsPanel({ hasMore = false, loadingMore = false, onLoadMore 
                       alt={r.nodeLabel}
                       loading="lazy"
                       decoding="async"
-                      className="h-24 w-24 object-cover transition-transform group-hover:scale-105"
+                      className={`${resultCardClass} object-cover transition-transform group-hover:scale-105`}
                     />
                     {compareIds.includes(r.id) && (
                       <span className="absolute right-1 top-1 flex h-4 w-4 items-center justify-center rounded-full bg-gold text-[9px] font-bold text-ink">
@@ -152,7 +159,7 @@ export function ResultsPanel({ hasMore = false, loadingMore = false, onLoadMore 
                   type="button"
                   onClick={onLoadMore}
                   disabled={loadingMore}
-                  className="h-24 w-24 rounded-md border border-dashed border-[var(--gc-border)] text-[10px] text-[var(--gc-text-muted)] hover:border-[var(--gc-accent)] hover:text-[var(--gc-accent)] disabled:opacity-50"
+                  className={`${resultCardClass} rounded-md border border-dashed border-[var(--gc-border)] text-[10px] text-[var(--gc-text-muted)] hover:border-[var(--gc-accent)] hover:text-[var(--gc-accent)] disabled:opacity-50`}
                 >
                   {loadingMore ? "加载中…" : "加载更多"}
                 </button>

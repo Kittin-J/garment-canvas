@@ -9,6 +9,7 @@ const KIND_COLOR: Record<NodeKind, string> = {
   upscale: "#4FA37C",
   "print-extract": "#E8935A",
   "print-mutate": "#5AA8E8",
+  "mask-redraw": "#E05252",
   result: "#6E6E6E",
 };
 

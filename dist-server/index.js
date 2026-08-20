@@ -32,36 +32,10 @@ function required(name) {
   if (!v) throw new Error(`Missing required env var: ${name} (see .env.example)`);
   return v;
 }
-function booleanEnv(name, fallback) {
-  const value = process.env[name]?.trim().toLowerCase();
-  if (value === void 0 || value === "") return fallback;
-  return value === "true" || value === "1" || value === "yes";
-}
-function boundedIntegerEnv(name, fallback, min, max) {
-  const value = Number(process.env[name]);
-  return Number.isInteger(value) ? Math.max(min, Math.min(max, value)) : fallback;
-}
 var config = {
-  /** change2pro 中转站 */
-  change2proBaseUrl: () => (process.env.CHANGE2PRO_BASE_URL ?? "https://your-change2pro-host/v1").replace(/\/+$/, ""),
-  change2proApiKey: () => required("CHANGE2PRO_API_KEY"),
-  /** nanobanana 可用独立 Key（如中转站按平台分组发 Key），缺省回退主 Key */
-  nanobananaApiKey: () => process.env.NANOBANANA_API_KEY || required("CHANGE2PRO_API_KEY"),
-  // 不再假定任意 OpenAI 兼容网关都存在某个固定模型；部署必须明确声明模型 ID。
-  nanobananaModel: () => required("NANOBANANA_MODEL"),
-  image2Model: () => required("IMAGE2_MODEL"),
-  nanobananaCapabilities: () => ({
-    supportsBatchN: booleanEnv("NANOBANANA_SUPPORTS_N", false),
-    maxBatchSize: boundedIntegerEnv("NANOBANANA_MAX_BATCH", 1, 1, 4),
-    supportsMultiReference: booleanEnv("NANOBANANA_SUPPORTS_MULTI_REFERENCE", true),
-    maxReferenceImages: boundedIntegerEnv("NANOBANANA_MAX_REFERENCE_IMAGES", 8, 1, 8)
-  }),
-  image2Capabilities: () => ({
-    supportsBatchN: booleanEnv("IMAGE2_SUPPORTS_N", false),
-    maxBatchSize: boundedIntegerEnv("IMAGE2_MAX_BATCH", 1, 1, 4),
-    supportsMultiReference: booleanEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", true),
-    maxReferenceImages: boundedIntegerEnv("IMAGE2_MAX_REFERENCE_IMAGES", 8, 1, 8)
-  }),
+  /** API易图片接口；路径由本地模型知识库逐模型声明。 */
+  apiyiBaseUrl: () => (process.env.APIYI_BASE_URL ?? "https://api.apiyi.com").replace(/\/+$/, ""),
+  apiyiApiKey: () => required("APIYI_API_KEY"),
   port: () => Number(process.env.PORT ?? 3001),
   dataDir: () => path.resolve(ROOT_DIR, process.env.DATA_DIR ?? "./data"),
   databaseUrl: () => process.env.DATABASE_URL?.trim() || void 0,
@@ -77,14 +51,12 @@ var config = {
   /** 生产模式是否只提供 API；true 时不要求或托管前端 dist。 */
   apiOnly: () => process.env.API_ONLY === "true",
   /** AI 调用超时（中转站网关限制，可配） */
-  aiTimeoutMs: () => Number(process.env.AI_TIMEOUT_MS ?? 3e5),
-  /** 失败重试次数（不含首次） */
-  aiMaxRetries: () => Number(process.env.AI_MAX_RETRIES ?? 2),
+  aiTimeoutMs: (fallback = 3e5) => Number(process.env.AI_TIMEOUT_MS ?? fallback),
   /** 不发外部请求的 AI 配置就绪检查，供 readiness 使用。 */
   aiConfigReady: () => {
-    const key = process.env.CHANGE2PRO_API_KEY || process.env.NANOBANANA_API_KEY;
-    const baseUrl = process.env.CHANGE2PRO_BASE_URL ?? "";
-    if (!key || !baseUrl || /your-change2pro-host/i.test(baseUrl) || !process.env.IMAGE2_MODEL?.trim() || !process.env.NANOBANANA_MODEL?.trim()) return false;
+    const key = process.env.APIYI_API_KEY?.trim();
+    const baseUrl = config.apiyiBaseUrl();
+    if (!key) return false;
     try {
       const url = new URL(baseUrl);
       return url.protocol === "https:";
@@ -100,7 +72,7 @@ import { Router } from "express";
 // src/types/workflow.ts
 var MAX_REFERENCE_IMAGES = 8;
 var BATCH_SIZES = [1, 2, 4, 8];
-var WORKFLOW_SCHEMA_VERSION = 1;
+var WORKFLOW_SCHEMA_VERSION = 2;
 var NODE_SPECS = {
   "image-input": {
     kind: "image-input",
@@ -112,24 +84,24 @@ var NODE_SPECS = {
   "sketch-to-render": {
     kind: "sketch-to-render",
     title: "\u8349\u56FE\u2192\u6548\u679C\u56FE",
-    description: "AI \u5C06\u7EBF\u7A3F\u6E32\u67D3\u4E3A\u670D\u88C5\u6548\u679C\u56FE",
-    providerId: "gpt-image-2",
+    description: "\u9009\u62E9\u6A21\u578B\uFF0C\u5C06\u7EBF\u7A3F\u6E32\u67D3\u4E3A\u670D\u88C5\u6548\u679C\u56FE",
+    providerId: "apiyi",
     inputs: MAX_REFERENCE_IMAGES,
     outputs: "images"
   },
   "ai-modify": {
     kind: "ai-modify",
     title: "AI \u6539\u6B3E",
-    description: "gpt-image-2 \u6539\u9886\u578B/\u8896\u578B/\u957F\u5EA6/\u7EC6\u8282",
-    providerId: "gpt-image-2",
+    description: "\u9009\u62E9\u6A21\u578B\u4FEE\u6539\u9886\u578B\u3001\u8896\u578B\u3001\u957F\u5EA6\u4E0E\u7EC6\u8282",
+    providerId: "apiyi",
     inputs: MAX_REFERENCE_IMAGES,
     outputs: "images"
   },
   "fabric-recolor": {
     kind: "fabric-recolor",
     title: "\u9762\u6599/\u914D\u8272\u66FF\u6362",
-    description: "gpt-image-2 \u66FF\u6362\u9762\u6599\u7EB9\u7406\u4E0E\u914D\u8272",
-    providerId: "gpt-image-2",
+    description: "\u9009\u62E9\u6A21\u578B\u66FF\u6362\u9762\u6599\u7EB9\u7406\u4E0E\u914D\u8272",
+    providerId: "apiyi",
     inputs: MAX_REFERENCE_IMAGES,
     outputs: "images"
   },
@@ -137,23 +109,31 @@ var NODE_SPECS = {
     kind: "upscale",
     title: "\u9AD8\u6E05\u653E\u5927",
     description: "AI \u653E\u5927\u81F3 2K/4K\uFF0C\u7CBE\u4FEE\u7EC6\u8282",
-    providerId: "gpt-image-2",
+    providerId: "apiyi",
     inputs: 1,
     outputs: "images"
   },
   "print-extract": {
     kind: "print-extract",
     title: "\u5370\u82B1\u63D0\u53D6",
-    description: "gpt-image-2 \u4ECE\u670D\u88C5\u4E0A\u62A0\u51FA\u5370\u82B1\uFF0C\u5E73\u94FA\u5C55\u5F00\u5B58\u7D20\u6750",
-    providerId: "gpt-image-2",
+    description: "\u9009\u62E9\u6A21\u578B\u4ECE\u670D\u88C5\u4E0A\u63D0\u53D6\u5370\u82B1\u5E76\u5E73\u94FA\u5C55\u5F00",
+    providerId: "apiyi",
     inputs: MAX_REFERENCE_IMAGES,
     outputs: "images"
   },
   "print-mutate": {
     kind: "print-mutate",
     title: "\u5370\u82B1\u88C2\u53D8",
-    description: "gpt-image-2 \u57FA\u4E8E\u5370\u82B1\u751F\u6210 1~8 \u5F20\u98CE\u683C\u4E00\u81F4\u7684\u53D8\u4F53",
-    providerId: "gpt-image-2",
+    description: "\u9009\u62E9\u6A21\u578B\u751F\u6210 1~8 \u5F20\u98CE\u683C\u4E00\u81F4\u7684\u5370\u82B1\u53D8\u4F53",
+    providerId: "apiyi",
+    inputs: MAX_REFERENCE_IMAGES,
+    outputs: "images"
+  },
+  "mask-redraw": {
+    kind: "mask-redraw",
+    title: "\u8499\u7248\u5C40\u90E8\u91CD\u7ED8",
+    description: "\u7528 GPT Image 2 \u53EA\u4FEE\u6539\u8499\u7248\u9009\u4E2D\u7684\u533A\u57DF",
+    providerId: "apiyi",
     inputs: MAX_REFERENCE_IMAGES,
     outputs: "images"
   },
@@ -167,8 +147,294 @@ var NODE_SPECS = {
 };
 
 // server/engine/runner.ts
-import { EventEmitter } from "node:events";
 import { nanoid as nanoid4 } from "nanoid";
+
+// server/providers/apiyi.ts
+import sharp2 from "sharp";
+
+// docs/ai/apiyi/model-contracts.json
+var model_contracts_default = {
+  schemaVersion: 2,
+  reviewedOn: "2026-08-20",
+  baseUrl: "https://api.apiyi.com",
+  runtime: {
+    upstreamMode: "synchronous",
+    businessQueue: "postgresql",
+    retryableHttpStatuses: [429, 503],
+    maxAutomaticRetries: 2,
+    ambiguousTransportFailure: "outcome_unknown",
+    persistTemporaryUrlsImmediately: true
+  },
+  inputNormalization: {
+    acceptedMimeTypes: ["image/png", "image/jpeg", "image/webp", "image/gif"],
+    outputMimeTypes: ["image/png", "image/jpeg"],
+    maxInputBytes: 20971520,
+    maxInputPixels: 4e7,
+    maxLongEdge: 4096,
+    targetBytes: 15e5,
+    jpegQuality: { initial: 92, minimum: 80 },
+    animationPolicy: "first-frame",
+    applyExifOrientation: true,
+    outputColourspace: "srgb",
+    preserveMeaningfulAlpha: true
+  },
+  models: [
+    {
+      id: "gpt-image-2",
+      upstreamModelId: "gpt-image-2",
+      label: "GPT Image 2 \u5C40\u90E8\u91CD\u7ED8",
+      channel: "official",
+      allowedNodeKinds: ["mask-redraw"],
+      timeoutMs: 36e4,
+      generation: null,
+      edit: {
+        path: "/v1/images/edits",
+        contentType: "multipart/form-data",
+        minReferences: 1,
+        maxReferences: 8,
+        singleImageField: "image[]",
+        multipleImageField: "image[]",
+        mask: {
+          required: true,
+          mimeTypes: ["image/png"],
+          maxBytes: 4194304,
+          requiresAlpha: true,
+          mustMatchFirstImageDimensions: true,
+          editableAlpha: 0,
+          preservedAlpha: 255
+        }
+      },
+      forbiddenParameters: ["input_fidelity", "response_format"],
+      output: { kind: "openai-image", fields: ["b64_json"], maxImages: 1 }
+    },
+    {
+      id: "gpt-image-2-vip",
+      upstreamModelId: "gpt-image-2-vip",
+      label: "GPT Image 2 VIP",
+      channel: "reverse-codex",
+      allowedNodeKinds: ["image-generation"],
+      timeoutMs: 3e5,
+      generation: { path: "/v1/images/generations", contentType: "application/json" },
+      edit: { path: "/v1/images/edits", contentType: "multipart/form-data", minReferences: 1, maxReferences: 8, singleImageField: "image", multipleImageField: "image" },
+      sizes: ["auto", "1280x1280", "848x1280", "1280x848", "960x1280", "1280x960", "1024x1280", "1280x1024", "720x1280", "1280x720", "1280x544", "2048x2048", "1360x2048", "2048x1360", "1536x2048", "2048x1536", "1632x2048", "2048x1632", "1152x2048", "2048x1152", "2048x864", "2880x2880", "2336x3520", "3520x2336", "2480x3312", "3312x2480", "2560x3216", "3216x2560", "2160x3840", "3840x2160", "3840x1632"],
+      forbiddenParameters: ["quality", "n", "aspect_ratio"],
+      output: { kind: "openai-image", fields: ["b64_json", "url"], maxImages: 1 }
+    },
+    {
+      id: "gemini-3.1-flash-image",
+      upstreamModelId: "gemini-3.1-flash-image",
+      label: "Gemini 3.1 Flash Image",
+      channel: "official",
+      allowedNodeKinds: ["image-generation"],
+      timeoutMs: 36e4,
+      generation: { path: "/v1beta/models/{model}:generateContent", contentType: "application/json" },
+      edit: { path: "/v1beta/models/{model}:generateContent", contentType: "application/json", minReferences: 1, maxReferences: 8 },
+      aspectRatios: ["1:1", "1:4", "4:1", "1:8", "8:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
+      imageSizes: ["512", "1K", "2K", "4K"],
+      output: { kind: "gemini-parts", fields: ["inlineData"], scanAllParts: true }
+    },
+    {
+      id: "flux-2-pro",
+      upstreamModelId: "flux-2-pro",
+      label: "FLUX.2 Pro",
+      channel: "official",
+      allowedNodeKinds: ["image-generation"],
+      timeoutMs: 12e4,
+      generation: { path: "/v1/images/generations", contentType: "application/json" },
+      edit: { path: "/v1/images/generations", contentType: "application/json", minReferences: 1, maxReferences: 8 },
+      dimensions: { multipleOf: 16, minSide: 64, maxPixels: 4194304 },
+      outputFormats: ["jpeg", "png"],
+      forbiddenParameters: ["n"],
+      output: { kind: "openai-image", fields: ["url"], maxImages: 1, urlTtlSeconds: 600 }
+    },
+    {
+      id: "seedream-5-0-260128",
+      upstreamModelId: "seedream-5-0-260128",
+      label: "Seedream 5.0",
+      channel: "official",
+      allowedNodeKinds: ["image-generation"],
+      timeoutMs: 12e4,
+      generation: { path: "/v1/images/generations", contentType: "application/json" },
+      edit: { path: "/v1/images/generations", contentType: "application/json", minReferences: 1, maxReferences: 8 },
+      sizes: ["2K", "3K"],
+      requiredParameters: { watermark: false, sequential_image_generation: "disabled" },
+      forbiddenParameters: ["n"],
+      output: { kind: "openai-image", fields: ["url", "b64_json"], recordActualSize: true }
+    },
+    {
+      id: "grok-imagine-image",
+      upstreamModelId: "grok-imagine-image",
+      label: "Grok Imagine 2",
+      channel: "official",
+      allowedNodeKinds: ["image-generation"],
+      timeoutMs: 36e4,
+      generation: { path: "/v1/images/generations", contentType: "application/json" },
+      edit: { path: "/v1/images/edits", contentType: "multipart/form-data", minReferences: 1, maxReferences: 4, singleImageField: "image", multipleImageField: "image[]", firstReferenceControlsDimensions: true },
+      aspectRatios: ["1:1", "16:9", "9:16", "4:3", "3:4"],
+      resolutions: ["1k", "2k"],
+      outputCounts: { min: 1, max: 10 },
+      output: { kind: "openai-image", fields: ["url", "b64_json"], usageIsAccountingSource: false }
+    }
+  ]
+};
+
+// src/types/imageModels.ts
+var IMAGE_MODEL_IDS = [
+  "gpt-image-2",
+  "gpt-image-2-vip",
+  "gemini-3.1-flash-image",
+  "flux-2-pro",
+  "seedream-5-0-260128",
+  "grok-imagine-image"
+];
+var rawModels = model_contracts_default.models;
+var contractMap = new Map(rawModels.map((model) => [model.id, model]));
+for (const id of IMAGE_MODEL_IDS) {
+  if (!contractMap.has(id)) throw new Error(`API\u6613\u6A21\u578B\u77E5\u8BC6\u5E93\u7F3A\u5C11\u5951\u7EA6: ${id}`);
+}
+if (contractMap.size !== IMAGE_MODEL_IDS.length) {
+  throw new Error("API\u6613\u6A21\u578B\u77E5\u8BC6\u5E93\u4E0E\u5E94\u7528\u6A21\u578B\u6E05\u5355\u4E0D\u4E00\u81F4");
+}
+var DEFAULT_GENERATION_MODEL_ID = "gpt-image-2-vip";
+var MASK_REDRAW_MODEL_ID = "gpt-image-2";
+var GENERATION_IMAGE_MODEL_IDS = IMAGE_MODEL_IDS.filter(
+  (id) => id !== MASK_REDRAW_MODEL_ID
+);
+function isImageModelId(value) {
+  return typeof value === "string" && IMAGE_MODEL_IDS.includes(value);
+}
+function getImageModelContract(id) {
+  return contractMap.get(id);
+}
+function isModelAllowedForNode(modelId, nodeKind) {
+  return nodeKind === "mask-redraw" ? modelId === MASK_REDRAW_MODEL_ID : modelId !== MASK_REDRAW_MODEL_ID;
+}
+var VIP_SIZE_BY_RATIO = {
+  "1:1": "2048x2048",
+  "2:3": "1360x2048",
+  "3:2": "2048x1360",
+  "3:4": "1536x2048",
+  "4:3": "2048x1536",
+  "4:5": "1632x2048",
+  "5:4": "2048x1632",
+  "9:16": "1152x2048",
+  "16:9": "2048x1152",
+  "21:9": "2048x864"
+};
+var FLUX_DIMENSIONS_BY_RATIO = {
+  "1:1": { width: 2048, height: 2048 },
+  "2:3": { width: 1360, height: 2040 },
+  "3:2": { width: 2040, height: 1360 },
+  "3:4": { width: 1536, height: 2048 },
+  "4:3": { width: 2048, height: 1536 },
+  "4:5": { width: 1632, height: 2040 },
+  "5:4": { width: 2040, height: 1632 },
+  "9:16": { width: 1152, height: 2048 },
+  "16:9": { width: 2048, height: 1152 },
+  "21:9": { width: 2016, height: 864 }
+};
+function defaultImageModelOptions(modelId, preferredAspectRatio = "1:1") {
+  switch (modelId) {
+    case "gpt-image-2":
+      return {};
+    case "gpt-image-2-vip":
+      return { size: VIP_SIZE_BY_RATIO[preferredAspectRatio] ?? VIP_SIZE_BY_RATIO["1:1"] };
+    case "gemini-3.1-flash-image": {
+      const allowed = getImageModelContract(modelId).aspectRatios ?? [];
+      return {
+        aspectRatio: allowed.includes(preferredAspectRatio) ? preferredAspectRatio : "1:1",
+        imageSize: "2K"
+      };
+    }
+    case "flux-2-pro": {
+      const dimensions = FLUX_DIMENSIONS_BY_RATIO[preferredAspectRatio] ?? FLUX_DIMENSIONS_BY_RATIO["1:1"];
+      return { ...dimensions, outputFormat: "png" };
+    }
+    case "seedream-5-0-260128":
+      return { size: "2K" };
+    case "grok-imagine-image": {
+      const allowed = getImageModelContract(modelId).aspectRatios ?? [];
+      return {
+        aspectRatio: allowed.includes(preferredAspectRatio) ? preferredAspectRatio : "1:1",
+        resolution: "2k"
+      };
+    }
+  }
+}
+function objectValue(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : {};
+}
+function normalizeImageModelOptions(modelId, value, preferredAspectRatio = "1:1") {
+  const raw = objectValue(value);
+  const defaults = defaultImageModelOptions(modelId, preferredAspectRatio);
+  switch (modelId) {
+    case "gpt-image-2":
+      return {};
+    case "gpt-image-2-vip": {
+      const sizes = getImageModelContract(modelId).sizes ?? [];
+      return { size: typeof raw.size === "string" && sizes.includes(raw.size) ? raw.size : defaults.size };
+    }
+    case "gemini-3.1-flash-image": {
+      const contract = getImageModelContract(modelId);
+      return {
+        aspectRatio: typeof raw.aspectRatio === "string" && contract.aspectRatios?.includes(raw.aspectRatio) ? raw.aspectRatio : defaults.aspectRatio,
+        imageSize: typeof raw.imageSize === "string" && contract.imageSizes?.includes(raw.imageSize) ? raw.imageSize : defaults.imageSize
+      };
+    }
+    case "flux-2-pro": {
+      const dimensions = getImageModelContract(modelId).dimensions;
+      const width = Number(raw.width);
+      const height = Number(raw.height);
+      const validDimensions = Number.isInteger(width) && Number.isInteger(height) && width >= dimensions.minSide && height >= dimensions.minSide && width % dimensions.multipleOf === 0 && height % dimensions.multipleOf === 0 && width * height <= dimensions.maxPixels;
+      const outputFormat = raw.outputFormat === "jpeg" || raw.outputFormat === "png" ? raw.outputFormat : defaults.outputFormat;
+      return validDimensions ? { width, height, outputFormat } : defaults;
+    }
+    case "seedream-5-0-260128": {
+      const sizes = getImageModelContract(modelId).sizes ?? [];
+      return { size: typeof raw.size === "string" && sizes.includes(raw.size) ? raw.size : defaults.size };
+    }
+    case "grok-imagine-image": {
+      const contract = getImageModelContract(modelId);
+      return {
+        aspectRatio: typeof raw.aspectRatio === "string" && contract.aspectRatios?.includes(raw.aspectRatio) ? raw.aspectRatio : defaults.aspectRatio,
+        resolution: typeof raw.resolution === "string" && contract.resolutions?.includes(raw.resolution) ? raw.resolution : defaults.resolution
+      };
+    }
+  }
+}
+function imageModelOptionsError(modelId, value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return "must be an object";
+  const raw = value;
+  const normalized = normalizeImageModelOptions(modelId, raw);
+  const allowedKeys = {
+    "gpt-image-2": [],
+    "gpt-image-2-vip": ["size"],
+    "gemini-3.1-flash-image": ["aspectRatio", "imageSize"],
+    "flux-2-pro": ["width", "height", "outputFormat"],
+    "seedream-5-0-260128": ["size"],
+    "grok-imagine-image": ["aspectRatio", "resolution"]
+  };
+  const unknown = Object.keys(raw).find((key) => !allowedKeys[modelId].includes(key));
+  if (unknown) return `contains unsupported parameter ${unknown}`;
+  const normalizedEntries = Object.entries(normalized);
+  if (Object.keys(raw).length !== normalizedEntries.length) {
+    return "contains an unsupported or incomplete model option";
+  }
+  if (normalizedEntries.some(([key, expected]) => raw[key] !== expected)) {
+    return "contains an unsupported or incomplete model option";
+  }
+  return void 0;
+}
+function modelMaxReferenceImages(modelId) {
+  return Math.min(8, getImageModelContract(modelId).edit.maxReferences);
+}
+function modelMaximumImagesPerRequest(modelId) {
+  if (modelId === "grok-imagine-image") return getImageModelContract(modelId).outputCounts?.max ?? 1;
+  return getImageModelContract(modelId).output.maxImages ?? 1;
+}
+
+// server/lib/maskProcessing.ts
+import sharp from "sharp";
 
 // server/providers/base.ts
 var ProviderError = class extends Error {
@@ -193,7 +459,7 @@ function classifyProviderMessage(status, rawMessage) {
       publicMessage: "AI \u7F51\u5173\u9274\u6743\u5931\u8D25\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u68C0\u67E5 API Key \u6216\u8D26\u53F7\u6743\u9650"
     };
   }
-  const contentRefused = /content\s*(policy|filter)|content management policy|responsible\s*ai\s*policy\s*violation/i.test(message) || /(safety system|moderation).{0,50}(block|filter|reject|refus)/i.test(message) || /(block|filter|reject|refus).{0,50}(safety system|moderation|content management policy)/i.test(message) || /内容.{0,12}(安全|审核|政策|过滤).{0,12}(拦截|过滤|拒绝|违规)|内容.{0,10}(拒绝|违规)/i.test(message);
+  const contentRefused = /content\s*(policy|filter)|content management policy|responsible\s*ai\s*policy\s*violation|responsibleaipolicyviolation/i.test(message) || /(safety system|moderation).{0,50}(block|filter|reject|refus)/i.test(message) || /(block|filter|reject|refus).{0,50}(safety system|moderation|content management policy)/i.test(message) || /内容.{0,12}(安全|审核|政策|过滤).{0,12}(拦截|过滤|拒绝|违规)|内容.{0,10}(拒绝|违规)/i.test(message);
   if (contentRefused) {
     return {
       category: "content_refused",
@@ -204,6 +470,13 @@ function classifyProviderMessage(status, rawMessage) {
     return {
       category: "model_unavailable",
       publicMessage: "\u5F53\u524D AI \u6A21\u578B\u4E0D\u53EF\u7528\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u68C0\u67E5\u6A21\u578B\u914D\u7F6E"
+    };
+  }
+  const deterministicParameterError = /(invalid|unknown|unsupported|not supported|out of range).{0,60}(parameter|argument|field|resolution|aspect ratio|size|width|height|format|image count)/i.test(message) || /(parameter|argument|field|resolution|aspect ratio|size|width|height|format|image count).{0,60}(invalid|unknown|unsupported|not supported|out of range|must be|only supports?)/i.test(message);
+  if (deterministicParameterError) {
+    return {
+      category: "invalid_request",
+      publicMessage: "AI \u670D\u52A1\u6682\u4E0D\u652F\u6301\u5F53\u524D\u53C2\u6570\u6216\u53C2\u8003\u56FE\u7EC4\u5408\uFF0C\u8BF7\u8C03\u6574\u540E\u91CD\u8BD5"
     };
   }
   if (status === 429) {
@@ -257,12 +530,6 @@ function sanitizedProviderDiagnostic(error) {
     return `HTTP ${match[1]}: ${redact(match[2])}`;
   }
 }
-var NotImplementedError = class extends ProviderError {
-  constructor(feature) {
-    super(`Not implemented: ${feature}`);
-    this.name = "NotImplementedError";
-  }
-};
 async function fetchWithRetry(url, initFactory, opts) {
   let parsedUrl;
   try {
@@ -280,54 +547,28 @@ async function fetchWithRetry(url, initFactory, opts) {
     );
   }
   const timeoutMs = opts?.timeoutMs ?? config.aiTimeoutMs();
-  const maxRetries = opts?.maxRetries ?? config.aiMaxRetries();
-  let lastError;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (attempt > 0) {
-      await sleep(500 * 2 ** (attempt - 1));
+  void opts?.maxRetries;
+  try {
+    const res = await fetch(url, {
+      ...initFactory(),
+      signal: AbortSignal.timeout(timeoutMs)
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw providerErrorFromResponse(res.status, body, opts?.providerId);
     }
-    try {
-      const res = await fetch(url, {
-        ...initFactory(),
-        signal: AbortSignal.timeout(timeoutMs)
-      });
-      if (res.status >= 400 && res.status < 500) {
-        const body = await res.text().catch(() => "");
-        throw providerErrorFromResponse(res.status, body, opts?.providerId);
-      }
-      if (res.status >= 500) {
-        const body = await res.text().catch(() => "");
-        lastError = providerErrorFromResponse(res.status, body, opts?.providerId);
-        continue;
-      }
-      return res;
-    } catch (err) {
-      if (err instanceof ProviderError && err.status !== void 0 && err.status < 500) {
-        throw err;
-      }
-      lastError = err;
-    }
-  }
-  if (lastError instanceof ProviderError) throw lastError;
-  if (lastError instanceof Error && (lastError.name === "TimeoutError" || lastError.name === "AbortError")) {
+    return res;
+  } catch (error) {
+    if (error instanceof ProviderError) throw error;
+    const timedOut = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
     throw new ProviderError(
-      "AI \u670D\u52A1\u54CD\u5E94\u8D85\u65F6\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5",
-      504,
+      timedOut ? "AI \u8BF7\u6C42\u5DF2\u8D85\u65F6\uFF0C\u7ED3\u679C\u53EF\u80FD\u5DF2\u7ECF\u751F\u6210\uFF1B\u4E3A\u907F\u514D\u91CD\u590D\u8BA1\u8D39\uFF0C\u7CFB\u7EDF\u4E0D\u4F1A\u81EA\u52A8\u91CD\u8BD5" : "AI \u8FDE\u63A5\u4E2D\u65AD\uFF0C\u7ED3\u679C\u53EF\u80FD\u5DF2\u7ECF\u751F\u6210\uFF1B\u4E3A\u907F\u514D\u91CD\u590D\u8BA1\u8D39\uFF0C\u7CFB\u7EDF\u4E0D\u4F1A\u81EA\u52A8\u91CD\u8BD5",
+      timedOut ? 504 : 502,
       opts?.providerId,
-      "timeout",
-      lastError.message
+      "outcome_unknown",
+      error instanceof Error ? error.message : String(error)
     );
   }
-  throw new ProviderError(
-    "AI \u670D\u52A1\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5",
-    502,
-    opts?.providerId,
-    "gateway_unavailable",
-    lastError instanceof Error ? lastError.message : String(lastError)
-  );
-}
-function sleep(ms) {
-  return new Promise((r) => setTimeout(r, ms));
 }
 function parseDataUrl(dataUrl) {
   const m = /^data:([^;,]+)?(;base64)?,(.*)$/s.exec(dataUrl);
@@ -341,21 +582,6 @@ function parseDataUrl(dataUrl) {
 function toDataUrl(base64, mime = "image/png") {
   return `data:${mime};base64,${base64}`;
 }
-function aspectRatioToSize(aspectRatio) {
-  switch (aspectRatio) {
-    case "3:4":
-    case "9:16":
-      return "1024x1536";
-    case "4:3":
-    case "16:9":
-      return "1536x1024";
-    default:
-      return "1024x1024";
-  }
-}
-
-// server/providers/gptImagesResponse.ts
-import sharp from "sharp";
 
 // server/lib/imageProcessingLimit.ts
 var MAX_CONCURRENT_IMAGE_PROCESSING = 2;
@@ -450,362 +676,586 @@ function isLocalImageReference(value) {
   return /^\/api\/files\/[A-Za-z0-9_-]{1,128}\.(?:png|jpe?g|webp|gif)$/.test(value);
 }
 
-// server/providers/gptImagesResponse.ts
-var INVALID_IMAGE_RESPONSE_MESSAGE = "AI \u670D\u52A1\u8FD4\u56DE\u4E86\u65E0\u6548\u56FE\u7247\uFF0C\u8BF7\u7A0D\u540E\u91CD\u8BD5\uFF1B\u5982\u6301\u7EED\u5931\u8D25\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458";
-var MAX_PROVIDER_RESPONSE_PIXELS = 4e7;
-function isRecord(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function invalidImageResponse(providerId, location, reason) {
-  return new ProviderError(
-    INVALID_IMAGE_RESPONSE_MESSAGE,
-    502,
-    providerId,
-    "invalid_response",
-    `Images response ${location}: ${reason}`
-  );
-}
-async function parsePngBase64(value, providerId, index) {
-  if (typeof value !== "string" || value.length === 0) {
-    throw invalidImageResponse(providerId, `item ${index}`, "b64_json must be a non-empty string");
-  }
-  try {
-    const validated = validateImageDataUrl(`data:image/png;base64,${value}`);
-    await withImageProcessingSlot(async () => {
-      await sharp(validated.buffer, {
-        animated: false,
-        failOn: "warning",
-        limitInputPixels: MAX_PROVIDER_RESPONSE_PIXELS
-      }).raw().toBuffer();
-    });
-    return `data:image/png;base64,${validated.buffer.toString("base64")}`;
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "PNG validation failed";
-    throw invalidImageResponse(providerId, `item ${index}`, reason);
-  }
-}
-function parseImageUrl(value, providerId, index) {
-  if (typeof value !== "string" || value.trim().length === 0) {
-    throw invalidImageResponse(providerId, `item ${index}`, "url must be a non-empty string");
-  }
-  const normalized = value.trim();
-  try {
-    const parsed = new URL(normalized);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") throw new Error("unsupported protocol");
-  } catch {
-    throw invalidImageResponse(providerId, `item ${index}`, "url must be an absolute HTTP(S) URL");
-  }
-  return normalized;
-}
-async function parseGptImagesPngResponse(payload, providerId) {
-  if (!isRecord(payload)) {
-    throw invalidImageResponse(providerId, "body", "expected a JSON object");
-  }
-  if (payload.error !== void 0 && payload.error !== null) {
-    if (!isRecord(payload.error)) {
-      throw invalidImageResponse(providerId, "error", "expected an error object");
-    }
-    const code = payload.error.code;
-    const message = typeof payload.error.message === "string" ? payload.error.message : "images api error";
-    const rawMessage = typeof code === "string" ? `${code}: ${message}` : message;
-    const status = typeof code === "number" && Number.isInteger(code) && code >= 400 && code < 600 ? code : void 0;
-    throw providerErrorFromMessage(rawMessage, providerId, status);
-  }
-  if (!Array.isArray(payload.data) || payload.data.length === 0) {
-    throw new ProviderError("AI \u670D\u52A1\u672A\u8FD4\u56DE\u56FE\u7247\uFF0C\u8BF7\u91CD\u8BD5", 502, providerId, "empty_response");
-  }
-  const images = [];
-  for (let index = 0; index < payload.data.length; index += 1) {
-    const item = payload.data[index];
-    if (!isRecord(item)) {
-      throw invalidImageResponse(providerId, `item ${index}`, "expected an object");
-    }
-    if (Object.prototype.hasOwnProperty.call(item, "b64_json")) {
-      images.push(await parsePngBase64(item.b64_json, providerId, index));
-    } else if (Object.prototype.hasOwnProperty.call(item, "url")) {
-      images.push(parseImageUrl(item.url, providerId, index));
-    } else {
-      throw invalidImageResponse(providerId, `item ${index}`, "expected b64_json or url");
-    }
-  }
-  return images;
-}
-
-// server/providers/image2References.ts
-import sharp2 from "sharp";
-var IMAGE2_COLLAGE_LAYOUT = {
-  padding: 24,
-  gap: 16,
-  labelHeight: 48,
-  tileSize: 512,
-  maxColumns: 4
-};
-var MAX_REFERENCE_INPUT_PIXELS = 4e7;
-function extensionForMime(mime) {
-  switch (mime) {
-    case "image/jpeg":
-      return "jpg";
-    case "image/webp":
-      return "webp";
-    case "image/gif":
-      return "gif";
-    default:
-      return "png";
-  }
-}
-function referenceLabel(index) {
-  const { tileSize, labelHeight } = IMAGE2_COLLAGE_LAYOUT;
-  return Buffer.from(
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${tileSize}" height="${labelHeight}"><rect width="100%" height="100%" fill="#171717"/><text x="16" y="32" fill="#ffffff" font-family="sans-serif" font-size="22" font-weight="700">Image ${index}</text></svg>`
-  );
-}
-async function prepareImage2ReferenceUpload(referenceImages) {
-  if (referenceImages.length === 1) {
-    const { buffer, mime } = parseDataUrl(referenceImages[0]);
-    return {
-      buffer,
-      filename: `reference-1.${extensionForMime(mime)}`,
-      mime
-    };
+// server/lib/maskProcessing.ts
+var MAX_GPT_IMAGE_MASK_BYTES = 4 * 1024 * 1024;
+var MAX_MASK_PIXELS = 4e7;
+async function validateMaskForSource(sourceDataUrl, maskDataUrl, providerId = "gpt-image-2") {
+  const source = validateImageDataUrl(sourceDataUrl);
+  const mask = validateImageDataUrl(maskDataUrl, MAX_GPT_IMAGE_MASK_BYTES);
+  if (mask.mime !== "image/png") {
+    throw new ProviderError("\u8499\u7248\u5FC5\u987B\u662F PNG \u56FE\u7247", 400, providerId, "invalid_request");
   }
   return withImageProcessingSlot(async () => {
-    const { padding, gap, labelHeight, tileSize, maxColumns } = IMAGE2_COLLAGE_LAYOUT;
-    const columns = Math.min(referenceImages.length, maxColumns);
-    const rows = Math.ceil(referenceImages.length / columns);
-    const width = padding * 2 + columns * tileSize + (columns - 1) * gap;
-    const height = padding * 2 + rows * (labelHeight + tileSize) + (rows - 1) * gap;
-    const tiles = [];
-    for (const referenceImage of referenceImages) {
-      const { buffer: buffer2 } = parseDataUrl(referenceImage);
-      const tile = await sharp2(buffer2, {
-        animated: false,
-        failOn: "warning",
-        limitInputPixels: MAX_REFERENCE_INPUT_PIXELS,
-        sequentialRead: true
-      }).rotate().resize(tileSize, tileSize, {
-        fit: "contain",
-        background: { r: 255, g: 255, b: 255, alpha: 1 }
-      }).flatten({ background: { r: 255, g: 255, b: 255 } }).png().toBuffer();
-      tiles.push(tile);
+    const sourceMeta = await sharp(source.buffer, {
+      animated: false,
+      failOn: "error",
+      limitInputPixels: MAX_MASK_PIXELS
+    }).metadata();
+    const maskImage = sharp(mask.buffer, {
+      animated: false,
+      failOn: "error",
+      limitInputPixels: MAX_MASK_PIXELS
+    });
+    const maskMeta = await maskImage.metadata();
+    if (!sourceMeta.width || !sourceMeta.height || !maskMeta.width || !maskMeta.height) {
+      throw new ProviderError("\u65E0\u6CD5\u8BFB\u53D6\u539F\u56FE\u6216\u8499\u7248\u5C3A\u5BF8", 400, providerId, "invalid_request");
     }
-    const inputs = [];
-    for (let index = 0; index < tiles.length; index += 1) {
-      const column = index % columns;
-      const row = Math.floor(index / columns);
-      const left = padding + column * (tileSize + gap);
-      const top = padding + row * (labelHeight + tileSize + gap);
-      inputs.push({ input: referenceLabel(index + 1), left, top });
-      inputs.push({ input: tiles[index], left, top: top + labelHeight });
+    if (sourceMeta.width !== maskMeta.width || sourceMeta.height !== maskMeta.height) {
+      throw new ProviderError(
+        `\u8499\u7248\u5C3A\u5BF8\u5FC5\u987B\u4E0E\u539F\u56FE\u5B8C\u5168\u4E00\u81F4\uFF08\u539F\u56FE ${sourceMeta.width}x${sourceMeta.height}\uFF0C\u8499\u7248 ${maskMeta.width}x${maskMeta.height}\uFF09`,
+        400,
+        providerId,
+        "invalid_request"
+      );
     }
-    const buffer = await sharp2({
-      create: {
-        width,
-        height,
-        channels: 3,
-        background: { r: 244, g: 244, b: 244 }
-      }
-    }).composite(inputs).png().toBuffer();
+    if (!maskMeta.hasAlpha) {
+      throw new ProviderError("\u8499\u7248 PNG \u5FC5\u987B\u5305\u542B Alpha \u901A\u9053", 400, providerId, "invalid_request");
+    }
+    const alphaPixels = await maskImage.extractChannel("alpha").raw().toBuffer();
+    let minAlpha = 255;
+    let maxAlpha = 0;
+    for (const value of alphaPixels) {
+      minAlpha = Math.min(minAlpha, value);
+      maxAlpha = Math.max(maxAlpha, value);
+    }
+    if (minAlpha === 255) {
+      throw new ProviderError("\u8499\u7248\u6CA1\u6709\u53EF\u7F16\u8F91\u533A\u57DF\uFF0C\u8BF7\u5148\u6D82\u62B9\u9700\u8981\u4FEE\u6539\u7684\u4F4D\u7F6E", 400, providerId, "invalid_request");
+    }
+    if (maxAlpha === 0) {
+      throw new ProviderError("\u8499\u7248\u8986\u76D6\u4E86\u6574\u5F20\u56FE\u7247\uFF0C\u8BF7\u4FDD\u7559\u4E0D\u9700\u8981\u4FEE\u6539\u7684\u533A\u57DF", 400, providerId, "invalid_request");
+    }
     return {
-      buffer,
-      filename: "numbered-references.png",
-      mime: "image/png"
+      sourceBuffer: source.buffer,
+      maskBuffer: mask.buffer,
+      width: sourceMeta.width,
+      height: sourceMeta.height
     };
   });
 }
-function promptWithImageLayout(prompt, referenceCount) {
-  if (referenceCount <= 1) return prompt;
-  return `Reference collage: Image 1..${referenceCount} are arranged row by row, left to right, then top to bottom.
-${prompt}`;
+async function compositeMaskedEdit(sourceDataUrl, maskDataUrl, generatedDataUrl) {
+  const pair = await validateMaskForSource(sourceDataUrl, maskDataUrl);
+  const generated = validateImageDataUrl(generatedDataUrl);
+  return withImageProcessingSlot(async () => {
+    const generatedMeta = await sharp(generated.buffer, {
+      animated: false,
+      failOn: "error",
+      limitInputPixels: MAX_MASK_PIXELS
+    }).metadata();
+    if (generatedMeta.width !== pair.width || generatedMeta.height !== pair.height) {
+      throw new ProviderError(
+        "AI \u8FD4\u56DE\u56FE\u7247\u5C3A\u5BF8\u4E0E\u539F\u56FE\u4E0D\u4E00\u81F4\uFF0C\u65E0\u6CD5\u5B89\u5168\u6267\u884C\u8499\u7248\u5916\u50CF\u7D20\u4FDD\u62A4",
+        502,
+        "gpt-image-2",
+        "invalid_response"
+      );
+    }
+    const editMask = await sharp(pair.maskBuffer).negate({ alpha: true }).png().toBuffer();
+    const editableLayer = await sharp(generated.buffer).ensureAlpha().composite([{ input: editMask, blend: "dest-in" }]).png().toBuffer();
+    const output = await sharp(pair.sourceBuffer).ensureAlpha().composite([{ input: editableLayer, blend: "over" }]).png().toBuffer();
+    return toDataUrl(output.toString("base64"), "image/png");
+  });
 }
 
-// server/providers/nanobanana.ts
-var PROVIDER_ID = "nanobanana";
-async function generateOnce(req) {
-  const capabilities = config.nanobananaCapabilities();
-  const url = `${config.change2proBaseUrl()}/images/generations`;
-  const res = await fetchWithRetry(
-    url,
-    () => ({
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${config.nanobananaApiKey()}`
-      },
-      body: JSON.stringify({
-        model: config.nanobananaModel(),
-        prompt: req.prompt,
-        ...capabilities.supportsBatchN ? { n: Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize)) } : {},
-        size: aspectRatioToSize(req.aspectRatio),
-        quality: "low",
-        output_format: "png"
-      })
-    }),
-    { providerId: PROVIDER_ID }
-  );
-  const json = await res.json();
-  return await parseGptImagesPngResponse(json, PROVIDER_ID);
+// server/providers/apiyi.ts
+var PROVIDER_RESPONSE_PIXEL_LIMIT = 4e7;
+var REFERENCE_MIMES = /* @__PURE__ */ new Set(["image/png", "image/jpeg", "image/webp"]);
+var FLUX_MAX_INPUT_PIXELS = 2e7;
+var FLUX_MAX_INPUT_BYTES = 20 * 1024 * 1024;
+function record(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value) ? value : void 0;
 }
-var nanobananaProvider = {
-  id: PROVIDER_ID,
-  /** 文生图；不支持批量 n 的网关由 generateExactImages 在上层按缺口补发。 */
-  async generate(req) {
+function requestOptions(modelId, req) {
+  const options = req.modelOptions ?? defaultImageModelOptions(modelId, req.aspectRatio);
+  const error = imageModelOptionsError(modelId, options);
+  if (error) throw new ProviderError(`\u6A21\u578B\u53C2\u6570\u65E0\u6548\uFF1A${error}`, 400, modelId, "invalid_request");
+  return options;
+}
+function referenceData(req, modelId) {
+  const refs = req.referenceImages ?? [];
+  const max = modelMaxReferenceImages(modelId);
+  if (refs.length > max) {
+    throw new ProviderError(`${modelId} \u6700\u591A\u652F\u6301 ${max} \u5F20\u53C2\u8003\u56FE`, 400, modelId, "invalid_request");
+  }
+  return refs;
+}
+function parsedReference(dataUrl, modelId) {
+  try {
+    const validated = validateImageDataUrl(dataUrl);
+    if (!REFERENCE_MIMES.has(validated.mime)) {
+      throw new ProviderError(`${modelId} \u4EC5\u652F\u6301 PNG\u3001JPEG \u6216 WebP \u53C2\u8003\u56FE`, 400, modelId, "invalid_request");
+    }
     return {
-      images: await generateOnce(req),
-      model: config.nanobananaModel()
+      mime: validated.mime,
+      base64: validated.buffer.toString("base64"),
+      buffer: validated.buffer
     };
-  },
-  /** 图生图：使用 /images/edits multipart 接口。 */
-  async edit(req) {
-    if (!req.referenceImages?.length) {
-      throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID);
-    }
-    const capabilities = config.nanobananaCapabilities();
-    const maxReferences = Math.min(MAX_REFERENCE_IMAGES, capabilities.maxReferenceImages);
-    if (req.referenceImages.length > maxReferences) {
-      throw new ProviderError(`\u5F53\u524D AI \u670D\u52A1\u6700\u591A\u652F\u6301 ${maxReferences} \u5F20\u53C2\u8003\u56FE`, 400, PROVIDER_ID, "invalid_request");
-    }
-    if (req.referenceImages.length > 1 && !capabilities.supportsMultiReference) {
-      throw new ProviderError("\u5F53\u524D AI \u670D\u52A1\u672A\u5F00\u542F\u591A\u53C2\u8003\u56FE\uFF0C\u8BF7\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID, "invalid_request");
-    }
-    if (req.referenceImages.length > 1 && req.mask) {
-      throw new ProviderError("\u591A\u53C2\u8003\u56FE\u62FC\u56FE\u6682\u4E0D\u652F\u6301\u8499\u7248\uFF0C\u8BF7\u79FB\u9664\u8499\u7248\u6216\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID, "invalid_request");
-    }
-    const referenceUpload = await prepareImage2ReferenceUpload(req.referenceImages);
-    const prompt = promptWithImageLayout(req.prompt, req.referenceImages.length);
-    const url = `${config.change2proBaseUrl()}/images/edits`;
-    const res = await fetchWithRetry(
-      url,
-      () => {
-        const form = new FormData();
-        form.append("model", config.nanobananaModel());
-        form.append("prompt", prompt);
-        if (req.aspectRatio) form.append("size", aspectRatioToSize(req.aspectRatio));
-        form.append("quality", "low");
-        form.append("output_format", "png");
-        if (capabilities.supportsBatchN) {
-          form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize))));
-        }
-        form.append(
-          "image",
-          new Blob([new Uint8Array(referenceUpload.buffer)], { type: referenceUpload.mime }),
-          referenceUpload.filename
-        );
-        if (req.mask) {
-          const { mime, buffer } = parseDataUrl(req.mask);
-          form.append("mask", new Blob([new Uint8Array(buffer)], { type: mime }), "mask.png");
-        }
-        return {
-          method: "POST",
-          headers: { Authorization: `Bearer ${config.nanobananaApiKey()}` },
-          body: form
-        };
-      },
-      { providerId: PROVIDER_ID }
+  } catch (error) {
+    if (error instanceof ProviderError) throw error;
+    throw new ProviderError(
+      `${modelId} \u53C2\u8003\u56FE\u6570\u636E\u65E0\u6548`,
+      400,
+      modelId,
+      "invalid_request",
+      error instanceof Error ? error.message : String(error)
     );
-    const json = await res.json();
-    const images = await parseGptImagesPngResponse(json, PROVIDER_ID);
-    return { images, model: config.nanobananaModel() };
   }
-};
-
-// server/providers/image2.ts
-var PROVIDER_ID2 = "gpt-image-2";
-var image2Provider = {
-  id: PROVIDER_ID2,
-  /** 无参考图：/v1/images/generations */
-  async generate(req) {
-    const capabilities = config.image2Capabilities();
-    const url = `${config.change2proBaseUrl()}/images/generations`;
-    const res = await fetchWithRetry(
-      url,
-      () => ({
+}
+function fluxTargetDimensions(width, height) {
+  const contract = getImageModelContract("flux-2-pro").dimensions;
+  const scale = Math.min(1, Math.sqrt(contract.maxPixels / (width * height)));
+  let targetWidth = Math.max(contract.minSide, Math.round(width * scale / contract.multipleOf) * contract.multipleOf);
+  let targetHeight = Math.max(contract.minSide, Math.round(height * scale / contract.multipleOf) * contract.multipleOf);
+  while (targetWidth * targetHeight > contract.maxPixels) {
+    const widthScale = targetWidth / width;
+    const heightScale = targetHeight / height;
+    if (widthScale >= heightScale && targetWidth > contract.minSide) targetWidth -= contract.multipleOf;
+    else if (targetHeight > contract.minSide) targetHeight -= contract.multipleOf;
+    else break;
+  }
+  return { width: targetWidth, height: targetHeight };
+}
+async function adaptFluxReference(dataUrl) {
+  const modelId = "flux-2-pro";
+  const parsed = parsedReference(dataUrl, modelId);
+  try {
+    return await withImageProcessingSlot(async () => {
+      const input = sharp2(parsed.buffer, {
+        animated: false,
+        failOn: "error",
+        limitInputPixels: FLUX_MAX_INPUT_PIXELS
+      });
+      const metadata = await input.metadata();
+      if (!metadata.width || !metadata.height) {
+        throw new ProviderError("FLUX \u53C2\u8003\u56FE\u5C3A\u5BF8\u65E0\u6548", 400, modelId, "invalid_request");
+      }
+      const swapsAxes = metadata.orientation !== void 0 && metadata.orientation >= 5 && metadata.orientation <= 8;
+      const width = swapsAxes ? metadata.height : metadata.width;
+      const height = swapsAxes ? metadata.width : metadata.height;
+      const target = fluxTargetDimensions(width, height);
+      const alpha = metadata.hasAlpha ? await input.clone().rotate().ensureAlpha().extractChannel("alpha").raw().toBuffer() : void 0;
+      const transparent = alpha?.some((value) => value < 255) ?? false;
+      const transformed = sharp2(parsed.buffer, {
+        animated: false,
+        failOn: "error",
+        limitInputPixels: FLUX_MAX_INPUT_PIXELS
+      }).rotate().resize({ width: target.width, height: target.height, fit: "fill" }).toColourspace("srgb");
+      const output = transparent ? await transformed.png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer() : await transformed.flatten({ background: "#ffffff" }).jpeg({ quality: 92, chromaSubsampling: "4:4:4", mozjpeg: true }).toBuffer();
+      if (output.byteLength > FLUX_MAX_INPUT_BYTES) {
+        throw new ProviderError("FLUX \u53C2\u8003\u56FE\u5904\u7406\u540E\u4ECD\u8D85\u8FC7 20MB\uFF0C\u8BF7\u5148\u88C1\u526A\u56FE\u7247", 400, modelId, "invalid_request");
+      }
+      return toDataUrl(output.toString("base64"), transparent ? "image/png" : "image/jpeg");
+    });
+  } catch (error) {
+    if (error instanceof ProviderError) throw error;
+    throw new ProviderError(
+      "FLUX \u53C2\u8003\u56FE\u65E0\u6CD5\u9002\u914D\uFF0C\u8BF7\u4F7F\u7528\u6807\u51C6 PNG\u3001JPEG \u6216 WebP \u56FE\u7247",
+      400,
+      modelId,
+      "invalid_request",
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+}
+function appendImages(form, refs, modelId) {
+  const editContract = getImageModelContract(modelId).edit;
+  const field = refs.length === 1 ? editContract.singleImageField : editContract.multipleImageField;
+  if (!field) {
+    throw new ProviderError(`${modelId} \u7F3A\u5C11 multipart \u56FE\u7247\u5B57\u6BB5\u5951\u7EA6`, 500, modelId, "invalid_request");
+  }
+  refs.forEach((ref, index) => {
+    const parsed = parsedReference(ref, modelId);
+    const extension = parsed.mime === "image/jpeg" ? "jpg" : parsed.mime.split("/")[1];
+    form.append(
+      field,
+      new Blob([new Uint8Array(parsed.buffer)], { type: parsed.mime }),
+      `image-${index + 1}.${extension}`
+    );
+  });
+}
+function upstreamModelId(modelId) {
+  return getImageModelContract(modelId).upstreamModelId;
+}
+function resolveContractPath(path11, modelId) {
+  return path11.replace("{model}", encodeURIComponent(upstreamModelId(modelId)));
+}
+async function fetchApiyi(modelId, path11, initFactory) {
+  const timeout = getImageModelContract(modelId).timeoutMs;
+  return fetchWithRetry(`${config.apiyiBaseUrl()}${resolveContractPath(path11, modelId)}`, initFactory, {
+    providerId: modelId,
+    timeoutMs: config.aiTimeoutMs(timeout),
+    maxRetries: 0
+  });
+}
+async function readJson(response, modelId) {
+  try {
+    return await response.json();
+  } catch (error) {
+    throw new ProviderError(
+      "AI \u54CD\u5E94\u4E2D\u65AD\u6216\u4E0D\u5B8C\u6574\uFF0C\u7ED3\u679C\u53EF\u80FD\u5DF2\u7ECF\u751F\u6210\uFF1B\u7CFB\u7EDF\u4E0D\u4F1A\u81EA\u52A8\u91CD\u8BD5",
+      502,
+      modelId,
+      "outcome_unknown",
+      error instanceof Error ? error.message : String(error)
+    );
+  }
+}
+function imageUrl(value, modelId, index) {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ProviderError("AI \u670D\u52A1\u8FD4\u56DE\u4E86\u65E0\u6548\u56FE\u7247\u5730\u5740", 502, modelId, "invalid_response", `data[${index}].url invalid`);
+  }
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "https:" && parsed.protocol !== "http:") throw new Error("protocol");
+  } catch {
+    throw new ProviderError("AI \u670D\u52A1\u8FD4\u56DE\u4E86\u65E0\u6548\u56FE\u7247\u5730\u5740", 502, modelId, "invalid_response", `data[${index}].url invalid`);
+  }
+  return value;
+}
+async function base64Image(value, modelId, mimeHint) {
+  if (typeof value !== "string" || !value) {
+    throw new ProviderError("AI \u670D\u52A1\u8FD4\u56DE\u4E86\u65E0\u6548\u56FE\u7247\u6570\u636E", 502, modelId, "invalid_response");
+  }
+  try {
+    let buffer;
+    let mime;
+    if (value.startsWith("data:")) {
+      const validated = validateImageDataUrl(value);
+      buffer = validated.buffer;
+      mime = validated.mime;
+    } else {
+      buffer = Buffer.from(value, "base64");
+      if (!buffer.length || buffer.toString("base64") !== value) {
+        throw new ProviderError("AI \u670D\u52A1\u8FD4\u56DE\u4E86\u635F\u574F\u7684\u56FE\u7247\u6570\u636E", 502, modelId, "invalid_response");
+      }
+      const detected = detectImageMime(buffer);
+      if (!detected) {
+        throw new ProviderError("AI \u670D\u52A1\u8FD4\u56DE\u4E86\u672A\u77E5\u56FE\u7247\u683C\u5F0F", 502, modelId, "invalid_response");
+      }
+      mime = detected;
+    }
+    if (!REFERENCE_MIMES.has(mime)) {
+      throw new ProviderError("AI \u670D\u52A1\u8FD4\u56DE\u4E86\u4E0D\u652F\u6301\u7684\u56FE\u7247\u683C\u5F0F", 502, modelId, "invalid_response");
+    }
+    if (mimeHint && mime !== mimeHint) {
+      throw new ProviderError("AI \u670D\u52A1\u8FD4\u56DE\u56FE\u7247\u7684 MIME \u4E0E\u5B9E\u9645\u683C\u5F0F\u4E0D\u4E00\u81F4", 502, modelId, "invalid_response");
+    }
+    await withImageProcessingSlot(async () => {
+      await sharp2(buffer, {
+        animated: false,
+        failOn: "warning",
+        limitInputPixels: PROVIDER_RESPONSE_PIXEL_LIMIT
+      }).raw().toBuffer();
+    });
+    return toDataUrl(buffer.toString("base64"), mime);
+  } catch (error) {
+    if (error instanceof ProviderError) throw error;
+    throw new ProviderError(
+      "AI \u670D\u52A1\u8FD4\u56DE\u4E86\u635F\u574F\u7684\u56FE\u7247\u6570\u636E",
+      502,
+      modelId,
+      "invalid_response",
+      `image payload validation failed: ${error instanceof Error ? error.message : String(error)}`.slice(0, 500)
+    );
+  }
+}
+function throwEmbeddedError(payload, modelId) {
+  if (payload.error === void 0 || payload.error === null) return;
+  const detail = record(payload.error);
+  const message = typeof detail?.message === "string" ? detail.message : "API\u6613\u56FE\u7247\u63A5\u53E3\u8FD4\u56DE\u9519\u8BEF";
+  const rawCode = detail?.code;
+  const status = typeof rawCode === "number" ? rawCode : void 0;
+  const classifierMessage = typeof rawCode === "string" ? `${rawCode}: ${message}` : message;
+  throw providerErrorFromMessage(classifierMessage, modelId, status);
+}
+async function parseOpenAiImageResponse(payload, modelId, opts) {
+  const body = record(payload);
+  if (!body) throw new ProviderError("AI \u670D\u52A1\u8FD4\u56DE\u683C\u5F0F\u65E0\u6548", 502, modelId, "invalid_response");
+  throwEmbeddedError(body, modelId);
+  if (!Array.isArray(body.data) || body.data.length === 0) {
+    throw new ProviderError("AI \u670D\u52A1\u672A\u8FD4\u56DE\u56FE\u7247", 502, modelId, "empty_response");
+  }
+  if (opts?.maxImages && body.data.length > opts.maxImages) {
+    throw new ProviderError("AI \u670D\u52A1\u8FD4\u56DE\u56FE\u7247\u6570\u91CF\u8D85\u51FA\u5951\u7EA6", 502, modelId, "invalid_response");
+  }
+  const images = [];
+  const providerOutputSizes = [];
+  for (let index = 0; index < body.data.length; index += 1) {
+    const item = record(body.data[index]);
+    if (!item) throw new ProviderError("AI \u670D\u52A1\u8FD4\u56DE\u56FE\u7247\u6761\u76EE\u65E0\u6548", 502, modelId, "invalid_response");
+    if (!opts?.urlOnly && item.b64_json !== void 0) images.push(await base64Image(item.b64_json, modelId));
+    else if (item.url !== void 0) images.push(imageUrl(item.url, modelId, index));
+    else throw new ProviderError("AI \u670D\u52A1\u8FD4\u56DE\u56FE\u7247\u5B57\u6BB5\u65E0\u6548", 502, modelId, "invalid_response");
+    if (opts?.requireOutputSize) {
+      if (typeof item.size !== "string" || !/^[1-9]\d{1,4}x[1-9]\d{1,4}$/.test(item.size)) {
+        throw new ProviderError(
+          "AI \u670D\u52A1\u672A\u8FD4\u56DE\u53EF\u8BB0\u5F55\u7684\u5B9E\u9645\u56FE\u7247\u5C3A\u5BF8",
+          502,
+          modelId,
+          "invalid_response",
+          `data[${index}].size invalid`
+        );
+      }
+      providerOutputSizes.push(item.size);
+    }
+  }
+  return { images, providerOutputSizes: opts?.requireOutputSize ? providerOutputSizes : void 0 };
+}
+async function parseOpenAiImages(payload, modelId, opts) {
+  return (await parseOpenAiImageResponse(payload, modelId, opts)).images;
+}
+async function parseGeminiImages(payload, modelId) {
+  const body = record(payload);
+  if (!body) throw new ProviderError("Gemini \u54CD\u5E94\u683C\u5F0F\u65E0\u6548", 502, modelId, "invalid_response");
+  throwEmbeddedError(body, modelId);
+  const candidates = Array.isArray(body.candidates) ? body.candidates : [];
+  const images = [];
+  const finishReasons = [];
+  for (const candidateValue of candidates) {
+    const candidate = record(candidateValue);
+    if (!candidate) continue;
+    if (typeof candidate.finishReason === "string") finishReasons.push(candidate.finishReason);
+    const content = record(candidate.content);
+    const parts = Array.isArray(content?.parts) ? content.parts : [];
+    for (const partValue of parts) {
+      const part = record(partValue);
+      const inline = record(part?.inlineData);
+      if (!inline || inline.data === void 0) continue;
+      const mime = inline.mimeType === "image/jpeg" ? "image/jpeg" : inline.mimeType === "image/png" ? "image/png" : void 0;
+      if (!mime) throw new ProviderError("Gemini \u8FD4\u56DE\u4E86\u4E0D\u652F\u6301\u7684\u56FE\u7247\u683C\u5F0F", 502, modelId, "invalid_response");
+      images.push(await base64Image(inline.data, modelId, mime));
+    }
+  }
+  if (!images.length) {
+    const refused = finishReasons.some((reason) => /safety|block|prohibited/i.test(reason));
+    throw new ProviderError(
+      refused ? "\u672C\u6B21\u8BF7\u6C42\u672A\u901A\u8FC7 AI \u5B89\u5168\u5BA1\u6838\uFF0C\u8BF7\u8C03\u6574\u63D0\u793A\u8BCD\u6216\u53C2\u8003\u56FE\u7247\u540E\u91CD\u8BD5" : "AI \u670D\u52A1\u672A\u8FD4\u56DE\u56FE\u7247",
+      502,
+      modelId,
+      refused ? "content_refused" : "empty_response",
+      `finishReasons=${finishReasons.join(",")}`
+    );
+  }
+  return images;
+}
+async function geminiInlineData(dataUrl, modelId) {
+  const parsed = parsedReference(dataUrl, modelId);
+  if (parsed.mime === "image/png" || parsed.mime === "image/jpeg") {
+    return { inlineData: { mimeType: parsed.mime, data: parsed.base64 } };
+  }
+  const converted = await withImageProcessingSlot(() => sharp2(parsed.buffer).png().toBuffer());
+  return { inlineData: { mimeType: "image/png", data: converted.toString("base64") } };
+}
+async function validateApiyiRequest(modelId, req, mode) {
+  if (!req.prompt.trim()) throw new ProviderError("\u63D0\u793A\u8BCD\u4E0D\u80FD\u4E3A\u7A7A", 400, modelId, "invalid_request");
+  requestOptions(modelId, req);
+  const refs = referenceData(req, modelId);
+  if (mode === "edit" && refs.length === 0) {
+    throw new ProviderError("\u7F16\u8F91\u6A21\u5F0F\u81F3\u5C11\u9700\u8981\u4E00\u5F20\u53C2\u8003\u56FE", 400, modelId, "invalid_request");
+  }
+  if (mode === "generate" && refs.length > 0) {
+    throw new ProviderError("\u6587\u751F\u56FE\u8BF7\u6C42\u4E0D\u80FD\u5305\u542B\u53C2\u8003\u56FE", 400, modelId, "invalid_request");
+  }
+  refs.forEach((ref) => parsedReference(ref, modelId));
+  if (modelId === "gpt-image-2") {
+    if (mode !== "edit" || !req.mask) {
+      throw new ProviderError("gpt-image-2 \u4EC5\u7528\u4E8E\u5E26 PNG \u8499\u7248\u7684\u5C40\u90E8\u91CD\u7ED8", 400, modelId, "invalid_request");
+    }
+    await validateMaskForSource(refs[0], req.mask, modelId);
+  } else if (req.mask) {
+    throw new ProviderError(`${modelId} \u4E0D\u652F\u6301\u8499\u7248\u53C2\u6570`, 400, modelId, "invalid_request");
+  }
+}
+async function generate(modelId, req) {
+  await validateApiyiRequest(modelId, req, "generate");
+  const contract = getImageModelContract(modelId);
+  if (!contract.generation) throw new ProviderError(`${modelId} \u4E0D\u652F\u6301\u6587\u751F\u56FE`, 400, modelId, "invalid_request");
+  const options = requestOptions(modelId, req);
+  let response;
+  switch (modelId) {
+    case "gpt-image-2":
+      throw new ProviderError("gpt-image-2 \u53EA\u80FD\u7531\u8499\u7248\u5C40\u90E8\u91CD\u7ED8\u8282\u70B9\u8C03\u7528", 400, modelId, "invalid_request");
+    case "gpt-image-2-vip":
+      response = await fetchApiyi(modelId, contract.generation.path, () => ({
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${config.change2proApiKey()}`
-        },
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiyiApiKey()}` },
+        body: JSON.stringify({ model: upstreamModelId(modelId), prompt: req.prompt, size: options.size })
+      }));
+      return { images: await parseOpenAiImages(await readJson(response, modelId), modelId, { maxImages: 1 }), model: modelId };
+    case "gemini-3.1-flash-image":
+      response = await fetchApiyi(modelId, contract.generation.path, () => ({
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiyiApiKey()}` },
         body: JSON.stringify({
-          model: config.image2Model(),
-          prompt: req.prompt,
-          ...capabilities.supportsBatchN ? { n: Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize)) } : {},
-          size: aspectRatioToSize(req.aspectRatio),
-          quality: "low",
-          output_format: "png"
+          contents: [{ parts: [{ text: req.prompt }] }],
+          generationConfig: { responseModalities: ["IMAGE"], imageConfig: {
+            aspectRatio: options.aspectRatio,
+            imageSize: options.imageSize
+          } }
         })
-      }),
-      { providerId: PROVIDER_ID2 }
-    );
-    const json = await res.json();
-    return { images: await parseGptImagesPngResponse(json, PROVIDER_ID2), model: config.image2Model() };
-  },
-  /** 有参考图：/v1/images/edits，multipart form 上传 */
-  async edit(req) {
-    if (!req.referenceImages?.length) {
-      throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID2);
+      }));
+      return { images: await parseGeminiImages(await readJson(response, modelId), modelId), model: modelId };
+    case "flux-2-pro":
+      response = await fetchApiyi(modelId, contract.generation.path, () => ({
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiyiApiKey()}` },
+        body: JSON.stringify({
+          model: upstreamModelId(modelId),
+          prompt: req.prompt,
+          width: options.width,
+          height: options.height,
+          output_format: options.outputFormat
+        })
+      }));
+      return { images: await parseOpenAiImages(await readJson(response, modelId), modelId, { urlOnly: true, maxImages: 1 }), model: modelId };
+    case "seedream-5-0-260128": {
+      response = await fetchApiyi(modelId, contract.generation.path, () => ({
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiyiApiKey()}` },
+        body: JSON.stringify({
+          model: upstreamModelId(modelId),
+          prompt: req.prompt,
+          size: options.size,
+          response_format: "b64_json",
+          watermark: false,
+          sequential_image_generation: "disabled"
+        })
+      }));
+      const parsed = await parseOpenAiImageResponse(await readJson(response, modelId), modelId, { requireOutputSize: true });
+      return { ...parsed, model: modelId };
     }
-    const capabilities = config.image2Capabilities();
-    const maxReferences = Math.min(MAX_REFERENCE_IMAGES, capabilities.maxReferenceImages);
-    if (req.referenceImages.length > maxReferences) {
-      throw new ProviderError(`\u5F53\u524D AI \u670D\u52A1\u6700\u591A\u652F\u6301 ${maxReferences} \u5F20\u53C2\u8003\u56FE`, 400, PROVIDER_ID2, "invalid_request");
-    }
-    if (req.referenceImages.length > 1 && !capabilities.supportsMultiReference) {
-      throw new ProviderError("\u5F53\u524D AI \u670D\u52A1\u672A\u5F00\u542F\u591A\u53C2\u8003\u56FE\uFF0C\u8BF7\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID2, "invalid_request");
-    }
-    if (req.referenceImages.length > 1 && req.mask) {
-      throw new ProviderError("\u591A\u53C2\u8003\u56FE\u62FC\u56FE\u6682\u4E0D\u652F\u6301\u8499\u7248\uFF0C\u8BF7\u79FB\u9664\u8499\u7248\u6216\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID2, "invalid_request");
-    }
-    const referenceUpload = await prepareImage2ReferenceUpload(req.referenceImages);
-    const prompt = promptWithImageLayout(req.prompt, req.referenceImages.length);
-    const url = `${config.change2proBaseUrl()}/images/edits`;
-    const res = await fetchWithRetry(
-      url,
-      () => {
-        const form = new FormData();
-        form.append("model", config.image2Model());
-        form.append("prompt", prompt);
-        if (req.aspectRatio) form.append("size", aspectRatioToSize(req.aspectRatio));
-        form.append("quality", "low");
-        form.append("output_format", "png");
-        if (capabilities.supportsBatchN) {
-          form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize))));
-        }
-        form.append(
-          "image",
-          new Blob([new Uint8Array(referenceUpload.buffer)], { type: referenceUpload.mime }),
-          referenceUpload.filename
-        );
-        if (req.mask) {
-          const { mime, buffer } = parseDataUrl(req.mask);
-          form.append("mask", new Blob([new Uint8Array(buffer)], { type: mime }), "mask.png");
-        }
-        return {
-          method: "POST",
-          headers: { Authorization: `Bearer ${config.change2proApiKey()}` },
-          body: form
-        };
-      },
-      { providerId: PROVIDER_ID2 }
-    );
-    const json = await res.json();
-    return { images: await parseGptImagesPngResponse(json, PROVIDER_ID2), model: config.image2Model() };
+    case "grok-imagine-image":
+      response = await fetchApiyi(modelId, contract.generation.path, () => ({
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiyiApiKey()}` },
+        body: JSON.stringify({
+          model: upstreamModelId(modelId),
+          prompt: req.prompt,
+          aspect_ratio: options.aspectRatio,
+          resolution: options.resolution,
+          n: Math.max(1, Math.min(req.batchSize ?? 1, modelMaximumImagesPerRequest(modelId))),
+          response_format: "b64_json"
+        })
+      }));
+      return { images: await parseOpenAiImages(await readJson(response, modelId), modelId, { maxImages: 10 }), model: modelId };
   }
-};
+}
+async function edit(modelId, req) {
+  await validateApiyiRequest(modelId, req, "edit");
+  const contract = getImageModelContract(modelId);
+  const options = requestOptions(modelId, req);
+  const refs = req.referenceImages;
+  let response;
+  switch (modelId) {
+    case "gpt-image-2": {
+      response = await fetchApiyi(modelId, contract.edit.path, () => {
+        const form = new FormData();
+        form.append("model", upstreamModelId(modelId));
+        form.append("prompt", req.prompt);
+        appendImages(form, refs, modelId);
+        const mask = parseDataUrl(req.mask);
+        form.append("mask", new Blob([new Uint8Array(mask.buffer)], { type: "image/png" }), "mask.png");
+        form.append("output_format", "png");
+        return { method: "POST", headers: { Authorization: `Bearer ${config.apiyiApiKey()}` }, body: form };
+      });
+      return { images: await parseOpenAiImages(await readJson(response, modelId), modelId, { maxImages: 1 }), model: modelId };
+    }
+    case "gpt-image-2-vip": {
+      response = await fetchApiyi(modelId, contract.edit.path, () => {
+        const form = new FormData();
+        form.append("model", upstreamModelId(modelId));
+        form.append("prompt", req.prompt);
+        form.append("size", String(options.size));
+        appendImages(form, refs, modelId);
+        return { method: "POST", headers: { Authorization: `Bearer ${config.apiyiApiKey()}` }, body: form };
+      });
+      return { images: await parseOpenAiImages(await readJson(response, modelId), modelId, { maxImages: 1 }), model: modelId };
+    }
+    case "gemini-3.1-flash-image": {
+      const parts = [{ text: req.prompt }, ...await Promise.all(refs.map((ref) => geminiInlineData(ref, modelId)))];
+      response = await fetchApiyi(modelId, contract.edit.path, () => ({
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiyiApiKey()}` },
+        body: JSON.stringify({
+          contents: [{ parts }],
+          generationConfig: { responseModalities: ["IMAGE"], imageConfig: {
+            aspectRatio: options.aspectRatio,
+            imageSize: options.imageSize
+          } }
+        })
+      }));
+      return { images: await parseGeminiImages(await readJson(response, modelId), modelId), model: modelId };
+    }
+    case "flux-2-pro": {
+      const adaptedRefs = await Promise.all(refs.map(adaptFluxReference));
+      const inputImages = Object.fromEntries(adaptedRefs.map((ref, index) => [
+        index === 0 ? "input_image" : `input_image_${index + 1}`,
+        ref
+      ]));
+      response = await fetchApiyi(modelId, contract.edit.path, () => ({
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiyiApiKey()}` },
+        body: JSON.stringify({
+          model: upstreamModelId(modelId),
+          prompt: req.prompt,
+          width: options.width,
+          height: options.height,
+          output_format: options.outputFormat,
+          ...inputImages
+        })
+      }));
+      return { images: await parseOpenAiImages(await readJson(response, modelId), modelId, { urlOnly: true, maxImages: 1 }), model: modelId };
+    }
+    case "seedream-5-0-260128": {
+      response = await fetchApiyi(modelId, contract.edit.path, () => ({
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.apiyiApiKey()}` },
+        body: JSON.stringify({
+          model: upstreamModelId(modelId),
+          prompt: req.prompt,
+          image: refs,
+          size: options.size,
+          response_format: "b64_json",
+          watermark: false,
+          sequential_image_generation: "disabled"
+        })
+      }));
+      const parsed = await parseOpenAiImageResponse(await readJson(response, modelId), modelId, { requireOutputSize: true });
+      return { ...parsed, model: modelId };
+    }
+    case "grok-imagine-image": {
+      response = await fetchApiyi(modelId, contract.edit.path, () => {
+        const form = new FormData();
+        form.append("model", upstreamModelId(modelId));
+        form.append("prompt", req.prompt);
+        form.append("response_format", "b64_json");
+        appendImages(form, refs, modelId);
+        return { method: "POST", headers: { Authorization: `Bearer ${config.apiyiApiKey()}` }, body: form };
+      });
+      return { images: await parseOpenAiImages(await readJson(response, modelId), modelId, { maxImages: 10 }), model: modelId };
+    }
+  }
+}
+function createApiyiProvider(modelId) {
+  return {
+    id: modelId,
+    validate: (req, mode) => validateApiyiRequest(modelId, req, mode),
+    generate: (req) => generate(modelId, req),
+    edit: (req) => edit(modelId, req)
+  };
+}
+var apiyiProviders = Object.fromEntries(
+  [
+    "gpt-image-2",
+    "gpt-image-2-vip",
+    "gemini-3.1-flash-image",
+    "flux-2-pro",
+    "seedream-5-0-260128",
+    "grok-imagine-image"
+  ].map((modelId) => [modelId, createApiyiProvider(modelId)])
+);
 
 // server/providers/index.ts
-var comfyuiStub = {
-  id: "comfyui-local",
-  generate() {
-    throw new NotImplementedError("comfyui-local provider (reserved for P1)");
-  },
-  edit() {
-    throw new NotImplementedError("comfyui-local provider (reserved for P1)");
-  }
-};
-var providers = {
-  nanobanana: nanobananaProvider,
-  "gpt-image-2": image2Provider,
-  "comfyui-local": comfyuiStub
-};
+var providers = { ...apiyiProviders };
 function getProvider(id) {
   const p = providers[id];
   if (!p) {
@@ -815,10 +1265,6 @@ function getProvider(id) {
 }
 
 // server/providers/exact.ts
-var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-function isRetryableBatchError(error) {
-  return error instanceof ProviderError && (error.category === "model_unavailable" || error.category === "rate_limited");
-}
 function logProviderFailure(provider, error, options, attempt) {
   console.error("[ai-provider-failure]", JSON.stringify({
     runId: options.runId ?? "unknown",
@@ -833,40 +1279,50 @@ function logProviderFailure(provider, error, options, attempt) {
 async function generateExactImages(provider, request, requestedCount, options = {}) {
   const target = Math.max(1, Math.min(8, Math.floor(requestedCount) || 1));
   const images = [];
+  const providerOutputSizes = [];
   const failures = [];
   let model = provider.id;
   let providerRequests = 0;
   let firstError;
-  const maxAttempts = target + 3;
-  const retryDelays = options.transientRetryDelaysMs ?? [2e3, 5e3];
-  let transientRetries = 0;
-  while (images.length < target && providerRequests < maxAttempts) {
+  const maxRequests = target;
+  while (images.length < target && providerRequests < maxRequests) {
     const remaining = target - images.length;
     const current = { ...request, batchSize: Math.min(4, remaining) };
+    const mode = current.referenceImages?.length ? "edit" : "generate";
+    await provider.validate?.(current, mode);
+    await options.beforeProviderCall?.(providerRequests + 1);
     providerRequests += 1;
     try {
-      const result = current.referenceImages?.length ? await provider.edit(current) : await provider.generate(current);
+      const result = mode === "edit" ? await provider.edit(current) : await provider.generate(current);
       model = result.model;
-      const accepted = result.images.filter(Boolean).slice(0, remaining);
-      images.push(...accepted);
-      transientRetries = 0;
-      if (accepted.length === 0) failures.push("\u6A21\u578B\u672A\u8FD4\u56DE\u56FE\u7247");
+      const accepted = result.images.map((image, index) => ({ image, providerOutputSize: result.providerOutputSizes?.[index] ?? null })).filter((item) => Boolean(item.image)).slice(0, remaining);
+      images.push(...accepted.map((item) => item.image));
+      providerOutputSizes.push(...accepted.map((item) => item.providerOutputSize));
+      if (accepted.length === 0) {
+        failures.push("\u6A21\u578B\u672A\u8FD4\u56DE\u56FE\u7247");
+        break;
+      }
     } catch (error) {
       firstError ??= error;
       if (error instanceof ProviderError) logProviderFailure(provider, error, options, providerRequests);
-      if (isRetryableBatchError(error) && transientRetries < retryDelays.length) {
-        const delay = retryDelays[transientRetries];
-        transientRetries += 1;
-        await sleep2(delay);
-        continue;
+      if (error instanceof ProviderError && error.category === "outcome_unknown") throw error;
+      if (images.length > 0) {
+        failures.push(publicProviderErrorMessage(error));
+        break;
       }
       failures.push(publicProviderErrorMessage(error));
-      if (error instanceof ProviderError && (error.status !== void 0 && error.status >= 400 && error.status < 500 || ["content_refused", "invalid_request", "model_unavailable", "gateway_authentication"].includes(error.category))) break;
+      break;
     }
   }
   if (images.length === 0) throw firstError instanceof Error ? firstError : new Error(failures[0] ?? "\u6A21\u578B\u672A\u8FD4\u56DE\u56FE\u7247");
   if (images.length < target) failures.push(`\u53EA\u751F\u6210\u4E86 ${images.length}/${target} \u5F20\u56FE\u7247`);
-  return { images, model, providerRequests, failures };
+  return {
+    images,
+    model,
+    providerRequests,
+    failures,
+    providerOutputSizes: providerOutputSizes.some((size) => size !== null) ? providerOutputSizes : void 0
+  };
 }
 
 // server/lib/fileStore.ts
@@ -877,7 +1333,144 @@ import { isIP } from "node:net";
 import http from "node:http";
 import https from "node:https";
 import { nanoid } from "nanoid";
+import sharp4 from "sharp";
+
+// server/lib/uploadImageNormalization.ts
 import sharp3 from "sharp";
+var inputContract = model_contracts_default.inputNormalization;
+var UPLOAD_MAX_INPUT_BYTES = inputContract.maxInputBytes;
+var UPLOAD_MAX_INPUT_PIXELS = inputContract.maxInputPixels;
+var UPLOAD_MAX_LONG_EDGE = inputContract.maxLongEdge;
+var UPLOAD_TARGET_BYTES = inputContract.targetBytes;
+var UPLOAD_JPEG_QUALITY = inputContract.jpegQuality.initial;
+var UPLOAD_MIN_JPEG_QUALITY = inputContract.jpegQuality.minimum;
+var MIN_SHRINK_LONG_EDGE = 256;
+var SHARP_INPUT_OPTIONS = {
+  animated: false,
+  failOn: "error",
+  limitInputPixels: UPLOAD_MAX_INPUT_PIXELS,
+  sequentialRead: true
+};
+function orientedDimensions(metadata) {
+  if (!metadata.width || !metadata.height) {
+    throw new ImageValidationError("\u65E0\u6CD5\u8BFB\u53D6\u56FE\u7247\u5C3A\u5BF8\uFF0C\u8BF7\u6362\u4E00\u5F20\u6807\u51C6 PNG\u3001JPEG\u3001WebP \u6216 GIF \u56FE\u7247");
+  }
+  if (metadata.width * metadata.height > UPLOAD_MAX_INPUT_PIXELS) {
+    throw new ImageValidationError(
+      `\u56FE\u7247\u50CF\u7D20\u8FC7\u5927\uFF08\u6700\u591A ${UPLOAD_MAX_INPUT_PIXELS.toLocaleString("en-US")} \u50CF\u7D20\uFF09\uFF0C\u8BF7\u7F29\u5C0F\u540E\u91CD\u8BD5`
+    );
+  }
+  const swapsAxes = metadata.orientation !== void 0 && metadata.orientation >= 5 && metadata.orientation <= 8;
+  return swapsAxes ? { width: metadata.height, height: metadata.width } : { width: metadata.width, height: metadata.height };
+}
+function dimensionsWithinLongEdge(width, height) {
+  const longEdge = Math.max(width, height);
+  if (longEdge <= UPLOAD_MAX_LONG_EDGE) return { width, height };
+  const scale = UPLOAD_MAX_LONG_EDGE / longEdge;
+  return {
+    width: Math.max(1, Math.round(width * scale)),
+    height: Math.max(1, Math.round(height * scale))
+  };
+}
+function smallerDimensions(width, height, encodedBytes) {
+  const longEdge = Math.max(width, height);
+  if (longEdge <= MIN_SHRINK_LONG_EDGE) {
+    throw new ImageValidationError("\u56FE\u7247\u5185\u5BB9\u8FC7\u4E8E\u590D\u6742\uFF0C\u538B\u7F29\u540E\u4ECD\u8D85\u8FC7 1.5MB\uFF0C\u8BF7\u5148\u88C1\u526A\u56FE\u7247\u540E\u91CD\u8BD5");
+  }
+  const estimated = Math.sqrt(UPLOAD_TARGET_BYTES / Math.max(encodedBytes, 1)) * 0.96;
+  const scale = Math.max(0.5, Math.min(0.9, estimated));
+  const next = {
+    width: Math.max(1, Math.floor(width * scale)),
+    height: Math.max(1, Math.floor(height * scale))
+  };
+  if (next.width === width && next.height === height) {
+    return width >= height ? { width: width - 1, height } : { width, height: height - 1 };
+  }
+  return next;
+}
+function pipeline(buffer, width, height) {
+  return sharp3(buffer, SHARP_INPUT_OPTIONS).rotate().resize({ width, height, fit: "fill" }).toColourspace("srgb");
+}
+async function encodeJpeg(buffer, width, height, quality) {
+  const result = await pipeline(buffer, width, height).flatten({ background: "#ffffff" }).jpeg({ quality, chromaSubsampling: "4:4:4", mozjpeg: true }).toBuffer({ resolveWithObject: true });
+  return { buffer: result.data, info: result.info };
+}
+async function encodeOpaqueWithinLimit(buffer, initialWidth, initialHeight) {
+  let width = initialWidth;
+  let height = initialHeight;
+  for (; ; ) {
+    const high = await encodeJpeg(buffer, width, height, UPLOAD_JPEG_QUALITY);
+    if (high.buffer.byteLength <= UPLOAD_TARGET_BYTES) return high;
+    const low = await encodeJpeg(buffer, width, height, UPLOAD_MIN_JPEG_QUALITY);
+    if (low.buffer.byteLength <= UPLOAD_TARGET_BYTES) {
+      let best = low;
+      let left = UPLOAD_MIN_JPEG_QUALITY + 1;
+      let right = UPLOAD_JPEG_QUALITY - 1;
+      while (left <= right) {
+        const quality = Math.floor((left + right) / 2);
+        const candidate = await encodeJpeg(buffer, width, height, quality);
+        if (candidate.buffer.byteLength <= UPLOAD_TARGET_BYTES) {
+          best = candidate;
+          left = quality + 1;
+        } else {
+          right = quality - 1;
+        }
+      }
+      return best;
+    }
+    ({ width, height } = smallerDimensions(width, height, low.buffer.byteLength));
+  }
+}
+async function encodeTransparentWithinLimit(buffer, initialWidth, initialHeight) {
+  let width = initialWidth;
+  let height = initialHeight;
+  for (; ; ) {
+    const result = await pipeline(buffer, width, height).png({ compressionLevel: 9, adaptiveFiltering: true }).toBuffer({ resolveWithObject: true });
+    if (result.data.byteLength <= UPLOAD_TARGET_BYTES) return { buffer: result.data, info: result.info };
+    ({ width, height } = smallerDimensions(width, height, result.data.byteLength));
+  }
+}
+async function hasMeaningfulAlpha(buffer, metadata) {
+  if (!metadata.hasAlpha) return false;
+  const alpha = await sharp3(buffer, SHARP_INPUT_OPTIONS).rotate().ensureAlpha().extractChannel("alpha").raw().toBuffer();
+  return alpha.some((value) => value < 255);
+}
+async function normalizeUploadImageDataUrl(dataUrl) {
+  const validated = validateImageDataUrl(dataUrl, UPLOAD_MAX_INPUT_BYTES);
+  try {
+    return await withImageProcessingSlot(async () => {
+      const metadata = await sharp3(validated.buffer, SHARP_INPUT_OPTIONS).metadata();
+      const oriented = orientedDimensions(metadata);
+      const target = dimensionsWithinLongEdge(oriented.width, oriented.height);
+      const transparent = await hasMeaningfulAlpha(validated.buffer, metadata);
+      const encoded = transparent ? await encodeTransparentWithinLimit(validated.buffer, target.width, target.height) : await encodeOpaqueWithinLimit(validated.buffer, target.width, target.height);
+      if (!encoded.info.width || !encoded.info.height) {
+        throw new ImageValidationError("\u6807\u51C6\u5316\u540E\u65E0\u6CD5\u8BFB\u53D6\u56FE\u7247\u5C3A\u5BF8");
+      }
+      return {
+        buffer: encoded.buffer,
+        mimeType: transparent ? "image/png" : "image/jpeg",
+        width: encoded.info.width,
+        height: encoded.info.height,
+        byteLength: encoded.buffer.byteLength,
+        normalized: true
+      };
+    });
+  } catch (error) {
+    if (error instanceof ImageValidationError) throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    if (/pixel limit|exceeds.*pixels|too large/i.test(detail)) {
+      throw new ImageValidationError(
+        `\u56FE\u7247\u50CF\u7D20\u8FC7\u5927\uFF08\u6700\u591A ${UPLOAD_MAX_INPUT_PIXELS.toLocaleString("en-US")} \u50CF\u7D20\uFF09\uFF0C\u8BF7\u7F29\u5C0F\u540E\u91CD\u8BD5`
+      );
+    }
+    throw new ImageValidationError(
+      `\u56FE\u7247\u65E0\u6CD5\u5B8C\u6210\u6807\u51C6\u5316\u5904\u7406\uFF0C\u8BF7\u8F6C\u6362\u4E3A\u6807\u51C6 PNG\u3001JPEG\u3001WebP \u6216 GIF \u540E\u91CD\u8BD5\uFF08${detail.slice(0, 160)}\uFF09`
+    );
+  }
+}
+
+// server/lib/fileStore.ts
 var MAX_THUMBNAIL_INPUT_PIXELS = 4e7;
 var MIME_EXT = {
   "image/png": "png",
@@ -916,7 +1509,7 @@ async function ensureThumbnail(id) {
     const temporary = path2.join(thumbnailsDir(), `.${id}.${nanoid(6)}.tmp.webp`);
     try {
       await withImageProcessingSlot(async () => {
-        await sharp3(source, {
+        await sharp4(source, {
           animated: false,
           failOn: "error",
           limitInputPixels: MAX_THUMBNAIL_INPUT_PIXELS
@@ -966,6 +1559,35 @@ function saveDataUrl(dataUrl) {
     fs2.closeSync(fd);
   }
   return { id, url: `/api/files/${id}` };
+}
+async function saveNormalizedUploadDataUrl(dataUrl) {
+  const normalized = await normalizeUploadImageDataUrl(dataUrl);
+  const ext = MIME_EXT[normalized.mimeType];
+  const id = `${nanoid(12)}.${ext}`;
+  const filePath = path2.join(uploadsDir(), id);
+  let handle;
+  try {
+    handle = await fs2.promises.open(filePath, "wx", 384);
+    await handle.writeFile(normalized.buffer);
+    await handle.sync();
+  } catch (error) {
+    try {
+      await fs2.promises.rm(filePath, { force: true });
+    } catch {
+    }
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+  return {
+    id,
+    url: `/api/files/${id}`,
+    mimeType: normalized.mimeType,
+    width: normalized.width,
+    height: normalized.height,
+    byteLength: normalized.byteLength,
+    normalized: true
+  };
 }
 function resolveToDataUrl(ref) {
   if (!ref.startsWith("/api/files/")) return ref;
@@ -1200,203 +1822,6 @@ async function persistImageRef(ref) {
   return saveDataUrl(dataUrl).url;
 }
 
-// server/lib/imagePostProcessing.ts
-import sharp4 from "sharp";
-var EXACT_ASPECT_DIMENSIONS = {
-  "1:1": { width: 1024, height: 1024 },
-  "3:4": { width: 1152, height: 1536 },
-  "4:3": { width: 1536, height: 1152 },
-  "9:16": { width: 864, height: 1536 },
-  "16:9": { width: 1536, height: 864 }
-};
-var WEBP_QUALITIES = [92, 84, 76, 68, 60, 50, 40, 30, 20, 10];
-var SHARP_INPUT_OPTIONS = {
-  animated: false,
-  failOn: "warning",
-  limitInputPixels: 4e7
-};
-function isExactAspectRatio(value) {
-  return typeof value === "string" && Object.prototype.hasOwnProperty.call(EXACT_ASPECT_DIMENSIONS, value);
-}
-function isUpscaleSize(value) {
-  return value === "2K" || value === "4K";
-}
-function normalizeExactAspectRatio(value) {
-  return isExactAspectRatio(value) ? value : "1:1";
-}
-function normalizeUpscaleSize(value) {
-  return isUpscaleSize(value) ? value : "2K";
-}
-async function imageRefToBuffer(ref) {
-  const dataUrl = await normalizeImageRef(ref);
-  return validateImageDataUrl(dataUrl).buffer;
-}
-async function encodeWebpWithinLimit(image) {
-  for (const quality of WEBP_QUALITIES) {
-    const output = await image.clone().webp({ quality, effort: 4, smartSubsample: true }).toBuffer();
-    if (output.byteLength <= MAX_IMAGE_BYTES) return output;
-  }
-  throw new Error(`processed image exceeds ${MAX_IMAGE_BYTES} bytes even at minimum quality`);
-}
-function toWebpDataUrl(buffer) {
-  return `data:image/webp;base64,${buffer.toString("base64")}`;
-}
-async function fitGeneratedImageToAspect(ref, aspectRatio) {
-  return withImageProcessingSlot(async () => {
-    const normalizedAspectRatio = normalizeExactAspectRatio(aspectRatio);
-    const input = await imageRefToBuffer(ref);
-    const { width, height } = EXACT_ASPECT_DIMENSIONS[normalizedAspectRatio];
-    const source = sharp4(input, SHARP_INPUT_OPTIONS).rotate();
-    const { dominant } = await source.clone().stats();
-    const background = { r: dominant.r, g: dominant.g, b: dominant.b, alpha: 1 };
-    const output = await encodeWebpWithinLimit(
-      source.resize({ width, height, fit: "contain", position: "centre", background }).flatten({ background }).toColourspace("srgb")
-    );
-    return toWebpDataUrl(output);
-  });
-}
-async function upscaleImageToLongEdge(ref, imageSize) {
-  return withImageProcessingSlot(async () => {
-    const normalizedImageSize = normalizeUpscaleSize(imageSize);
-    const input = await imageRefToBuffer(ref);
-    const longEdge = normalizedImageSize === "4K" ? 4096 : 2048;
-    const output = await encodeWebpWithinLimit(
-      sharp4(input, SHARP_INPUT_OPTIONS).rotate().resize({ width: longEdge, height: longEdge, fit: "inside" }).toColourspace("srgb")
-    );
-    return toWebpDataUrl(output);
-  });
-}
-
-// src/lib/colors.ts
-var COLOR_CATEGORIES = [
-  {
-    id: "neutral",
-    label: "\u4E2D\u6027\u57FA\u7840\u8272",
-    swatches: [
-      { name: "\u78B3\u7D20\u9ED1", hex: "#161616" },
-      { name: "\u68D5\u9ED1", hex: "#2B1D16" },
-      { name: "\u70AD\u9ED1", hex: "#1A1A1A" },
-      { name: "\u66AE\u8272\u7070", hex: "#6B6B70" },
-      { name: "\u70DF\u7070", hex: "#6E6E6E" },
-      { name: "\u6DF1\u6D77\u9E25\u7070", hex: "#8B9296" },
-      { name: "\u6C34\u6CE5\u7070", hex: "#9A9A98" },
-      { name: "\u5927\u8C61\u7070", hex: "#8A8378" },
-      { name: "\u66AE\u6C99\u7070", hex: "#A39B8B" },
-      { name: "\u4E91\u70DF\u7070", hex: "#B9B7B2" },
-      { name: "\u6D45\u7070", hex: "#C8C8C8" },
-      { name: "\u73CD\u73E0\u767D", hex: "#F2EFE9" },
-      { name: "\u71D5\u9EA6\u767D", hex: "#EDE6D6" },
-      { name: "\u739B\u7459\u767D", hex: "#E9E4DA" },
-      { name: "\u7C73\u767D", hex: "#F5F0E6" },
-      { name: "\u67D4\u548C\u7C73", hex: "#E5DCC8" },
-      { name: "\u5976\u674F\u7C73", hex: "#F0E4CE" },
-      { name: "\u7EAF\u767D", hex: "#FFFFFF" },
-      { name: "\u9999\u69DF\u8272", hex: "#F0DCB8" },
-      { name: "\u9A7C\u8272", hex: "#C19A6B" },
-      { name: "\u5361\u5176", hex: "#B8A47E" },
-      { name: "\u5496\u5561", hex: "#6F4E37" },
-      { name: "\u6989\u6728\u8272", hex: "#A67B4F" },
-      { name: "\u7126\u7CD6", hex: "#A0522D" }
-    ]
-  },
-  {
-    id: "warm",
-    label: "\u6696\u8272\u7CFB",
-    swatches: [
-      // 红
-      { name: "\u7194\u5CA9\u7EA2", hex: "#B03A2E" },
-      { name: "\u4E2D\u56FD\u7EA2", hex: "#DE2910" },
-      { name: "\u6B63\u7EA2", hex: "#C8102E" },
-      { name: "\u6A31\u6843\u7EA2", hex: "#C2183C" },
-      { name: "\u6CE2\u826E\u7B2C\u7EA2", hex: "#5C1A24" },
-      { name: "\u9152\u7EA2", hex: "#722F37" },
-      { name: "\u6885\u6D1B\u8461\u8404\u9152\u7EA2", hex: "#6E2438" },
-      { name: "\u7816\u7EA2", hex: "#B5493A" },
-      // 粉
-      { name: "\u8393\u679C\u7C89", hex: "#D98CA6" },
-      { name: "\u82AD\u6BD4\u7C89", hex: "#E0219C" },
-      { name: "\u73CA\u745A\u7C89", hex: "#F88379" },
-      { name: "\u85D5\u7C89", hex: "#E8C4C4" },
-      { name: "\u73AB\u7470\u8336", hex: "#C08585" },
-      { name: "\u96FE\u73AB\u7470\u8272", hex: "#B48A8C" },
-      { name: "\u7070\u7C89\u73AB", hex: "#C4A4A8" },
-      { name: "\u73AB\u7470\u91D1", hex: "#B76E79" },
-      // 橙
-      { name: "\u7231\u9A6C\u4ED5\u6A59", hex: "#F37021" },
-      { name: "\u6A58\u6A59", hex: "#E8752A" },
-      { name: "\u67F3\u6A59\u6C41\u6A58", hex: "#F28C28" },
-      { name: "\u9999\u74DC\u6A59", hex: "#F2A65A" },
-      { name: "\u67D4\u548C\u6843", hex: "#F5CBA7" },
-      // 黄/金
-      { name: "\u82A6\u82C7\u9EC4", hex: "#D9C97A" },
-      { name: "\u900F\u660E\u9EC4", hex: "#F5E663" },
-      { name: "\u9E45\u9EC4", hex: "#F2D16B" },
-      { name: "\u59DC\u9EC4", hex: "#D9A441" },
-      { name: "\u91D1\u9EA6\u9EC4", hex: "#D9B24A" },
-      { name: "\u7425\u73C0\u9EC4", hex: "#D99400" },
-      { name: "\u91D1\u68D5\u6988\u8272", hex: "#C9A227" },
-      { name: "\u91D1\u5408\u6B22", hex: "#C77F2F" },
-      { name: "\u9999\u69DF\u91D1", hex: "#D4C5A0" },
-      // 棕/赭
-      { name: "\u8D64\u8910\u8D6D", hex: "#8C4A2F" },
-      { name: "\u6817\u8D64\u8272", hex: "#7A3B2E" },
-      { name: "\u7EA2\u68D5\u8272", hex: "#8B3A2A" },
-      { name: "\u62FF\u94C1\u68D5", hex: "#9C7A5B" },
-      { name: "\u8DEF\u6613\u5A01\u767B\u68D5", hex: "#4E3424" },
-      { name: "\u51E1\u6234\u514B\u68D5", hex: "#3D2B1F" },
-      { name: "\u6DF1\u7119\u68D5", hex: "#4A2E1E" },
-      { name: "\u5DE7\u514B\u529B\u8272", hex: "#5C3A24" },
-      { name: "\u7194\u5CA9\u70DF\u96FE", hex: "#7A6E6A" }
-    ]
-  },
-  {
-    id: "cool",
-    label: "\u51B7\u8272\u7CFB",
-    swatches: [
-      // 绿
-      { name: "\u7FE0\u7389\u7EFF", hex: "#2E8B6E" },
-      { name: "\u58A8\u7EFF", hex: "#1F3D2B" },
-      { name: "\u6DF1\u82D4\u7EFF", hex: "#3B4A2F" },
-      { name: "\u6DF1\u6A44\u6984\u7EFF", hex: "#4A5423" },
-      { name: "\u6A44\u6984\u7EFF", hex: "#6B7C4A" },
-      { name: "\u83B3\u841D\u7EFF", hex: "#6E7F4E" },
-      { name: "\u8C5A\u8349\u7EFF", hex: "#8A9A4B" },
-      { name: "\u8584\u8377\u7EFF", hex: "#98D8C8" },
-      // 蓝
-      { name: "\u8482\u8299\u5C3C\u84DD", hex: "#81D8D0" },
-      { name: "\u6D77\u6EE8\u84DD", hex: "#4FA3C2" },
-      { name: "\u5361\u5E03\u91CC\u84DD", hex: "#3579A8" },
-      { name: "\u8FDC\u5C71\u84DD", hex: "#7B9BB8" },
-      { name: "\u96FE\u973E\u84DD", hex: "#8FA8BF" },
-      { name: "\u725B\u4ED4\u84DD", hex: "#3B5B7C" },
-      { name: "\u85CF\u9752", hex: "#1B2A4A" },
-      { name: "\u7FA4\u9752", hex: "#4166B0" },
-      { name: "\u514B\u83B1\u56E0\u84DD", hex: "#002FA7" },
-      { name: "\u7075\u6C14\u975B\u84DD", hex: "#3F4E8C" },
-      // 紫
-      { name: "\u82CB\u83DC\u7D2B", hex: "#9B2D5F" },
-      { name: "\u7D2B\u7F57\u5170\u8272", hex: "#7F5AA2" },
-      { name: "\u85B0\u8863\u8349\u7D2B", hex: "#B4A7D6" },
-      { name: "\u9999\u828B\u7D2B", hex: "#B8A9C9" },
-      { name: "\u70DF\u718F\u7D2B", hex: "#6E5A72" },
-      { name: "\u6DF1\u7D2B", hex: "#4A3B5C" },
-      { name: "\u94F6\u7070", hex: "#C0C0C0" }
-    ]
-  }
-];
-var COLOR_PRESETS = COLOR_CATEGORIES.flatMap((c) => c.swatches);
-function nameOfColor(hex) {
-  return COLOR_PRESETS.find((c) => c.hex.toLowerCase() === hex.toLowerCase())?.name ?? hex;
-}
-function buildRecolorPrompt(colors) {
-  const list = colors.map((hex) => `${nameOfColor(hex)}(${hex})`).join("\u3001");
-  return `\u4FDD\u6301\u670D\u88C5\u7684\u7248\u578B\u3001\u6B3E\u5F0F\u7EC6\u8282\u3001\u6784\u56FE\u548C\u5149\u7EBF\u5B8C\u5168\u4E0D\u53D8\uFF0C\u4EC5\u5C06\u9762\u6599\u914D\u8272\u66FF\u6362\u4E3A\uFF1A${list}\u3002\u914D\u8272\u5E94\u7528\u4E8E\u9762\u6599\u4E3B\u4F53\uFF0C\u5448\u73B0\u771F\u5B9E\u9762\u6599\u8D28\u611F\u4E0E\u51C6\u786E\u8272\u5F69\uFF0C\u65E0\u6587\u5B57\u65E0\u6C34\u5370\u3002`;
-}
-
-// server/lib/generationRecords.ts
-import { nanoid as nanoid3 } from "nanoid";
-import path3 from "node:path";
-
 // server/lib/database.ts
 import pg from "pg";
 import { nanoid as nanoid2 } from "nanoid";
@@ -1601,6 +2026,11 @@ async function migrate() {
       project_id TEXT,
       node_id TEXT,
       run_id TEXT,
+      mime_type TEXT,
+      width INTEGER,
+      height INTEGER,
+      byte_length INTEGER,
+      normalized BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TEXT NOT NULL,
       deleted_at TEXT,
       purge_after TEXT
@@ -1769,6 +2199,117 @@ async function migrate() {
         ["account_data_retention_tombstones", (/* @__PURE__ */ new Date()).toISOString()]
       );
     }
+    if (!applied.has(6)) {
+      await client.query(`
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS plan_json TEXT;
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS target_step_id TEXT;
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS run_type TEXT NOT NULL DEFAULT 'workflow';
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS updated_at BIGINT;
+        ALTER TABLE generation_runs ADD COLUMN IF NOT EXISTS cancel_requested_at BIGINT;
+        UPDATE generation_runs SET updated_at = COALESCE(updated_at, finished_at, started_at);
+        ALTER TABLE generation_runs DROP CONSTRAINT IF EXISTS generation_runs_status_check;
+        ALTER TABLE generation_runs ADD CONSTRAINT generation_runs_status_check CHECK (status IN (
+          'queued','running','retry_wait','cancel_requested','cancelled',
+          'succeeded','failed','outcome_unknown','success','error'
+        ));
+        ALTER TABLE generation_runs DROP CONSTRAINT IF EXISTS generation_runs_run_type_check;
+        ALTER TABLE generation_runs ADD CONSTRAINT generation_runs_run_type_check
+          CHECK (run_type IN ('workflow','direct'));
+
+        CREATE TABLE IF NOT EXISTS generation_run_steps (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+          step_index INTEGER NOT NULL,
+          node_id TEXT NOT NULL,
+          kind TEXT NOT NULL,
+          step_json TEXT NOT NULL,
+          status TEXT NOT NULL CHECK (status IN (
+            'queued','running','retry_wait','cancel_requested','cancelled',
+            'succeeded','failed','outcome_unknown'
+          )),
+          model TEXT,
+          output_images_json TEXT NOT NULL DEFAULT '[]',
+          prompts_json TEXT NOT NULL DEFAULT '[]',
+          failures_json TEXT NOT NULL DEFAULT '[]',
+          provider_requests INTEGER NOT NULL DEFAULT 0,
+          error TEXT,
+          started_at BIGINT,
+          finished_at BIGINT,
+          UNIQUE (run_id, step_index),
+          UNIQUE (run_id, node_id)
+        );
+        CREATE INDEX IF NOT EXISTS generation_run_steps_run_idx
+          ON generation_run_steps(run_id, step_index);
+
+        CREATE TABLE IF NOT EXISTS generation_jobs (
+          id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+          step_id TEXT NOT NULL UNIQUE REFERENCES generation_run_steps(id) ON DELETE CASCADE,
+          idempotency_key TEXT NOT NULL UNIQUE,
+          status TEXT NOT NULL CHECK (status IN (
+            'queued','running','retry_wait','cancel_requested','cancelled',
+            'succeeded','failed','outcome_unknown'
+          )),
+          retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count BETWEEN 0 AND 2),
+          available_at BIGINT NOT NULL,
+          worker_id TEXT,
+          lease_expires_at BIGINT,
+          attempt_started_at BIGINT,
+          last_error TEXT,
+          created_at BIGINT NOT NULL,
+          updated_at BIGINT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS generation_jobs_claim_idx
+          ON generation_jobs(status, available_at, lease_expires_at);
+        CREATE INDEX IF NOT EXISTS generation_jobs_run_idx ON generation_jobs(run_id);
+
+        CREATE TABLE IF NOT EXISTS generation_run_events (
+          run_id TEXT NOT NULL REFERENCES generation_runs(id) ON DELETE CASCADE,
+          seq INTEGER NOT NULL,
+          payload_json TEXT NOT NULL,
+          created_at BIGINT NOT NULL,
+          PRIMARY KEY (run_id, seq)
+        );
+        CREATE INDEX IF NOT EXISTS generation_run_events_created_idx
+          ON generation_run_events(run_id, created_at);
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (6, $1, $2)",
+        ["durable_generation_queue", (/* @__PURE__ */ new Date()).toISOString()]
+      );
+    }
+    if (!applied.has(7)) {
+      await client.query(`
+        ALTER TABLE generation_run_steps
+          ADD COLUMN IF NOT EXISTS provider_output_sizes_json TEXT NOT NULL DEFAULT '[]';
+        ALTER TABLE generation_outputs
+          ADD COLUMN IF NOT EXISTS provider_output_size TEXT;
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (7, $1, $2)",
+        ["provider_output_size_metadata", (/* @__PURE__ */ new Date()).toISOString()]
+      );
+    }
+    if (!applied.has(8)) {
+      await client.query(`
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS mime_type TEXT;
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS width INTEGER;
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS height INTEGER;
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS byte_length INTEGER;
+        ALTER TABLE files ADD COLUMN IF NOT EXISTS normalized BOOLEAN NOT NULL DEFAULT FALSE;
+        ALTER TABLE files DROP CONSTRAINT IF EXISTS files_normalized_metadata_check;
+        ALTER TABLE files ADD CONSTRAINT files_normalized_metadata_check CHECK (
+          normalized = FALSE OR (
+            mime_type IN ('image/png', 'image/jpeg') AND
+            width > 0 AND height > 0 AND byte_length > 0
+          )
+        );
+      `);
+      await client.query(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (8, $1, $2)",
+        ["normalized_upload_metadata", (/* @__PURE__ */ new Date()).toISOString()]
+      );
+    }
     return imported;
   });
   if (importedRows !== void 0) {
@@ -1805,125 +2346,201 @@ async function databaseReady() {
   }
 }
 
+// server/lib/imagePostProcessing.ts
+import sharp5 from "sharp";
+var EXACT_ASPECT_DIMENSIONS = {
+  "1:1": { width: 1024, height: 1024 },
+  "3:4": { width: 1152, height: 1536 },
+  "4:3": { width: 1536, height: 1152 },
+  "9:16": { width: 864, height: 1536 },
+  "16:9": { width: 1536, height: 864 }
+};
+var WEBP_QUALITIES = [92, 84, 76, 68, 60, 50, 40, 30, 20, 10];
+var SHARP_INPUT_OPTIONS2 = {
+  animated: false,
+  failOn: "warning",
+  limitInputPixels: 4e7
+};
+function isExactAspectRatio(value) {
+  return typeof value === "string" && Object.prototype.hasOwnProperty.call(EXACT_ASPECT_DIMENSIONS, value);
+}
+function isUpscaleSize(value) {
+  return value === "2K" || value === "4K";
+}
+function normalizeExactAspectRatio(value) {
+  return isExactAspectRatio(value) ? value : "1:1";
+}
+function normalizeUpscaleSize(value) {
+  return isUpscaleSize(value) ? value : "2K";
+}
+async function imageRefToBuffer(ref) {
+  const dataUrl = await normalizeImageRef(ref);
+  return validateImageDataUrl(dataUrl).buffer;
+}
+async function encodeWebpWithinLimit(image) {
+  for (const quality of WEBP_QUALITIES) {
+    const output = await image.clone().webp({ quality, effort: 4, smartSubsample: true }).toBuffer();
+    if (output.byteLength <= MAX_IMAGE_BYTES) return output;
+  }
+  throw new Error(`processed image exceeds ${MAX_IMAGE_BYTES} bytes even at minimum quality`);
+}
+function toWebpDataUrl(buffer) {
+  return `data:image/webp;base64,${buffer.toString("base64")}`;
+}
+async function fitGeneratedImageToAspect(ref, aspectRatio) {
+  return withImageProcessingSlot(async () => {
+    const normalizedAspectRatio = normalizeExactAspectRatio(aspectRatio);
+    const input = await imageRefToBuffer(ref);
+    const { width, height } = EXACT_ASPECT_DIMENSIONS[normalizedAspectRatio];
+    const source = sharp5(input, SHARP_INPUT_OPTIONS2).rotate();
+    const { dominant } = await source.clone().stats();
+    const background = { r: dominant.r, g: dominant.g, b: dominant.b, alpha: 1 };
+    const output = await encodeWebpWithinLimit(
+      source.resize({ width, height, fit: "contain", position: "centre", background }).flatten({ background }).toColourspace("srgb")
+    );
+    return toWebpDataUrl(output);
+  });
+}
+async function upscaleImageToLongEdge(ref, imageSize) {
+  return withImageProcessingSlot(async () => {
+    const normalizedImageSize = normalizeUpscaleSize(imageSize);
+    const input = await imageRefToBuffer(ref);
+    const longEdge = normalizedImageSize === "4K" ? 4096 : 2048;
+    const output = await encodeWebpWithinLimit(
+      sharp5(input, SHARP_INPUT_OPTIONS2).rotate().resize({ width: longEdge, height: longEdge, fit: "inside" }).toColourspace("srgb")
+    );
+    return toWebpDataUrl(output);
+  });
+}
+
+// src/lib/colors.ts
+var COLOR_CATEGORIES = [
+  {
+    id: "neutral",
+    label: "\u4E2D\u6027\u57FA\u7840\u8272",
+    swatches: [
+      { name: "\u78B3\u7D20\u9ED1", hex: "#161616" },
+      { name: "\u68D5\u9ED1", hex: "#2B1D16" },
+      { name: "\u70AD\u9ED1", hex: "#1A1A1A" },
+      { name: "\u66AE\u8272\u7070", hex: "#6B6B70" },
+      { name: "\u70DF\u7070", hex: "#6E6E6E" },
+      { name: "\u6DF1\u6D77\u9E25\u7070", hex: "#8B9296" },
+      { name: "\u6C34\u6CE5\u7070", hex: "#9A9A98" },
+      { name: "\u5927\u8C61\u7070", hex: "#8A8378" },
+      { name: "\u66AE\u6C99\u7070", hex: "#A39B8B" },
+      { name: "\u4E91\u70DF\u7070", hex: "#B9B7B2" },
+      { name: "\u6D45\u7070", hex: "#C8C8C8" },
+      { name: "\u73CD\u73E0\u767D", hex: "#F2EFE9" },
+      { name: "\u71D5\u9EA6\u767D", hex: "#EDE6D6" },
+      { name: "\u739B\u7459\u767D", hex: "#E9E4DA" },
+      { name: "\u7C73\u767D", hex: "#F5F0E6" },
+      { name: "\u67D4\u548C\u7C73", hex: "#E5DCC8" },
+      { name: "\u5976\u674F\u7C73", hex: "#F0E4CE" },
+      { name: "\u7EAF\u767D", hex: "#FFFFFF" },
+      { name: "\u9999\u69DF\u8272", hex: "#F0DCB8" },
+      { name: "\u9A7C\u8272", hex: "#C19A6B" },
+      { name: "\u5361\u5176", hex: "#B8A47E" },
+      { name: "\u5496\u5561", hex: "#6F4E37" },
+      { name: "\u6989\u6728\u8272", hex: "#A67B4F" },
+      { name: "\u7126\u7CD6", hex: "#A0522D" }
+    ]
+  },
+  {
+    id: "warm",
+    label: "\u6696\u8272\u7CFB",
+    swatches: [
+      // 红
+      { name: "\u7194\u5CA9\u7EA2", hex: "#B03A2E" },
+      { name: "\u4E2D\u56FD\u7EA2", hex: "#DE2910" },
+      { name: "\u6B63\u7EA2", hex: "#C8102E" },
+      { name: "\u6A31\u6843\u7EA2", hex: "#C2183C" },
+      { name: "\u6CE2\u826E\u7B2C\u7EA2", hex: "#5C1A24" },
+      { name: "\u9152\u7EA2", hex: "#722F37" },
+      { name: "\u6885\u6D1B\u8461\u8404\u9152\u7EA2", hex: "#6E2438" },
+      { name: "\u7816\u7EA2", hex: "#B5493A" },
+      // 粉
+      { name: "\u8393\u679C\u7C89", hex: "#D98CA6" },
+      { name: "\u82AD\u6BD4\u7C89", hex: "#E0219C" },
+      { name: "\u73CA\u745A\u7C89", hex: "#F88379" },
+      { name: "\u85D5\u7C89", hex: "#E8C4C4" },
+      { name: "\u73AB\u7470\u8336", hex: "#C08585" },
+      { name: "\u96FE\u73AB\u7470\u8272", hex: "#B48A8C" },
+      { name: "\u7070\u7C89\u73AB", hex: "#C4A4A8" },
+      { name: "\u73AB\u7470\u91D1", hex: "#B76E79" },
+      // 橙
+      { name: "\u7231\u9A6C\u4ED5\u6A59", hex: "#F37021" },
+      { name: "\u6A58\u6A59", hex: "#E8752A" },
+      { name: "\u67F3\u6A59\u6C41\u6A58", hex: "#F28C28" },
+      { name: "\u9999\u74DC\u6A59", hex: "#F2A65A" },
+      { name: "\u67D4\u548C\u6843", hex: "#F5CBA7" },
+      // 黄/金
+      { name: "\u82A6\u82C7\u9EC4", hex: "#D9C97A" },
+      { name: "\u900F\u660E\u9EC4", hex: "#F5E663" },
+      { name: "\u9E45\u9EC4", hex: "#F2D16B" },
+      { name: "\u59DC\u9EC4", hex: "#D9A441" },
+      { name: "\u91D1\u9EA6\u9EC4", hex: "#D9B24A" },
+      { name: "\u7425\u73C0\u9EC4", hex: "#D99400" },
+      { name: "\u91D1\u68D5\u6988\u8272", hex: "#C9A227" },
+      { name: "\u91D1\u5408\u6B22", hex: "#C77F2F" },
+      { name: "\u9999\u69DF\u91D1", hex: "#D4C5A0" },
+      // 棕/赭
+      { name: "\u8D64\u8910\u8D6D", hex: "#8C4A2F" },
+      { name: "\u6817\u8D64\u8272", hex: "#7A3B2E" },
+      { name: "\u7EA2\u68D5\u8272", hex: "#8B3A2A" },
+      { name: "\u62FF\u94C1\u68D5", hex: "#9C7A5B" },
+      { name: "\u8DEF\u6613\u5A01\u767B\u68D5", hex: "#4E3424" },
+      { name: "\u51E1\u6234\u514B\u68D5", hex: "#3D2B1F" },
+      { name: "\u6DF1\u7119\u68D5", hex: "#4A2E1E" },
+      { name: "\u5DE7\u514B\u529B\u8272", hex: "#5C3A24" },
+      { name: "\u7194\u5CA9\u70DF\u96FE", hex: "#7A6E6A" }
+    ]
+  },
+  {
+    id: "cool",
+    label: "\u51B7\u8272\u7CFB",
+    swatches: [
+      // 绿
+      { name: "\u7FE0\u7389\u7EFF", hex: "#2E8B6E" },
+      { name: "\u58A8\u7EFF", hex: "#1F3D2B" },
+      { name: "\u6DF1\u82D4\u7EFF", hex: "#3B4A2F" },
+      { name: "\u6DF1\u6A44\u6984\u7EFF", hex: "#4A5423" },
+      { name: "\u6A44\u6984\u7EFF", hex: "#6B7C4A" },
+      { name: "\u83B3\u841D\u7EFF", hex: "#6E7F4E" },
+      { name: "\u8C5A\u8349\u7EFF", hex: "#8A9A4B" },
+      { name: "\u8584\u8377\u7EFF", hex: "#98D8C8" },
+      // 蓝
+      { name: "\u8482\u8299\u5C3C\u84DD", hex: "#81D8D0" },
+      { name: "\u6D77\u6EE8\u84DD", hex: "#4FA3C2" },
+      { name: "\u5361\u5E03\u91CC\u84DD", hex: "#3579A8" },
+      { name: "\u8FDC\u5C71\u84DD", hex: "#7B9BB8" },
+      { name: "\u96FE\u973E\u84DD", hex: "#8FA8BF" },
+      { name: "\u725B\u4ED4\u84DD", hex: "#3B5B7C" },
+      { name: "\u85CF\u9752", hex: "#1B2A4A" },
+      { name: "\u7FA4\u9752", hex: "#4166B0" },
+      { name: "\u514B\u83B1\u56E0\u84DD", hex: "#002FA7" },
+      { name: "\u7075\u6C14\u975B\u84DD", hex: "#3F4E8C" },
+      // 紫
+      { name: "\u82CB\u83DC\u7D2B", hex: "#9B2D5F" },
+      { name: "\u7D2B\u7F57\u5170\u8272", hex: "#7F5AA2" },
+      { name: "\u85B0\u8863\u8349\u7D2B", hex: "#B4A7D6" },
+      { name: "\u9999\u828B\u7D2B", hex: "#B8A9C9" },
+      { name: "\u70DF\u718F\u7D2B", hex: "#6E5A72" },
+      { name: "\u6DF1\u7D2B", hex: "#4A3B5C" },
+      { name: "\u94F6\u7070", hex: "#C0C0C0" }
+    ]
+  }
+];
+var COLOR_PRESETS = COLOR_CATEGORIES.flatMap((c) => c.swatches);
+function nameOfColor(hex) {
+  return COLOR_PRESETS.find((c) => c.hex.toLowerCase() === hex.toLowerCase())?.name ?? hex;
+}
+function buildRecolorPrompt(colors) {
+  const list = colors.map((hex) => `${nameOfColor(hex)}(${hex})`).join("\u3001");
+  return `\u4FDD\u6301\u670D\u88C5\u7684\u7248\u578B\u3001\u6B3E\u5F0F\u7EC6\u8282\u3001\u6784\u56FE\u548C\u5149\u7EBF\u5B8C\u5168\u4E0D\u53D8\uFF0C\u4EC5\u5C06\u9762\u6599\u914D\u8272\u66FF\u6362\u4E3A\uFF1A${list}\u3002\u914D\u8272\u5E94\u7528\u4E8E\u9762\u6599\u4E3B\u4F53\uFF0C\u5448\u73B0\u771F\u5B9E\u9762\u6599\u8D28\u611F\u4E0E\u51C6\u786E\u8272\u5F69\uFF0C\u65E0\u6587\u5B57\u65E0\u6C34\u5370\u3002`;
+}
+
 // server/lib/generationRecords.ts
-async function createGenerationRecord(runId, context, startedAt) {
-  await query(`
-    INSERT INTO generation_runs (
-      id, owner_id, project_id, project_name, node_id, node_label, kind, prompt,
-      parameters_json, reference_images_json, requested_count, status, started_at
-    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'queued', $12)
-  `, [
-    runId,
-    context.userId,
-    context.projectId ?? null,
-    context.projectName ?? null,
-    context.nodeId,
-    context.nodeLabel,
-    context.kind,
-    context.prompt ?? null,
-    JSON.stringify(context.parameters ?? {}),
-    JSON.stringify(context.referenceImages ?? []),
-    context.requestedCount,
-    startedAt
-  ]);
-}
-async function markGenerationRunning(runId, startedAt) {
-  await query("UPDATE generation_runs SET status = 'running', started_at = $1 WHERE id = $2", [startedAt, runId]);
-}
-async function registerGeneratedFiles(context, runId, nodeId, images, createdAt) {
-  const createdAtIso = new Date(createdAt).toISOString();
-  await transaction(async (client) => {
-    for (const image of images) {
-      if (!image.startsWith("/api/files/")) continue;
-      await client.query(`
-        INSERT INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)
-        VALUES ($1, $2, 'generated', $3, $4, $5, $6)
-        ON CONFLICT (id) DO NOTHING
-      `, [path3.basename(image), context.userId, context.projectId ?? null, nodeId, runId, createdAtIso]);
-    }
-  });
-}
-async function completeGenerationRecord(args) {
-  await transaction(async (client) => {
-    const run = await queryOne(
-      "SELECT owner_id, project_id, node_id FROM generation_runs WHERE id = $1 FOR UPDATE",
-      [args.runId],
-      client
-    );
-    if (!run) return;
-    await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [args.runId]);
-    for (const [index, image] of args.images.entries()) {
-      await client.query(`
-        INSERT INTO generation_outputs (id, run_id, image, prompt, status, error, created_at)
-        VALUES ($1, $2, $3, $4, 'success', NULL, $5)
-      `, [nanoid3(12), args.runId, image, args.prompts?.[index] ?? null, args.finishedAt + index]);
-      if (image.startsWith("/api/files/")) {
-        await client.query(`
-          INSERT INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)
-          VALUES ($1, $2, 'generated', $3, $4, $5, $6)
-          ON CONFLICT (id) DO NOTHING
-        `, [path3.basename(image), run.owner_id, run.project_id, run.node_id, args.runId, new Date(args.finishedAt).toISOString()]);
-      }
-    }
-    for (const [index, failure] of (args.failures ?? []).entries()) {
-      await client.query(`
-        INSERT INTO generation_outputs (id, run_id, image, prompt, status, error, created_at)
-        VALUES ($1, $2, '', $3, 'error', $4, $5)
-      `, [nanoid3(12), args.runId, failure.prompt ?? null, failure.error, args.finishedAt + args.images.length + index]);
-    }
-    const warning = args.failures?.length ? `${args.failures.length} \u4E2A\u751F\u6210\u4EFB\u52A1\u5931\u8D25` : null;
-    await client.query(`
-      UPDATE generation_runs SET status = 'success', successful_count = $1, provider_requests = $2,
-        model = $3, error = $4, finished_at = $5 WHERE id = $6
-    `, [args.images.length, args.providerRequests, args.model ?? null, warning, args.finishedAt, args.runId]);
-    if (args.images.length > 0) {
-      await client.query(`
-        INSERT INTO usage_events (
-          id, owner_id, run_id, project_id, node_id, model, successful_count,
-          provider_requests, duration_ms, created_at
-        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-        ON CONFLICT (run_id) DO UPDATE SET
-          model = excluded.model,
-          successful_count = excluded.successful_count,
-          provider_requests = excluded.provider_requests,
-          duration_ms = excluded.duration_ms,
-          created_at = excluded.created_at
-      `, [
-        nanoid3(12),
-        run.owner_id,
-        args.runId,
-        run.project_id,
-        run.node_id,
-        args.model ?? null,
-        args.images.length,
-        args.providerRequests,
-        Math.max(0, args.finishedAt - args.startedAt),
-        new Date(args.finishedAt).toISOString()
-      ]);
-    }
-  });
-}
-async function failGenerationRecord(runId, error, finishedAt) {
-  const generatedFileIds = await transaction(async (client) => {
-    const files = await client.query(
-      "SELECT id FROM files WHERE run_id = $1 FOR UPDATE",
-      [runId]
-    );
-    await client.query("UPDATE generation_runs SET status = 'error', error = $1, finished_at = $2 WHERE id = $3", [
-      error,
-      finishedAt,
-      runId
-    ]);
-    await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [runId]);
-    await client.query(`
-      INSERT INTO generation_outputs (id, run_id, image, status, error, created_at)
-      SELECT $1, id, '', 'error', $2, $3 FROM generation_runs WHERE id = $4
-    `, [nanoid3(12), error, finishedAt, runId]);
-    await client.query("DELETE FROM files WHERE run_id = $1", [runId]);
-    return files.rows.map((row) => row.id);
-  });
-  generatedFileIds.forEach(deleteStoredImage);
-}
+import { nanoid as nanoid3 } from "nanoid";
 
 // server/engine/runner.ts
 var DEFAULT_PROMPTS = {
@@ -1932,154 +2549,10 @@ var DEFAULT_PROMPTS = {
   "fabric-recolor": "\u4FDD\u6301\u670D\u88C5\u6B3E\u5F0F\u3001\u7EC6\u8282\u3001\u5149\u5F71\u4E0E\u80CC\u666F\u4E0D\u53D8\uFF0C\u4EC5\u66FF\u6362\u9762\u6599\u8D28\u611F"
 };
 var runs = /* @__PURE__ */ new Map();
-var MAX_FINISHED_RUNS = 50;
 var FINISHED_RUN_TTL_MS = 30 * 60 * 1e3;
-function pruneRuns() {
-  const now = Date.now();
-  const finished = [];
-  for (const run of runs.values()) {
-    if (!run.finished) continue;
-    if (run.emitter.listenerCount("event") > 0) continue;
-    if (now - run.createdAt > FINISHED_RUN_TTL_MS) {
-      runs.delete(run.id);
-    } else {
-      finished.push(run);
-    }
-  }
-  if (finished.length > MAX_FINISHED_RUNS) {
-    finished.sort((a, b) => a.createdAt - b.createdAt);
-    for (const run of finished.slice(0, finished.length - MAX_FINISHED_RUNS)) {
-      runs.delete(run.id);
-    }
-  }
-}
 function getRunForUser(id, ownerId) {
   const run = runs.get(id);
   return run?.ownerId === ownerId ? run : void 0;
-}
-async function createRun(plan, ownerId, recordContext) {
-  if (!ownerId.trim()) throw new Error("run ownerId is required");
-  if (recordContext && recordContext.userId !== ownerId) {
-    throw new Error("run ownerId must match recordContext.userId");
-  }
-  pruneRuns();
-  const run = {
-    id: nanoid4(10),
-    ownerId,
-    plan,
-    emitter: new EventEmitter(),
-    events: [],
-    finished: false,
-    createdAt: Date.now(),
-    recordContext
-  };
-  run.emitter.setMaxListeners(50);
-  runs.set(run.id, run);
-  if (recordContext) await createGenerationRecord(run.id, recordContext, run.createdAt);
-  setImmediate(() => {
-    executeRun(run).catch(async (err) => {
-      const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
-      if (run.recordContext) await failGenerationRecord(run.id, message, Date.now());
-      emit(run, { type: "run-error", error: message });
-    });
-  });
-  return run;
-}
-function emit(run, event) {
-  const sequenced = { ...event, seq: run.events.length + 1 };
-  run.events.push(sequenced);
-  run.emitter.emit("event", sequenced);
-  if (sequenced.type === "done" || sequenced.type === "run-error") {
-    run.finished = true;
-    run.emitter.emit("finish");
-  }
-}
-async function executeRun(run) {
-  const outputs = /* @__PURE__ */ new Map();
-  let providerRequests = 0;
-  let model;
-  let recordResult;
-  if (run.recordContext) await markGenerationRunning(run.id, Date.now());
-  const failRun = async (message, nodeId, startedAt) => {
-    const finishedAt = Date.now();
-    if (run.recordContext) await failGenerationRecord(run.id, message, finishedAt);
-    if (nodeId) {
-      emit(run, {
-        type: "node-status",
-        nodeId,
-        status: "error",
-        error: message,
-        ...startedAt !== void 0 ? { startedAt } : {},
-        finishedAt
-      });
-    }
-    emit(run, { type: "run-error", ...nodeId ? { nodeId } : {}, error: message, finishedAt });
-  };
-  for (const step of run.plan.steps) {
-    const inputImages = (step.upstream ?? []).flatMap(
-      (u) => outputs.get(u.nodeId) ?? u.images
-    );
-    if (NODE_SPECS[step.kind].providerId && inputImages.length > MAX_REFERENCE_IMAGES) {
-      const message = `Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`;
-      await failRun(message, step.nodeId);
-      return;
-    }
-    if (NODE_SPECS[step.kind].providerId && step.kind !== "sketch-to-render" && inputImages.length === 0) {
-      const message = `Node ${step.nodeId} requires an upstream image`;
-      await failRun(message, step.nodeId);
-      return;
-    }
-    const startedAt = Date.now();
-    emit(run, { type: "node-status", nodeId: step.nodeId, status: "running", startedAt });
-    try {
-      const result = await executeStep(step, inputImages, getProvider, run.id);
-      const persisted = await persistOutputImages(result.images);
-      if (run.recordContext) {
-        await registerGeneratedFiles(run.recordContext, run.id, step.nodeId, persisted, Date.now());
-      }
-      outputs.set(step.nodeId, persisted);
-      const finishedAt = Date.now();
-      providerRequests += result.providerRequests;
-      if (result.model) model = result.model;
-      if (run.recordContext?.nodeId === step.nodeId) {
-        recordResult = { images: persisted, prompts: result.prompts, failures: result.failures };
-      }
-      const partialWarning = result.failures?.length ? `${result.failures.length} \u4E2A\u751F\u6210\u4EFB\u52A1\u5931\u8D25` : void 0;
-      emit(run, {
-        type: "node-status",
-        nodeId: step.nodeId,
-        status: "success",
-        images: persisted,
-        error: partialWarning,
-        model: result.model,
-        prompts: result.prompts,
-        failures: result.failures,
-        startedAt,
-        finishedAt
-      });
-    } catch (err) {
-      const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
-      await failRun(message, step.nodeId, startedAt);
-      return;
-    }
-  }
-  if (run.recordContext) {
-    const finishedAt = Date.now();
-    await completeGenerationRecord({
-      runId: run.id,
-      images: recordResult?.images ?? [],
-      prompts: recordResult?.prompts,
-      failures: recordResult?.failures,
-      model,
-      providerRequests,
-      startedAt: run.createdAt,
-      finishedAt
-    });
-  }
-  emit(run, { type: "done" });
-}
-async function persistOutputImages(images) {
-  return Promise.all(images.map((img) => persistImageRef(img)));
 }
 async function postProcessGeneratedOutputImages(kind, params, images) {
   if (kind !== "sketch-to-render" && kind !== "ai-modify" && kind !== "upscale") return images;
@@ -2093,11 +2566,12 @@ async function postProcessGeneratedOutputImages(kind, params, images) {
   }
   return processed;
 }
-async function executeStep(step, inputImages, resolveProvider = getProvider, runId) {
+async function executeStep(step, inputImages, resolveProvider = getProvider, runIdOrOptions) {
+  const options = typeof runIdOrOptions === "string" ? { runId: runIdOrOptions } : runIdOrOptions ?? {};
   switch (step.kind) {
     case "image-input": {
-      const imageUrl = step.params.imageUrl;
-      return { images: imageUrl ? [imageUrl] : [], providerRequests: 0 };
+      const imageUrl2 = step.params.imageUrl;
+      return { images: imageUrl2 ? [imageUrl2] : [], providerRequests: 0 };
     }
     case "result": {
       return { images: inputImages, providerRequests: 0 };
@@ -2107,16 +2581,25 @@ async function executeStep(step, inputImages, resolveProvider = getProvider, run
     case "fabric-recolor":
     case "upscale":
     case "print-extract":
-    case "print-mutate": {
-      const spec = NODE_SPECS[step.kind];
-      const provider = resolveProvider(spec.providerId);
+    case "print-mutate":
+    case "mask-redraw": {
+      const modelId = isImageModelId(step.params.modelId) ? step.params.modelId : step.kind === "mask-redraw" ? MASK_REDRAW_MODEL_ID : DEFAULT_GENERATION_MODEL_ID;
+      if (!isModelAllowedForNode(modelId, step.kind)) {
+        throw new Error(`Model ${modelId} is not allowed for node ${step.nodeId}`);
+      }
+      const provider = resolveProvider(modelId);
+      const modelOptions = step.params.modelOptions;
+      if (step.kind === "mask-redraw" && (typeof step.params.maskSourceRef !== "string" || step.params.maskSourceRef !== inputImages[0])) {
+        throw new Error("\u8499\u7248\u5BF9\u5E94\u7684\u539F\u56FE\u5DF2\u53D8\u5316\uFF0C\u8BF7\u91CD\u65B0\u7ED8\u5236\u8499\u7248");
+      }
       const referenceImages = await resolveImageRefs(inputImages);
       const fabricImageUrl = step.params.fabricImageUrl;
       if (step.kind === "fabric-recolor" && fabricImageUrl) {
         referenceImages.push(...await resolveImageRefs([fabricImageUrl]));
       }
-      if (referenceImages.length > MAX_REFERENCE_IMAGES) {
-        throw new Error(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
+      const maxReferences = Math.min(MAX_REFERENCE_IMAGES, modelMaxReferenceImages(modelId));
+      if (referenceImages.length > maxReferences) {
+        throw new Error(`Node ${step.nodeId} accepts at most ${maxReferences} reference images for ${modelId}`);
       }
       const extra = (step.params.prompt ?? "").trim();
       if (step.kind === "fabric-recolor") {
@@ -2124,72 +2607,126 @@ async function executeStep(step, inputImages, resolveProvider = getProvider, run
         if (colors.length > 0) {
           const images2 = [];
           const prompts = [];
+          const providerOutputSizes = [];
           const failures = [];
           let model;
           let providerRequests = 0;
+          let firstError;
           for (const color of colors) {
             const prompt2 = buildRecolorPrompt([color]);
             try {
-              const result2 = await generateExactImages(provider, { prompt: prompt2, referenceImages }, 1, { runId, nodeId: step.nodeId });
+              const result2 = await generateExactImages(
+                provider,
+                { prompt: prompt2, referenceImages, modelOptions },
+                1,
+                { ...options, nodeId: step.nodeId }
+              );
               providerRequests += result2.providerRequests;
               model = result2.model;
-              for (const image of result2.images) {
+              for (const [index, image] of result2.images.entries()) {
                 images2.push(image);
                 prompts.push(prompt2);
+                providerOutputSizes.push(result2.providerOutputSizes?.[index] ?? null);
               }
             } catch (err) {
+              firstError ??= err;
+              if (err instanceof ProviderError && err.category === "outcome_unknown") throw err;
               failures.push({
                 prompt: prompt2,
                 error: err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err)
               });
+              if (images2.length > 0) break;
+              if (err instanceof ProviderError && (err.status === 429 || err.status === 503 || ["gateway_authentication", "invalid_request", "model_unavailable"].includes(err.category))) throw err;
             }
           }
           if (images2.length === 0) {
-            throw new Error(failures[0]?.error ?? "\u5168\u90E8\u914D\u8272\u751F\u6210\u5931\u8D25");
+            throw firstError instanceof Error ? firstError : new Error(failures[0]?.error ?? "\u5168\u90E8\u914D\u8272\u751F\u6210\u5931\u8D25");
           }
-          return { images: images2, prompts, model, providerRequests, failures: failures.length ? failures : void 0 };
+          return {
+            images: images2,
+            prompts,
+            model,
+            providerRequests,
+            providerOutputSizes: providerOutputSizes.some((size) => size !== null) ? providerOutputSizes : void 0,
+            failures: failures.length ? failures : void 0
+          };
         }
       }
       if (step.kind === "print-mutate") {
         const count = Math.max(1, Math.min(8, Number(step.params.count) || 4));
         const prompt2 = "\u57FA\u4E8E\u8FD9\u5F20\u5370\u82B1\u56FE\u6848\u751F\u6210\u98CE\u683C\u4E00\u81F4\u7684\u65B0\u53D8\u4F53\uFF1A\u4FDD\u6301\u539F\u6709\u914D\u8272\u4F53\u7CFB\u3001\u827A\u672F\u98CE\u683C\u4E0E\u7B14\u89E6\u8D28\u611F\uFF0C\u91CD\u65B0\u7F16\u6392\u5143\u7D20\u7684\u6784\u56FE\u4E0E\u7EC4\u5408\u65B9\u5F0F\uFF0C\u7EAF\u767D\u80CC\u666F\uFF0C\u9002\u5408\u4F5C\u4E3A\u5370\u82B1\u7D20\u6750\u590D\u7528" + (extra ? `\u3002\u8865\u5145\u8981\u6C42\uFF1A${extra}` : "");
-        const result2 = await generateExactImages(provider, { prompt: prompt2, referenceImages }, count, { runId, nodeId: step.nodeId });
+        const result2 = await generateExactImages(
+          provider,
+          { prompt: prompt2, referenceImages, modelOptions },
+          count,
+          { ...options, nodeId: step.nodeId }
+        );
         const failures = result2.failures.map((error) => ({ prompt: prompt2, error }));
         return {
           images: result2.images,
           prompts: result2.images.map(() => prompt2),
           model: result2.model,
           providerRequests: result2.providerRequests,
+          providerOutputSizes: result2.providerOutputSizes,
           failures: failures.length ? failures : void 0
         };
       }
-      const prompt = step.kind === "upscale" ? "\u5C06\u8FD9\u5F20\u670D\u88C5\u6548\u679C\u56FE\u653E\u5927\u4E3A\u8D85\u9AD8\u6E05\u7248\u672C\uFF0C\u589E\u5F3A\u9762\u6599\u7EB9\u7406\u3001\u8D70\u7EBF\u4E0E\u8FB9\u7F18\u7EC6\u8282\uFF0C\u4FDD\u6301\u539F\u6709\u6784\u56FE\u3001\u8272\u5F69\u548C\u5149\u5F71\u5B8C\u5168\u4E0D\u53D8" : step.kind === "print-extract" ? "\u63D0\u53D6\u8FD9\u4EF6\u8863\u670D\u4E0A\u7684\u5370\u82B1\u56FE\u6848\uFF1A\u5C06\u5370\u82B1\u5B8C\u6574\u62A0\u51FA\u5E76\u5E73\u94FA\u5C55\u5F00\u4E3A\u89C4\u6574\u7684\u77E9\u5F62\u56FE\u6848\uFF0C\u7EAF\u767D\u80CC\u666F\uFF0C\u53BB\u9664\u8863\u8EAB\u3001\u8936\u76B1\u3001\u9634\u5F71\u548C\u7A7F\u7740\u6548\u679C\uFF0C\u5370\u82B1\u7684\u6BD4\u4F8B\u3001\u7EC6\u8282\u548C\u8272\u5F69\u4E0E\u539F\u56FE\u4FDD\u6301\u4E00\u81F4\uFF0C\u9002\u5408\u4F5C\u4E3A\u5370\u82B1\u7D20\u6750\u590D\u7528" + (extra ? `\u3002\u8865\u5145\u8981\u6C42\uFF1A${extra}` : "") : extra || DEFAULT_PROMPTS[step.kind] || NODE_SPECS[step.kind].description;
+      const prompt = step.kind === "upscale" ? "\u5C06\u8FD9\u5F20\u670D\u88C5\u6548\u679C\u56FE\u653E\u5927\u4E3A\u8D85\u9AD8\u6E05\u7248\u672C\uFF0C\u589E\u5F3A\u9762\u6599\u7EB9\u7406\u3001\u8D70\u7EBF\u4E0E\u8FB9\u7F18\u7EC6\u8282\uFF0C\u4FDD\u6301\u539F\u6709\u6784\u56FE\u3001\u8272\u5F69\u548C\u5149\u5F71\u5B8C\u5168\u4E0D\u53D8" : step.kind === "print-extract" ? "\u63D0\u53D6\u8FD9\u4EF6\u8863\u670D\u4E0A\u7684\u5370\u82B1\u56FE\u6848\uFF1A\u5C06\u5370\u82B1\u5B8C\u6574\u62A0\u51FA\u5E76\u5E73\u94FA\u5C55\u5F00\u4E3A\u89C4\u6574\u7684\u77E9\u5F62\u56FE\u6848\uFF0C\u7EAF\u767D\u80CC\u666F\uFF0C\u53BB\u9664\u8863\u8EAB\u3001\u8936\u76B1\u3001\u9634\u5F71\u548C\u7A7F\u7740\u6548\u679C\uFF0C\u5370\u82B1\u7684\u6BD4\u4F8B\u3001\u7EC6\u8282\u548C\u8272\u5F69\u4E0E\u539F\u56FE\u4FDD\u6301\u4E00\u81F4\uFF0C\u9002\u5408\u4F5C\u4E3A\u5370\u82B1\u7D20\u6750\u590D\u7528" + (extra ? `\u3002\u8865\u5145\u8981\u6C42\uFF1A${extra}` : "") : step.kind === "mask-redraw" ? extra : extra || DEFAULT_PROMPTS[step.kind] || NODE_SPECS[step.kind].description;
+      if (step.kind === "mask-redraw" && !prompt) {
+        throw new Error("\u8499\u7248\u5C40\u90E8\u91CD\u7ED8\u5FC5\u987B\u586B\u5199\u4FEE\u6539\u8BF4\u660E");
+      }
+      const maskReference = step.kind === "mask-redraw" ? step.params.mask : void 0;
+      if (step.kind === "mask-redraw" && (typeof maskReference !== "string" || !maskReference)) {
+        throw new Error("\u8499\u7248\u5C40\u90E8\u91CD\u7ED8\u5FC5\u987B\u5148\u4FDD\u5B58 PNG \u8499\u7248");
+      }
+      const mask = typeof maskReference === "string" ? await normalizeImageRef(maskReference) : void 0;
       const request = {
         prompt,
         referenceImages: referenceImages.length ? referenceImages : void 0,
         aspectRatio: step.kind === "sketch-to-render" || step.kind === "ai-modify" ? normalizeExactAspectRatio(step.params.aspectRatio) : step.params.aspectRatio,
         batchSize: step.params.batchSize,
-        imageSize: step.kind === "upscale" ? normalizeUpscaleSize(step.params.imageSize) : void 0
+        imageSize: step.kind === "upscale" ? normalizeUpscaleSize(step.params.imageSize) : void 0,
+        modelOptions,
+        mask
       };
       const requestedCount = step.kind === "sketch-to-render" || step.kind === "ai-modify" ? Math.max(1, Math.min(8, Number(step.params.batchSize) || 1)) : 1;
-      const result = await generateExactImages(provider, request, requestedCount, { runId, nodeId: step.nodeId });
-      const images = await postProcessGeneratedOutputImages(step.kind, step.params, result.images);
+      const result = await generateExactImages(
+        provider,
+        request,
+        requestedCount,
+        { ...options, nodeId: step.nodeId }
+      );
+      const providerImages = step.kind === "mask-redraw" ? await Promise.all(result.images.map((image) => compositeMaskedEdit(referenceImages[0], mask, image))) : result.images;
+      const images = await postProcessGeneratedOutputImages(step.kind, step.params, providerImages);
       return {
         images,
         model: result.model,
         prompts: images.map(() => prompt),
         providerRequests: result.providerRequests,
+        providerOutputSizes: result.providerOutputSizes,
         failures: result.failures.length ? result.failures.map((error) => ({ prompt, error })) : void 0
       };
     }
   }
 }
 async function resolveImageRefs(refs) {
-  return Promise.all(refs.map(normalizeImageRef));
+  const localIds = Array.from(new Set(
+    refs.filter(isLocalImageReference).map((ref) => ref.slice("/api/files/".length))
+  ));
+  const storedInputs = localIds.length === 0 ? [] : await query(`
+        SELECT id, source_type, normalized FROM files WHERE id = ANY($1::text[])
+      `, [localIds]);
+  const metadataById = new Map(storedInputs.map((row) => [row.id, row]));
+  return Promise.all(refs.map(async (ref) => {
+    const resolved = await normalizeImageRef(ref);
+    if (!isLocalImageReference(ref)) return resolved;
+    const id = ref.slice("/api/files/".length);
+    const metadata = metadataById.get(id);
+    if (metadata?.normalized || metadata?.source_type === "generation") return resolved;
+    const normalized = await normalizeUploadImageDataUrl(resolved);
+    return toDataUrl(normalized.buffer.toString("base64"), normalized.mimeType);
+  }));
 }
-
-// server/routes/generate.ts
-import { nanoid as nanoid5 } from "nanoid";
 
 // server/lib/auth.ts
 import { createHash, randomBytes as randomBytes2 } from "node:crypto";
@@ -2322,6 +2859,717 @@ async function pruneExpiredSessions() {
   });
 }
 
+// server/lib/asyncHandler.ts
+function asyncHandler(handler) {
+  return (req, res, next) => {
+    void handler(req, res, next).catch(next);
+  };
+}
+
+// server/engine/runQueue.ts
+import os from "node:os";
+import path3 from "node:path";
+import { nanoid as nanoid5 } from "nanoid";
+var TERMINAL_RUN_STATUSES = /* @__PURE__ */ new Set([
+  "cancelled",
+  "succeeded",
+  "failed",
+  "outcome_unknown"
+]);
+var DEFAULT_LEASE_MS = 45e3;
+var DEFAULT_HEARTBEAT_MS = 1e4;
+var DEFAULT_POLL_MS = 750;
+var DEFAULT_RETRY_DELAYS_MS = [5e3, 15e3];
+var CANCELLED_AFTER_START_WARNING = "\u53D6\u6D88\u8BF7\u6C42\u672A\u80FD\u4E2D\u6B62\u5DF2\u7ECF\u5F00\u59CB\u7684\u4E0A\u6E38\u8C03\u7528\uFF0C\u7ED3\u679C\u5DF2\u6309\u5B9E\u9645\u8FD4\u56DE\u4FDD\u5B58";
+var DURABLE_RUN_EVENT_BATCH_SIZE = 500;
+var CancelledBeforeProviderCall = class extends Error {
+  constructor() {
+    super("\u4EFB\u52A1\u5DF2\u5728\u4E0A\u6E38\u8C03\u7528\u5F00\u59CB\u524D\u53D6\u6D88");
+    this.name = "CancelledBeforeProviderCall";
+  }
+};
+function parseJson(value, fallback) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+function isTerminalRunStatus(status) {
+  return TERMINAL_RUN_STATUSES.has(status) || status === "success" || status === "error";
+}
+async function lockRun(client, runId) {
+  return (await client.query(
+    "SELECT id, owner_id, project_id, node_id, status, target_step_id, started_at, finished_at FROM generation_runs WHERE id = $1 FOR UPDATE",
+    [runId]
+  )).rows[0];
+}
+async function appendRunEvent(client, runId, event, createdAt) {
+  const seqRow = (await client.query(`
+    SELECT COALESCE(MAX(seq), 0)::int + 1 AS seq
+    FROM generation_run_events WHERE run_id = $1
+  `, [runId])).rows[0];
+  const sequenced = { ...event, seq: seqRow?.seq ?? 1 };
+  await client.query(`
+    INSERT INTO generation_run_events (run_id, seq, payload_json, created_at)
+    VALUES ($1, $2, $3, $4)
+  `, [runId, sequenced.seq, JSON.stringify(sequenced), createdAt]);
+  return sequenced;
+}
+async function enqueueGenerationRun(plan, ownerId, context, runType = "workflow") {
+  if (!ownerId.trim() || context.userId !== ownerId) throw new Error("run owner is invalid");
+  if (plan.steps.length === 0) throw new Error("execution plan has no steps");
+  const runId = nanoid5(10);
+  const createdAt = Date.now();
+  const requestedTargetIndex = plan.steps.findIndex((step) => step.nodeId === context.nodeId);
+  const targetIndex = requestedTargetIndex >= 0 ? requestedTargetIndex : plan.steps.length - 1;
+  const stepIds = plan.steps.map(() => nanoid5(12));
+  const targetStep = plan.steps[targetIndex] ?? plan.steps.at(-1);
+  const targetStepId = stepIds[targetIndex] ?? stepIds.at(-1);
+  const initialModel = isImageModelId(targetStep.params.modelId) ? targetStep.params.modelId : null;
+  await transaction(async (client) => {
+    await client.query(`
+      INSERT INTO generation_runs (
+        id, owner_id, project_id, project_name, node_id, node_label, kind, prompt,
+        parameters_json, reference_images_json, model, requested_count, status,
+        started_at, plan_json, target_step_id, run_type, updated_at
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'queued',
+        $13, $14, $15, $16, $13
+      )
+    `, [
+      runId,
+      ownerId,
+      context.projectId ?? null,
+      context.projectName ?? null,
+      context.nodeId,
+      context.nodeLabel,
+      context.kind,
+      context.prompt ?? null,
+      JSON.stringify(context.parameters ?? {}),
+      JSON.stringify(context.referenceImages ?? targetStep.inputImages ?? []),
+      initialModel,
+      context.requestedCount,
+      createdAt,
+      JSON.stringify(plan),
+      targetStepId,
+      runType
+    ]);
+    for (const [index, step] of plan.steps.entries()) {
+      const stepId = stepIds[index];
+      const model = isImageModelId(step.params.modelId) ? step.params.modelId : null;
+      await client.query(`
+        INSERT INTO generation_run_steps (
+          id, run_id, step_index, node_id, kind, step_json, status, model
+        ) VALUES ($1, $2, $3, $4, $5, $6, 'queued', $7)
+      `, [stepId, runId, index, step.nodeId, step.kind, JSON.stringify(step), model]);
+      await client.query(`
+        INSERT INTO generation_jobs (
+          id, run_id, step_id, idempotency_key, status, retry_count, available_at, created_at, updated_at
+        ) VALUES ($1, $2, $3, $4, 'queued', 0, $5, $5, $5)
+      `, [nanoid5(12), runId, stepId, `${runId}:${stepId}`, createdAt]);
+      await appendRunEvent(client, runId, {
+        type: "node-status",
+        nodeId: step.nodeId,
+        status: "queued",
+        startedAt: createdAt
+      }, createdAt);
+    }
+  });
+  return { id: runId };
+}
+async function claimNextJob(workerId, now, leaseMs) {
+  return transaction(async (client) => {
+    const row = (await client.query(`
+      SELECT j.id, j.run_id, j.step_id, j.status, j.retry_count, j.attempt_started_at, j.worker_id,
+        s.node_id, s.step_index, s.step_json, s.started_at AS step_started_at, r.target_step_id
+      FROM generation_jobs j
+      JOIN generation_run_steps s ON s.id = j.step_id
+      JOIN generation_runs r ON r.id = j.run_id
+      WHERE j.status IN ('queued','retry_wait')
+        AND j.available_at <= $1
+        AND r.status IN ('queued','running','retry_wait')
+        AND NOT EXISTS (
+          SELECT 1 FROM generation_run_steps previous
+          WHERE previous.run_id = s.run_id
+            AND previous.step_index < s.step_index
+            AND previous.status <> 'succeeded'
+        )
+      ORDER BY j.available_at, r.started_at, s.step_index
+      FOR UPDATE OF j SKIP LOCKED
+      LIMIT 1
+    `, [now])).rows[0];
+    if (!row) return void 0;
+    const run = await lockRun(client, row.run_id);
+    if (!run || isTerminalRunStatus(run.status) || run.status === "cancel_requested") return void 0;
+    await client.query(`
+      UPDATE generation_jobs SET status = 'running', worker_id = $1, lease_expires_at = $2,
+        attempt_started_at = NULL, updated_at = $3 WHERE id = $4
+    `, [workerId, now + leaseMs, now, row.id]);
+    await client.query(`
+      UPDATE generation_run_steps SET status = 'running', started_at = COALESCE(started_at, $1), error = NULL
+      WHERE id = $2
+    `, [now, row.step_id]);
+    await client.query(
+      "UPDATE generation_runs SET status = 'running', updated_at = $1 WHERE id = $2",
+      [now, row.run_id]
+    );
+    await appendRunEvent(client, row.run_id, {
+      type: "node-status",
+      nodeId: row.node_id,
+      status: "running",
+      startedAt: now
+    }, now);
+    const step = parseJson(row.step_json, void 0);
+    if (!step) throw new Error("generation step payload is invalid");
+    return {
+      id: row.id,
+      runId: row.run_id,
+      stepId: row.step_id,
+      nodeId: row.node_id,
+      stepIndex: row.step_index,
+      step,
+      retryCount: row.retry_count,
+      startedAt: now
+    };
+  });
+}
+async function inputImagesForStep(runId, step) {
+  if (!step.upstream?.length) return step.inputImages;
+  const rows = await query(`
+    SELECT node_id, output_images_json FROM generation_run_steps
+    WHERE run_id = $1 AND status = 'succeeded'
+  `, [runId]);
+  const outputs = new Map(rows.map((row) => [row.node_id, parseJson(row.output_images_json, [])]));
+  return step.upstream.flatMap((upstream) => outputs.get(upstream.nodeId) ?? upstream.images);
+}
+async function markAttemptStarted(job, workerId, now, leaseMs) {
+  await transaction(async (client) => {
+    const row = (await client.query(
+      "SELECT status, worker_id FROM generation_jobs WHERE id = $1 FOR UPDATE",
+      [job.id]
+    )).rows[0];
+    if (!row || row.worker_id !== workerId) throw new Error("generation job lease was lost");
+    if (row.status === "cancel_requested") throw new CancelledBeforeProviderCall();
+    if (row.status !== "running") throw new Error(`generation job is ${row.status}`);
+    await client.query(`
+      UPDATE generation_jobs SET attempt_started_at = COALESCE(attempt_started_at, $1),
+        lease_expires_at = $2, updated_at = $1 WHERE id = $3
+    `, [now, now + leaseMs, job.id]);
+    await client.query(`
+      UPDATE generation_run_steps SET provider_requests = provider_requests + 1 WHERE id = $1
+    `, [job.stepId]);
+  });
+}
+async function persistStepImages(images) {
+  const persisted = [];
+  for (const image of images) persisted.push(await persistImageRef(image));
+  return persisted;
+}
+async function finalizeSuccessfulRun(client, run, finishedAt, cancellationWarning) {
+  const target = run.target_step_id ? (await client.query(`
+        SELECT output_images_json, prompts_json, provider_output_sizes_json, failures_json, model
+        FROM generation_run_steps WHERE id = $1
+      `, [run.target_step_id])).rows[0] : void 0;
+  const images = parseJson(target?.output_images_json ?? "[]", []);
+  const prompts = parseJson(target?.prompts_json ?? "[]", []);
+  const providerOutputSizes = parseJson(target?.provider_output_sizes_json ?? "[]", []);
+  const failures = parseJson(target?.failures_json ?? "[]", []);
+  const aggregate = (await client.query(`
+    SELECT COALESCE(SUM(provider_requests), 0)::int AS provider_requests,
+      (ARRAY_AGG(model ORDER BY step_index DESC) FILTER (WHERE model IS NOT NULL))[1] AS model
+    FROM generation_run_steps WHERE run_id = $1
+  `, [run.id])).rows[0];
+  await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [run.id]);
+  for (const [index, image] of images.entries()) {
+    await client.query(`
+      INSERT INTO generation_outputs (
+        id, run_id, image, prompt, provider_output_size, status, error, created_at
+      ) VALUES ($1, $2, $3, $4, $5, 'success', NULL, $6)
+    `, [
+      nanoid5(12),
+      run.id,
+      image,
+      prompts[index] ?? null,
+      providerOutputSizes[index] ?? null,
+      finishedAt + index
+    ]);
+  }
+  for (const [index, failure] of failures.entries()) {
+    await client.query(`
+      INSERT INTO generation_outputs (id, run_id, image, prompt, status, error, created_at)
+      VALUES ($1, $2, '', $3, 'error', $4, $5)
+    `, [nanoid5(12), run.id, failure.prompt ?? null, failure.error, finishedAt + images.length + index]);
+  }
+  const warning = cancellationWarning ?? (failures.length ? `${failures.length} \u4E2A\u751F\u6210\u4EFB\u52A1\u5931\u8D25` : null);
+  const model = target?.model ?? aggregate?.model ?? null;
+  const providerRequests = aggregate?.provider_requests ?? 0;
+  await client.query(`
+    UPDATE generation_runs SET status = 'succeeded', successful_count = $1, provider_requests = $2,
+      model = $3, error = $4, finished_at = $5, updated_at = $5 WHERE id = $6
+  `, [images.length, providerRequests, model, warning, finishedAt, run.id]);
+  if (images.length > 0) {
+    await client.query(`
+      INSERT INTO usage_events (
+        id, owner_id, run_id, project_id, node_id, model, successful_count,
+        provider_requests, duration_ms, created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      ON CONFLICT (run_id) DO UPDATE SET
+        model = excluded.model, successful_count = excluded.successful_count,
+        provider_requests = excluded.provider_requests, duration_ms = excluded.duration_ms,
+        created_at = excluded.created_at
+    `, [
+      nanoid5(12),
+      run.owner_id,
+      run.id,
+      run.project_id,
+      run.node_id,
+      model,
+      images.length,
+      providerRequests,
+      Math.max(0, finishedAt - run.started_at),
+      new Date(finishedAt).toISOString()
+    ]);
+  }
+  await appendRunEvent(client, run.id, { type: "done" }, finishedAt);
+}
+async function finalizeCancelledTargetRun(client, run, targetNodeId, message, finishedAt) {
+  const aggregate = (await client.query(`
+    SELECT COALESCE(SUM(provider_requests), 0)::int AS provider_requests,
+      (ARRAY_AGG(model ORDER BY step_index DESC) FILTER (WHERE model IS NOT NULL))[1] AS model
+    FROM generation_run_steps WHERE run_id = $1
+  `, [run.id])).rows[0];
+  await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [run.id]);
+  await client.query(`
+    UPDATE generation_runs SET status = 'cancelled', successful_count = 0, provider_requests = $1,
+      model = $2, error = $3, finished_at = $4, updated_at = $4 WHERE id = $5
+  `, [aggregate?.provider_requests ?? 0, aggregate?.model ?? null, message, finishedAt, run.id]);
+  await appendRunEvent(client, run.id, {
+    type: "node-status",
+    nodeId: targetNodeId,
+    status: "cancelled",
+    error: message,
+    finishedAt
+  }, finishedAt);
+  await appendRunEvent(client, run.id, { type: "done" }, finishedAt);
+}
+async function completeJobSuccess(job, workerId, result, persistedImages, finishedAt) {
+  await transaction(async (client) => {
+    const locked = (await client.query(
+      "SELECT status, worker_id FROM generation_jobs WHERE id = $1 FOR UPDATE",
+      [job.id]
+    )).rows[0];
+    if (!locked || locked.worker_id !== workerId) throw new Error("generation job lease was lost before completion");
+    const run = await lockRun(client, job.runId);
+    if (!run) throw new Error("generation run disappeared");
+    const cancellationWarning = locked.status === "cancel_requested" ? CANCELLED_AFTER_START_WARNING : void 0;
+    await client.query(`
+      UPDATE generation_jobs SET status = 'succeeded', worker_id = NULL, lease_expires_at = NULL,
+        updated_at = $1, last_error = NULL WHERE id = $2
+    `, [finishedAt, job.id]);
+    await client.query(`
+      UPDATE generation_run_steps SET status = 'succeeded', model = $1, output_images_json = $2,
+        prompts_json = $3, provider_output_sizes_json = $4, failures_json = $5,
+        error = $6, finished_at = $7
+      WHERE id = $8
+    `, [
+      result.model ?? null,
+      JSON.stringify(persistedImages),
+      JSON.stringify(result.prompts ?? []),
+      JSON.stringify(result.providerOutputSizes ?? []),
+      JSON.stringify(result.failures ?? []),
+      cancellationWarning ?? null,
+      finishedAt,
+      job.stepId
+    ]);
+    for (const image of persistedImages) {
+      if (!image.startsWith("/api/files/")) continue;
+      await client.query(`
+        INSERT INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)
+        VALUES ($1, $2, 'generated', $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING
+      `, [path3.basename(image), run.owner_id, run.project_id, job.nodeId, run.id, new Date(finishedAt).toISOString()]);
+    }
+    const partialWarning = result.failures?.length ? `${result.failures.length} \u4E2A\u751F\u6210\u4EFB\u52A1\u5931\u8D25` : void 0;
+    await appendRunEvent(client, run.id, {
+      type: "node-status",
+      nodeId: job.nodeId,
+      status: "success",
+      images: persistedImages,
+      model: result.model,
+      prompts: result.prompts,
+      providerOutputSizes: result.providerOutputSizes,
+      failures: result.failures,
+      error: cancellationWarning ?? partialWarning,
+      startedAt: job.startedAt,
+      finishedAt
+    }, finishedAt);
+    if (cancellationWarning) {
+      await client.query(`
+        UPDATE generation_jobs SET status = 'cancelled', worker_id = NULL, lease_expires_at = NULL, updated_at = $1
+        WHERE run_id = $2 AND status IN ('queued','retry_wait','cancel_requested')
+      `, [finishedAt, run.id]);
+      await client.query(`
+        UPDATE generation_run_steps SET status = 'cancelled', finished_at = $1, error = '\u7528\u6237\u53D6\u6D88\u4E86\u540E\u7EED\u6B65\u9AA4'
+        WHERE run_id = $2 AND status IN ('queued','retry_wait','cancel_requested')
+      `, [finishedAt, run.id]);
+    }
+    const active2 = (await client.query(`
+      SELECT COUNT(*)::int AS count FROM generation_jobs
+      WHERE run_id = $1 AND status IN ('queued','running','retry_wait','cancel_requested')
+    `, [run.id])).rows[0]?.count ?? 0;
+    if (active2 === 0) {
+      const target = run.target_step_id ? (await client.query(`
+            SELECT status, node_id, error FROM generation_run_steps WHERE id = $1
+          `, [run.target_step_id])).rows[0] : void 0;
+      if (target?.status === "cancelled") {
+        await finalizeCancelledTargetRun(
+          client,
+          run,
+          target.node_id,
+          target.error ?? "\u7528\u6237\u53D6\u6D88\u4E86\u76EE\u6807\u6B65\u9AA4",
+          finishedAt
+        );
+      } else if (target?.status === "succeeded" || !target) {
+        await finalizeSuccessfulRun(client, run, finishedAt, cancellationWarning);
+      } else {
+        throw new Error(`generation target step ended as ${target.status}`);
+      }
+    } else {
+      await client.query("UPDATE generation_runs SET status = 'running', updated_at = $1 WHERE id = $2", [finishedAt, run.id]);
+    }
+  });
+}
+function isRetryableProviderError(error) {
+  return error instanceof ProviderError && (error.status === 429 || error.status === 503 && error.category === "gateway_unavailable");
+}
+async function terminateRun(client, row, status, message, finishedAt) {
+  const run = await lockRun(client, row.run_id);
+  if (!run || isTerminalRunStatus(run.status)) return;
+  await client.query(`
+    UPDATE generation_jobs SET status = $1, worker_id = NULL, lease_expires_at = NULL,
+      last_error = $2, updated_at = $3 WHERE id = $4
+  `, [status, message, finishedAt, row.id]);
+  await client.query(`
+    UPDATE generation_run_steps SET status = $1, error = $2, finished_at = $3 WHERE id = $4
+  `, [status, message, finishedAt, row.step_id]);
+  await client.query(`
+    UPDATE generation_jobs SET status = 'cancelled', worker_id = NULL, lease_expires_at = NULL,
+      last_error = $1, updated_at = $2
+    WHERE run_id = $3 AND id <> $4 AND status IN ('queued','retry_wait','cancel_requested')
+  `, ["\u4E0A\u6E38\u6B65\u9AA4\u672A\u5B8C\u6210\uFF0C\u540E\u7EED\u4EFB\u52A1\u5DF2\u505C\u6B62", finishedAt, row.run_id, row.id]);
+  await client.query(`
+    UPDATE generation_run_steps SET status = 'cancelled', error = $1, finished_at = $2
+    WHERE run_id = $3 AND id <> $4 AND status IN ('queued','retry_wait','cancel_requested')
+  `, ["\u4E0A\u6E38\u6B65\u9AA4\u672A\u5B8C\u6210\uFF0C\u540E\u7EED\u4EFB\u52A1\u5DF2\u505C\u6B62", finishedAt, row.run_id, row.step_id]);
+  const aggregate = (await client.query(`
+    SELECT COALESCE(SUM(provider_requests), 0)::int AS provider_requests,
+      (ARRAY_AGG(model ORDER BY step_index DESC) FILTER (WHERE model IS NOT NULL))[1] AS model
+    FROM generation_run_steps WHERE run_id = $1
+  `, [row.run_id])).rows[0];
+  await client.query(`
+    UPDATE generation_runs SET status = $1, error = $2, provider_requests = $3,
+      model = COALESCE($4, model), finished_at = $5, updated_at = $5 WHERE id = $6
+  `, [status, message, aggregate?.provider_requests ?? 0, aggregate?.model ?? null, finishedAt, row.run_id]);
+  await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [row.run_id]);
+  if (status === "failed") {
+    await client.query(`
+      INSERT INTO generation_outputs (id, run_id, image, status, error, created_at)
+      VALUES ($1, $2, '', 'error', $3, $4)
+    `, [nanoid5(12), row.run_id, message, finishedAt]);
+  }
+  const clientStatus = status === "failed" ? "error" : status;
+  await appendRunEvent(client, row.run_id, {
+    type: "node-status",
+    nodeId: row.node_id,
+    status: clientStatus,
+    error: message,
+    startedAt: row.step_started_at ?? void 0,
+    finishedAt
+  }, finishedAt);
+  if (status === "failed") {
+    await appendRunEvent(client, row.run_id, {
+      type: "run-error",
+      nodeId: row.node_id,
+      error: message,
+      finishedAt
+    }, finishedAt);
+  } else {
+    await appendRunEvent(client, row.run_id, { type: "done" }, finishedAt);
+  }
+}
+async function handleJobError(job, workerId, error, options) {
+  const now = options.now?.() ?? Date.now();
+  const message = error instanceof CancelledBeforeProviderCall ? error.message : error instanceof ProviderError ? publicProviderErrorMessage(error) : error instanceof Error ? error.message : String(error);
+  if (error instanceof ProviderError) {
+    console.error("[ai-provider-worker-failure]", JSON.stringify({
+      runId: job.runId,
+      nodeId: job.nodeId,
+      providerId: error.providerId,
+      status: error.status ?? null,
+      category: error.category,
+      retryCount: job.retryCount,
+      diagnostic: sanitizedProviderDiagnostic(error) ?? error.message
+    }));
+  }
+  await transaction(async (client) => {
+    const row = (await client.query(`
+      SELECT j.id, j.run_id, j.step_id, j.status, j.retry_count, j.attempt_started_at, j.worker_id,
+        s.node_id, s.step_index, s.step_json, s.started_at AS step_started_at, r.target_step_id
+      FROM generation_jobs j JOIN generation_run_steps s ON s.id = j.step_id
+      JOIN generation_runs r ON r.id = j.run_id WHERE j.id = $1 FOR UPDATE OF j
+    `, [job.id])).rows[0];
+    if (!row || row.worker_id !== workerId && row.status !== "cancel_requested") return;
+    if (error instanceof CancelledBeforeProviderCall) {
+      await terminateRun(client, row, "cancelled", message, now);
+      return;
+    }
+    if (error instanceof ProviderError && error.category === "outcome_unknown") {
+      await terminateRun(client, row, "outcome_unknown", message, now);
+      return;
+    }
+    if (row.status === "cancel_requested") {
+      await terminateRun(client, row, "cancelled", "\u7528\u6237\u53D6\u6D88\u4E86\u4EFB\u52A1\uFF0C\u7CFB\u7EDF\u672A\u7EE7\u7EED\u91CD\u8BD5", now);
+      return;
+    }
+    if (isRetryableProviderError(error) && row.retry_count < 2) {
+      const retryNumber = row.retry_count + 1;
+      const retryDelays = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
+      const baseDelay = retryDelays[Math.min(row.retry_count, retryDelays.length - 1)] ?? DEFAULT_RETRY_DELAYS_MS[1];
+      const jitter = Math.floor((options.random?.() ?? Math.random()) * 1e3);
+      const availableAt = now + Math.max(0, baseDelay) + jitter;
+      await lockRun(client, row.run_id);
+      await client.query(`
+        UPDATE generation_jobs SET status = 'retry_wait', retry_count = $1, available_at = $2,
+          worker_id = NULL, lease_expires_at = NULL, attempt_started_at = NULL, last_error = $3, updated_at = $4
+        WHERE id = $5
+      `, [retryNumber, availableAt, message, now, row.id]);
+      await client.query(`
+        UPDATE generation_run_steps SET status = 'retry_wait', error = $1 WHERE id = $2
+      `, [message, row.step_id]);
+      await client.query("UPDATE generation_runs SET status = 'retry_wait', error = $1, updated_at = $2 WHERE id = $3", [
+        message,
+        now,
+        row.run_id
+      ]);
+      await appendRunEvent(client, row.run_id, {
+        type: "node-status",
+        nodeId: row.node_id,
+        status: "retry_wait",
+        error: message,
+        startedAt: row.step_started_at ?? job.startedAt
+      }, now);
+      return;
+    }
+    await terminateRun(client, row, "failed", message, now);
+  });
+}
+async function recoverExpiredGenerationJobs(now = Date.now()) {
+  return transaction(async (client) => {
+    const rows = (await client.query(`
+      SELECT j.id, j.run_id, j.step_id, j.status, j.retry_count, j.attempt_started_at, j.worker_id,
+        s.node_id, s.step_index, s.step_json, s.started_at AS step_started_at, r.target_step_id
+      FROM generation_jobs j JOIN generation_run_steps s ON s.id = j.step_id
+      JOIN generation_runs r ON r.id = j.run_id
+      WHERE j.status IN ('running','cancel_requested') AND j.lease_expires_at < $1
+      ORDER BY j.lease_expires_at ASC FOR UPDATE OF j SKIP LOCKED LIMIT 50
+    `, [now])).rows;
+    for (const row of rows) {
+      if (row.attempt_started_at !== null) {
+        await terminateRun(
+          client,
+          row,
+          "outcome_unknown",
+          "Worker \u5728\u4E0A\u6E38\u8C03\u7528\u5F00\u59CB\u540E\u4E2D\u65AD\uFF0C\u7ED3\u679C\u53EF\u80FD\u5DF2\u7ECF\u751F\u6210\uFF1B\u7CFB\u7EDF\u4E0D\u4F1A\u81EA\u52A8\u91CD\u8BD5",
+          now
+        );
+        continue;
+      }
+      if (row.status === "cancel_requested") {
+        await terminateRun(client, row, "cancelled", "\u4EFB\u52A1\u5DF2\u5728\u4E0A\u6E38\u8C03\u7528\u5F00\u59CB\u524D\u53D6\u6D88", now);
+        continue;
+      }
+      await lockRun(client, row.run_id);
+      await client.query(`
+        UPDATE generation_jobs SET status = 'queued', worker_id = NULL, lease_expires_at = NULL,
+          available_at = $1, updated_at = $1 WHERE id = $2
+      `, [now, row.id]);
+      await client.query("UPDATE generation_run_steps SET status = 'queued', error = NULL WHERE id = $1", [row.step_id]);
+      await client.query("UPDATE generation_runs SET status = 'queued', error = NULL, updated_at = $1 WHERE id = $2", [now, row.run_id]);
+      await appendRunEvent(client, row.run_id, {
+        type: "node-status",
+        nodeId: row.node_id,
+        status: "queued",
+        error: "Worker \u79DF\u7EA6\u8FC7\u671F\uFF0C\u4EFB\u52A1\u5DF2\u5B89\u5168\u91CD\u65B0\u6392\u961F"
+      }, now);
+    }
+    return rows.length;
+  });
+}
+async function processNextGenerationJob(workerId, options = {}) {
+  const now = options.now?.() ?? Date.now();
+  const leaseMs = options.leaseMs ?? DEFAULT_LEASE_MS;
+  await recoverExpiredGenerationJobs(now);
+  const job = await claimNextJob(workerId, now, leaseMs);
+  if (!job) return false;
+  const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS;
+  const heartbeat = setInterval(() => {
+    const heartbeatNow = options.now?.() ?? Date.now();
+    void db().query(`
+      UPDATE generation_jobs SET lease_expires_at = $1, updated_at = $2
+      WHERE id = $3 AND worker_id = $4 AND status IN ('running','cancel_requested')
+    `, [heartbeatNow + leaseMs, heartbeatNow, job.id, workerId]).catch((error) => {
+      console.error("[garment-canvas] generation lease heartbeat failed", error);
+    });
+  }, heartbeatMs);
+  heartbeat.unref();
+  try {
+    const inputImages = await inputImagesForStep(job.runId, job.step);
+    const result = await executeStep(
+      job.step,
+      inputImages,
+      options.resolveProvider ?? getProvider,
+      {
+        runId: job.runId,
+        beforeProviderCall: async () => {
+          await markAttemptStarted(job, workerId, options.now?.() ?? Date.now(), leaseMs);
+        }
+      }
+    );
+    const persistedImages = await persistStepImages(result.images);
+    await completeJobSuccess(job, workerId, result, persistedImages, options.now?.() ?? Date.now());
+  } catch (error) {
+    await handleJobError(job, workerId, error, options);
+  } finally {
+    clearInterval(heartbeat);
+  }
+  return true;
+}
+function startGenerationWorker() {
+  const workerId = `${os.hostname()}:${process.pid}:${nanoid5(6)}`;
+  let stopped = false;
+  let busy = false;
+  const tick = async () => {
+    if (stopped || busy) return;
+    busy = true;
+    try {
+      while (!stopped && await processNextGenerationJob(workerId)) {
+      }
+    } catch (error) {
+      console.error("[garment-canvas] generation worker failed", error);
+    } finally {
+      busy = false;
+    }
+  };
+  const timer = setInterval(() => void tick(), DEFAULT_POLL_MS);
+  timer.unref();
+  void tick();
+  return () => {
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+async function getDurableRunForUser(runId, ownerId) {
+  const row = await queryOne(`
+    SELECT id, status FROM generation_runs
+    WHERE id = $1 AND owner_id = $2 AND plan_json IS NOT NULL AND deleted_at IS NULL
+  `, [runId, ownerId]);
+  return row ? { id: row.id, status: row.status, finished: isTerminalRunStatus(row.status) } : void 0;
+}
+async function readDurableRunEvents(runId, ownerId, afterSeq) {
+  const run = await queryOne(`
+    SELECT id FROM generation_runs
+    WHERE id = $1 AND owner_id = $2 AND plan_json IS NOT NULL AND deleted_at IS NULL
+  `, [runId, ownerId]);
+  if (!run) return void 0;
+  const rows = await query(`
+    SELECT seq, payload_json FROM generation_run_events
+    WHERE run_id = $1 AND seq > $2 ORDER BY seq ASC LIMIT $3
+  `, [runId, afterSeq, DURABLE_RUN_EVENT_BATCH_SIZE]);
+  return rows.map((row) => ({ ...parseJson(row.payload_json, { type: "done" }), seq: row.seq }));
+}
+async function cancelDurableRun(runId, ownerId) {
+  const now = Date.now();
+  return transaction(async (client) => {
+    const visible = (await client.query(`
+      SELECT id FROM generation_runs
+      WHERE id = $1 AND owner_id = $2 AND plan_json IS NOT NULL AND deleted_at IS NULL
+    `, [runId, ownerId])).rows[0];
+    if (!visible) return void 0;
+    const jobs = (await client.query(`
+      SELECT j.id, j.step_id, s.node_id, j.status, j.attempt_started_at
+      FROM generation_jobs j JOIN generation_run_steps s ON s.id = j.step_id
+      WHERE j.run_id = $1
+      ORDER BY j.id
+      FOR UPDATE OF j
+    `, [runId])).rows;
+    const run = (await client.query(`
+      SELECT id, owner_id, project_id, node_id, status, target_step_id, started_at, finished_at
+      FROM generation_runs
+      WHERE id = $1 AND owner_id = $2 AND plan_json IS NOT NULL AND deleted_at IS NULL
+      FOR UPDATE
+    `, [runId, ownerId])).rows[0];
+    if (!run) return void 0;
+    if (isTerminalRunStatus(run.status)) {
+      return { status: run.status, finished: true };
+    }
+    const running = jobs.find((job) => job.status === "running" || job.status === "cancel_requested");
+    if (running) {
+      if (running.status === "cancel_requested") {
+        return { status: "cancel_requested", finished: false };
+      }
+      await client.query(`
+        UPDATE generation_jobs SET status = 'cancel_requested', updated_at = $1
+        WHERE id = $2
+      `, [now, running.id]);
+      await client.query("UPDATE generation_run_steps SET status = 'cancel_requested' WHERE id = $1", [running.step_id]);
+      await client.query(`
+        UPDATE generation_jobs SET status = 'cancelled', updated_at = $1, last_error = '\u7528\u6237\u53D6\u6D88\u4E86\u540E\u7EED\u6B65\u9AA4'
+        WHERE run_id = $2 AND status IN ('queued','retry_wait')
+      `, [now, runId]);
+      await client.query(`
+        UPDATE generation_run_steps SET status = 'cancelled', finished_at = $1, error = '\u7528\u6237\u53D6\u6D88\u4E86\u540E\u7EED\u6B65\u9AA4'
+        WHERE run_id = $2 AND status IN ('queued','retry_wait')
+      `, [now, runId]);
+      await client.query(`
+        UPDATE generation_runs SET status = 'cancel_requested', cancel_requested_at = $1, updated_at = $1
+        WHERE id = $2
+      `, [now, runId]);
+      await appendRunEvent(client, runId, {
+        type: "node-status",
+        nodeId: running.node_id,
+        status: "cancel_requested",
+        error: running.attempt_started_at === null ? "\u6B63\u5728\u4E0A\u6E38\u8C03\u7528\u5F00\u59CB\u524D\u53D6\u6D88" : "\u4E0A\u6E38\u4E0D\u652F\u6301\u4E2D\u6B62\uFF0C\u5DF2\u8BB0\u5F55\u53D6\u6D88\u8BF7\u6C42\u5E76\u7B49\u5F85\u771F\u5B9E\u7ED3\u679C"
+      }, now);
+      return { status: "cancel_requested", finished: false };
+    }
+    const target = run.target_step_id ? (await client.query(
+      "SELECT node_id FROM generation_run_steps WHERE id = $1",
+      [run.target_step_id]
+    )).rows[0] : void 0;
+    await client.query(`
+      UPDATE generation_jobs SET status = 'cancelled', updated_at = $1, last_error = '\u7528\u6237\u53D6\u6D88\u4E86\u4EFB\u52A1'
+      WHERE run_id = $2 AND status IN ('queued','retry_wait','cancel_requested')
+    `, [now, runId]);
+    await client.query(`
+      UPDATE generation_run_steps SET status = 'cancelled', finished_at = $1, error = '\u7528\u6237\u53D6\u6D88\u4E86\u4EFB\u52A1'
+      WHERE run_id = $2 AND status IN ('queued','retry_wait','cancel_requested')
+    `, [now, runId]);
+    await client.query(`
+      UPDATE generation_runs SET status = 'cancelled', error = '\u7528\u6237\u53D6\u6D88\u4E86\u4EFB\u52A1',
+        cancel_requested_at = $1, finished_at = $1, updated_at = $1 WHERE id = $2
+    `, [now, runId]);
+    await appendRunEvent(client, runId, {
+      type: "node-status",
+      nodeId: target?.node_id ?? run.node_id,
+      status: "cancelled",
+      error: "\u4EFB\u52A1\u5DF2\u5728\u4E0A\u6E38\u8C03\u7528\u5F00\u59CB\u524D\u53D6\u6D88",
+      finishedAt: now
+    }, now);
+    await appendRunEvent(client, runId, { type: "done" }, now);
+    return { status: "cancelled", finished: true };
+  });
+}
+
 // server/routes/generate.ts
 var generateRouter = Router();
 function isDirectGenerateKind(value) {
@@ -2346,22 +3594,15 @@ function validateDirectGenerateRequest(kind, request) {
   }
   return { ok: true, kind };
 }
-function postProcessDirectGenerateImages(kind, request, images) {
-  if (!kind) return Promise.resolve(images);
-  return postProcessGeneratedOutputImages(
-    kind,
-    request,
-    images
-  );
-}
-generateRouter.post("/", async (req, res) => {
-  const { providerId, request, projectId, projectName, nodeId, nodeLabel, kind } = req.body;
-  if (!providerId || !request?.prompt) {
-    res.status(400).json({ error: "providerId and request.prompt are required" });
+generateRouter.post("/", asyncHandler(async (req, res) => {
+  const { providerId, modelId: requestedModelId, request, projectId, projectName, nodeId, nodeLabel, kind } = req.body;
+  const modelId = requestedModelId ?? providerId;
+  if (!modelId || !request?.prompt) {
+    res.status(400).json({ error: "modelId and request.prompt are required" });
     return;
   }
-  if (request.referenceImages && request.referenceImages.length > MAX_REFERENCE_IMAGES) {
-    res.status(400).json({ error: `referenceImages must contain at most ${MAX_REFERENCE_IMAGES} images` });
+  if (!isImageModelId(modelId)) {
+    res.status(400).json({ error: "modelId must identify a supported API\u6613 image model" });
     return;
   }
   const validation = validateDirectGenerateRequest(kind, request);
@@ -2369,59 +3610,56 @@ generateRouter.post("/", async (req, res) => {
     res.status(400).json({ error: validation.error });
     return;
   }
-  const runId = nanoid5(10);
-  const startedAt = Date.now();
+  const resolvedKind = validation.kind ?? (modelId === "gpt-image-2" ? "mask-redraw" : "sketch-to-render");
+  if (!isModelAllowedForNode(modelId, resolvedKind)) {
+    res.status(400).json({ error: `${modelId} is not allowed for ${resolvedKind}` });
+    return;
+  }
+  const maskSourceRef = request.referenceImages?.[0];
+  if (resolvedKind === "mask-redraw" && (typeof maskSourceRef !== "string" || !maskSourceRef.trim() || typeof request.mask !== "string" || !request.mask.trim())) {
+    res.status(400).json({ error: "mask-redraw requires a source image and PNG mask" });
+    return;
+  }
+  const maxReferences = Math.min(MAX_REFERENCE_IMAGES, modelMaxReferenceImages(modelId));
+  if (request.referenceImages && request.referenceImages.length > maxReferences) {
+    res.status(400).json({ error: `referenceImages must contain at most ${maxReferences} images for ${modelId}` });
+    return;
+  }
+  const modelOptions = request.modelOptions ?? defaultImageModelOptions(modelId, request.aspectRatio);
+  const optionsError = imageModelOptionsError(modelId, modelOptions);
+  if (optionsError) {
+    res.status(400).json({ error: `request.modelOptions ${optionsError}` });
+    return;
+  }
   const requestedCount = Math.max(1, Math.min(8, Number(request.batchSize) || 1));
-  await createGenerationRecord(runId, {
-    userId: requestUser(req).id,
+  const user = requestUser(req);
+  const resolvedNodeId = nodeId ?? "direct-generate";
+  const resolvedRequest = { ...request, modelOptions };
+  const run = await enqueueGenerationRun({
+    steps: [{
+      nodeId: resolvedNodeId,
+      kind: resolvedKind,
+      inputImages: request.referenceImages ?? [],
+      params: {
+        ...resolvedRequest,
+        modelId,
+        ...resolvedKind === "mask-redraw" ? { maskSourceRef } : {}
+      }
+    }]
+  }, user.id, {
+    userId: user.id,
     projectId,
     projectName,
-    nodeId: nodeId ?? "direct-generate",
+    nodeId: resolvedNodeId,
     nodeLabel: nodeLabel ?? "\u76F4\u63A5\u751F\u6210",
-    kind: validation.kind ?? "sketch-to-render",
+    kind: resolvedKind,
     prompt: request.prompt,
-    parameters: request,
+    parameters: { ...request, modelId, modelOptions },
     referenceImages: request.referenceImages,
     requestedCount
-  }, startedAt);
-  await markGenerationRunning(runId, startedAt);
-  try {
-    const provider = getProvider(providerId);
-    const resolved = {
-      ...request,
-      referenceImages: request.referenceImages ? await Promise.all(request.referenceImages.map(normalizeImageRef)) : void 0,
-      mask: request.mask ? await normalizeImageRef(request.mask) : void 0
-    };
-    const raw = await generateExactImages(provider, resolved, requestedCount, { runId, nodeId });
-    const processedImages = await postProcessDirectGenerateImages(validation.kind, resolved, raw.images);
-    const images = await Promise.all(processedImages.map(persistImageRef));
-    const finishedAt = Date.now();
-    const failures = raw.failures.map((error) => ({ prompt: request.prompt, error }));
-    await completeGenerationRecord({
-      runId,
-      images,
-      prompts: images.map(() => request.prompt),
-      failures,
-      model: raw.model,
-      providerRequests: raw.providerRequests,
-      startedAt,
-      finishedAt
-    });
-    res.json({ ...raw, images, runId });
-  } catch (err) {
-    const message = err instanceof ProviderError ? publicProviderErrorMessage(err) : err instanceof Error ? err.message : String(err);
-    await failGenerationRecord(runId, message, Date.now());
-    if (err instanceof ProviderError) {
-      res.status(err.status && err.status >= 400 && err.status < 600 ? err.status : 502).json({
-        error: message,
-        providerId: err.providerId ?? providerId,
-        category: err.category
-      });
-    } else {
-      res.status(500).json({ error: message });
-    }
-  }
-});
+  }, "direct");
+  res.status(202).json({ runId: run.id, status: "queued" });
+}));
 
 // server/routes/runPlan.ts
 import { Router as Router2 } from "express";
@@ -2438,11 +3676,16 @@ function assertPlanInputs(plan, edges) {
   for (const step of plan.steps) {
     const spec = NODE_SPECS[step.kind];
     if (!spec.providerId) continue;
+    const modelId = isImageModelId(step.params.modelId) ? step.params.modelId : step.kind === "mask-redraw" ? MASK_REDRAW_MODEL_ID : DEFAULT_GENERATION_MODEL_ID;
+    if (!isModelAllowedForNode(modelId, step.kind)) {
+      throw new DagError(`Model ${modelId} is not allowed for node ${step.nodeId}`);
+    }
     const usableImages = (step.upstream ?? []).flatMap(
       (upstream) => executingNodeIds.has(upstream.nodeId) ? ["__runtime_output__"] : upstream.images
     );
-    if (usableImages.length > MAX_REFERENCE_IMAGES) {
-      throw new DagError(`Node ${step.nodeId} accepts at most ${MAX_REFERENCE_IMAGES} reference images`);
+    const maxReferences = Math.min(MAX_REFERENCE_IMAGES, modelMaxReferenceImages(modelId));
+    if (usableImages.length > maxReferences) {
+      throw new DagError(`Node ${step.nodeId} accepts at most ${maxReferences} reference images for ${modelId}`);
     }
     if (step.kind === "sketch-to-render" && usableImages.length === 0) {
       const prompt = typeof step.params.prompt === "string" ? step.params.prompt.trim() : "";
@@ -2459,6 +3702,16 @@ function assertPlanInputs(plan, edges) {
       );
       if (garmentImages.length === 0) {
         throw new DagError(`Node ${step.nodeId} requires a garment image`);
+      }
+      continue;
+    }
+    if (step.kind === "mask-redraw") {
+      if (usableImages.length === 0) throw new DagError(`Node ${step.nodeId} requires an upstream image`);
+      if (typeof step.params.mask !== "string" || !step.params.mask) {
+        throw new DagError(`Node ${step.nodeId} requires a saved PNG mask`);
+      }
+      if (typeof step.params.maskSourceRef !== "string" || step.params.maskSourceRef !== usableImages[0]) {
+        throw new DagError(`Node ${step.nodeId} mask does not match its current source image`);
       }
       continue;
     }
@@ -2543,31 +3796,59 @@ function extractOutputImages(data) {
     case "upscale":
     case "print-extract":
     case "print-mutate":
+    case "mask-redraw":
       return data.outputImages ?? [];
     case "result":
       return data.images ?? [];
   }
 }
 function extractParams(data) {
+  const modelFields = (preferredAspectRatio = "1:1") => {
+    if (!NODE_SPECS[data.kind].providerId) return {};
+    const modelId = "modelId" in data && isImageModelId(data.modelId) ? data.modelId : data.kind === "mask-redraw" ? MASK_REDRAW_MODEL_ID : DEFAULT_GENERATION_MODEL_ID;
+    return {
+      modelId,
+      modelOptions: "modelOptions" in data && data.modelOptions ? data.modelOptions : defaultImageModelOptions(modelId, preferredAspectRatio)
+    };
+  };
   switch (data.kind) {
     case "image-input":
       return { imageUrl: data.imageUrl, imageRole: data.imageRole };
     case "sketch-to-render":
-      return { prompt: data.prompt, aspectRatio: data.aspectRatio, batchSize: data.batchSize };
+      return {
+        prompt: data.prompt,
+        aspectRatio: data.aspectRatio,
+        batchSize: data.batchSize,
+        ...modelFields(data.aspectRatio)
+      };
     case "ai-modify":
-      return { prompt: data.prompt, aspectRatio: data.aspectRatio, batchSize: data.batchSize };
+      return {
+        prompt: data.prompt,
+        aspectRatio: data.aspectRatio,
+        batchSize: data.batchSize,
+        ...modelFields(data.aspectRatio)
+      };
     case "fabric-recolor":
       return {
         prompt: data.prompt,
         colors: data.colors,
-        fabricImageUrl: data.fabricImageUrl
+        fabricImageUrl: data.fabricImageUrl,
+        ...modelFields()
       };
     case "upscale":
-      return { imageSize: data.imageSize };
+      return { imageSize: data.imageSize, ...modelFields() };
     case "print-extract":
-      return { prompt: data.prompt };
+      return { prompt: data.prompt, ...modelFields() };
     case "print-mutate":
-      return { prompt: data.prompt, count: data.count };
+      return { prompt: data.prompt, count: data.count, ...modelFields() };
+    case "mask-redraw":
+      return {
+        prompt: data.prompt,
+        mask: data.mask,
+        maskSourceRef: data.maskSourceRef,
+        modelId: MASK_REDRAW_MODEL_ID,
+        modelOptions: {}
+      };
     case "result":
       return { note: data.note };
   }
@@ -2582,9 +3863,20 @@ var NODE_KINDS = [
   "upscale",
   "print-extract",
   "print-mutate",
+  "mask-redraw",
   "result"
 ];
-var STATUSES = ["idle", "queued", "running", "success", "error"];
+var STATUSES = [
+  "idle",
+  "queued",
+  "running",
+  "retry_wait",
+  "cancel_requested",
+  "success",
+  "error",
+  "outcome_unknown",
+  "cancelled"
+];
 var IMAGE_ROLES = ["default", "sketch", "garment", "fabric", "reference"];
 var ASPECT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9"];
 var IMAGE_SIZES = ["2K", "4K"];
@@ -2602,7 +3894,7 @@ var WorkflowValidationError = class extends Error {
 function fail(path11, message) {
   throw new WorkflowValidationError(`${path11}: ${message}`);
 }
-function record(value, path11) {
+function record2(value, path11) {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     fail(path11, "must be an object");
   }
@@ -2654,34 +3946,73 @@ function imageReferenceArray(value, path11, max = MAX_IMAGE_REFS) {
   if (value.length > max) fail(path11, `must contain at most ${max} items`);
   return value.map((item, index) => imageReference(item, `${path11}[${index}]`));
 }
+function migratedModelFields(kind, raw, preferredAspectRatio = "1:1") {
+  const requested = isImageModelId(raw.modelId) && isModelAllowedForNode(raw.modelId, kind) ? raw.modelId : kind === "mask-redraw" ? MASK_REDRAW_MODEL_ID : DEFAULT_GENERATION_MODEL_ID;
+  return {
+    modelId: requested,
+    modelOptions: normalizeImageModelOptions(requested, raw.modelOptions, preferredAspectRatio)
+  };
+}
 function migrateNodeData(kind, raw) {
   switch (kind) {
     case "image-input":
       return { imageRole: "default", ...raw };
     case "sketch-to-render":
-      return { prompt: "", aspectRatio: "3:4", batchSize: 1, outputImages: [], ...raw };
+      return {
+        prompt: "",
+        aspectRatio: "3:4",
+        batchSize: 1,
+        outputImages: [],
+        ...raw,
+        ...migratedModelFields(kind, raw, typeof raw.aspectRatio === "string" ? raw.aspectRatio : "3:4")
+      };
     case "ai-modify":
-      return { prompt: "", aspectRatio: "1:1", batchSize: 1, outputImages: [], ...raw };
+      return {
+        prompt: "",
+        aspectRatio: "1:1",
+        batchSize: 1,
+        outputImages: [],
+        ...raw,
+        ...migratedModelFields(kind, raw, typeof raw.aspectRatio === "string" ? raw.aspectRatio : "1:1")
+      };
     case "fabric-recolor":
-      return { colors: [], prompt: "", outputImages: [], ...raw };
+      return { colors: [], prompt: "", outputImages: [], ...raw, ...migratedModelFields(kind, raw) };
     case "upscale":
-      return { imageSize: "2K", outputImages: [], ...raw };
+      return { imageSize: "2K", outputImages: [], ...raw, ...migratedModelFields(kind, raw) };
     case "print-extract":
-      return { prompt: "", outputImages: [], savedAsAssets: [], ...raw };
+      return { prompt: "", outputImages: [], savedAsAssets: [], ...raw, ...migratedModelFields(kind, raw) };
     case "print-mutate":
-      return { prompt: "", count: 4, outputImages: [], ...raw };
+      return { prompt: "", count: 4, outputImages: [], ...raw, ...migratedModelFields(kind, raw) };
+    case "mask-redraw":
+      return {
+        prompt: "",
+        outputImages: [],
+        ...raw,
+        modelId: MASK_REDRAW_MODEL_ID,
+        modelOptions: defaultImageModelOptions(MASK_REDRAW_MODEL_ID)
+      };
     case "result":
       return { images: [], ...raw };
   }
 }
+function validateModelSelection(kind, raw, path11) {
+  if (!NODE_SPECS[kind].providerId) return;
+  if (!isImageModelId(raw.modelId)) fail(`${path11}.modelId`, "must be a supported API\u6613 image model");
+  if (!isModelAllowedForNode(raw.modelId, kind)) {
+    fail(`${path11}.modelId`, `${raw.modelId} is not allowed for ${kind}`);
+  }
+  const optionsError = imageModelOptionsError(raw.modelId, raw.modelOptions);
+  if (optionsError) fail(`${path11}.modelOptions`, optionsError);
+}
 function validateData(kind, rawValue, path11) {
-  const input = record(rawValue, path11);
+  const input = record2(rawValue, path11);
   const runtimeStatus = input.status;
-  const raw = runtimeStatus === "queued" || runtimeStatus === "running" || runtimeStatus === "error" ? { ...input, status: "idle", error: void 0 } : input;
+  const raw = runtimeStatus !== "idle" && runtimeStatus !== "success" ? { ...input, status: "idle", error: void 0 } : input;
   if (raw.kind !== kind) fail(`${path11}.kind`, `must equal node type ${kind}`);
   stringValue(raw.label, `${path11}.label`, { nonEmpty: true });
   oneOf(raw.status, STATUSES, `${path11}.status`);
   optionalString(raw.error, `${path11}.error`);
+  validateModelSelection(kind, raw, path11);
   switch (kind) {
     case "image-input":
       oneOf(raw.imageRole, IMAGE_ROLES, `${path11}.imageRole`);
@@ -2720,6 +4051,12 @@ function validateData(kind, rawValue, path11) {
       }
       imageReferenceArray(raw.outputImages, `${path11}.outputImages`);
       break;
+    case "mask-redraw":
+      stringValue(raw.prompt, `${path11}.prompt`);
+      optionalImageReference(raw.mask, `${path11}.mask`);
+      optionalImageReference(raw.maskSourceRef, `${path11}.maskSourceRef`);
+      imageReferenceArray(raw.outputImages, `${path11}.outputImages`);
+      break;
     case "result":
       imageReferenceArray(raw.images, `${path11}.images`);
       optionalString(raw.note, `${path11}.note`);
@@ -2729,14 +4066,14 @@ function validateData(kind, rawValue, path11) {
 }
 function validateNode(value, index, migrateLegacy) {
   const path11 = `flow.nodes[${index}]`;
-  const raw = record(value, path11);
+  const raw = record2(value, path11);
   const id = stringValue(raw.id, `${path11}.id`, { nonEmpty: true });
   if (!SAFE_ID.test(id)) fail(`${path11}.id`, "must contain only letters, digits, underscore or hyphen");
   const type = oneOf(raw.type, NODE_KINDS, `${path11}.type`);
-  const position = record(raw.position, `${path11}.position`);
+  const position = record2(raw.position, `${path11}.position`);
   finiteNumber(position.x, `${path11}.position.x`);
   finiteNumber(position.y, `${path11}.position.y`);
-  const initialData = record(raw.data, `${path11}.data`);
+  const initialData = record2(raw.data, `${path11}.data`);
   const data = validateData(
     type,
     migrateLegacy ? migrateNodeData(type, initialData) : initialData,
@@ -2746,7 +4083,7 @@ function validateNode(value, index, migrateLegacy) {
 }
 function validateEdge(value, index) {
   const path11 = `flow.edges[${index}]`;
-  const raw = record(value, path11);
+  const raw = record2(value, path11);
   const id = stringValue(raw.id, `${path11}.id`, { nonEmpty: true });
   const source = stringValue(raw.source, `${path11}.source`, { nonEmpty: true });
   const target = stringValue(raw.target, `${path11}.target`, { nonEmpty: true });
@@ -2758,9 +4095,9 @@ function validateEdge(value, index) {
   return { ...raw, id, source, target };
 }
 function validateAndMigrateFlow(value) {
-  const raw = record(value, "flow");
+  const raw = record2(value, "flow");
   const version = raw.schemaVersion;
-  const migrateLegacy = version === void 0 || version === 0;
+  const migrateLegacy = version === void 0 || version === 0 || version === 1;
   if (!migrateLegacy && version !== WORKFLOW_SCHEMA_VERSION) {
     fail("flow.schemaVersion", `unsupported version ${String(version)}; current version is ${WORKFLOW_SCHEMA_VERSION}`);
   }
@@ -2795,13 +4132,6 @@ function validateAndMigrateFlow(value) {
     }
   }
   return { schemaVersion: WORKFLOW_SCHEMA_VERSION, nodes, edges };
-}
-
-// server/lib/asyncHandler.ts
-function asyncHandler(handler) {
-  return (req, res, next) => {
-    void handler(req, res, next).catch(next);
-  };
 }
 
 // server/routes/runPlan.ts
@@ -2858,7 +4188,7 @@ runPlanRouter.post("/", asyncHandler(async (req, res) => {
         return;
       }
     }
-    const run = await createRun(plan, user.id, {
+    const run = await enqueueGenerationRun(plan, user.id, {
       userId: user.id,
       projectId: typeof projectId === "string" ? projectId : void 0,
       projectName: typeof projectName === "string" ? projectName : void 0,
@@ -2870,7 +4200,7 @@ runPlanRouter.post("/", asyncHandler(async (req, res) => {
       referenceImages: targetStep.inputImages,
       requestedCount
     });
-    res.json({ runId: run.id });
+    res.status(202).json({ runId: run.id, status: "queued" });
   } catch (err) {
     if (err instanceof DagError || err instanceof WorkflowValidationError) {
       res.status(400).json({ error: err.message });
@@ -2879,12 +4209,7 @@ runPlanRouter.post("/", asyncHandler(async (req, res) => {
     }
   }
 }));
-runPlanRouter.get("/:id/events", (req, res) => {
-  const run = getRunForUser(req.params.id, requestUser(req).id);
-  if (!run) {
-    res.status(404).json({ error: "run not found" });
-    return;
-  }
+function streamInMemoryRun(run, req, res) {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache, no-transform",
@@ -2921,15 +4246,102 @@ runPlanRouter.get("/:id/events", (req, res) => {
     run.emitter.off("event", send);
     run.emitter.off("finish", close);
   });
-});
-runPlanRouter.get("/:id", (req, res) => {
-  const run = getRunForUser(req.params.id, requestUser(req).id);
+}
+var durableRunEventStreamDependencies = {
+  readEvents: readDurableRunEvents,
+  getRun: getDurableRunForUser,
+  wait: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds))
+};
+async function streamDurableRunEvents(runId, ownerId, req, res, overrides = {}) {
+  const dependencies = { ...durableRunEventStreamDependencies, ...overrides };
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    "X-Accel-Buffering": "no"
+  });
+  res.write("retry: 3000\n\n");
+  let cursor = Number(req.get("Last-Event-ID") ?? 0);
+  if (!Number.isSafeInteger(cursor) || cursor < 0) cursor = 0;
+  let closed = false;
+  req.on("close", () => {
+    closed = true;
+  });
+  const heartbeat = setInterval(() => {
+    if (!closed) res.write(": keepalive\n\n");
+  }, 15e3);
+  heartbeat.unref();
+  const drain = async () => {
+    while (!closed) {
+      const events = await dependencies.readEvents(runId, ownerId, cursor);
+      if (!events) return false;
+      for (const event of events) {
+        if (closed) return true;
+        if (event.seq !== void 0) {
+          cursor = Math.max(cursor, event.seq);
+          res.write(`id: ${event.seq}
+`);
+        }
+        res.write(`data: ${JSON.stringify(event)}
+
+`);
+      }
+      if (events.length < DURABLE_RUN_EVENT_BATCH_SIZE) return true;
+    }
+    return true;
+  };
+  try {
+    while (!closed) {
+      if (!await drain()) break;
+      const status = await dependencies.getRun(runId, ownerId);
+      if (!status) break;
+      if (status.finished) {
+        await drain();
+        break;
+      }
+      await dependencies.wait(500);
+    }
+  } finally {
+    clearInterval(heartbeat);
+    if (!closed) res.end();
+  }
+}
+runPlanRouter.get("/:id/events", asyncHandler(async (req, res) => {
+  const ownerId = requestUser(req).id;
+  const durable = await getDurableRunForUser(req.params.id, ownerId);
+  if (!durable) {
+    const legacyRun = getRunForUser(req.params.id, ownerId);
+    if (!legacyRun) {
+      res.status(404).json({ error: "run not found" });
+      return;
+    }
+    streamInMemoryRun(legacyRun, req, res);
+    return;
+  }
+  await streamDurableRunEvents(req.params.id, ownerId, req, res);
+}));
+runPlanRouter.post("/:id/cancel", asyncHandler(async (req, res) => {
+  const result = await cancelDurableRun(req.params.id, requestUser(req).id);
+  if (!result) {
+    res.status(404).json({ error: "run not found" });
+    return;
+  }
+  res.json(result);
+}));
+runPlanRouter.get("/:id", asyncHandler(async (req, res) => {
+  const ownerId = requestUser(req).id;
+  const durable = await getDurableRunForUser(req.params.id, ownerId);
+  if (durable) {
+    res.json({ runId: durable.id, status: durable.status, finished: durable.finished });
+    return;
+  }
+  const run = getRunForUser(req.params.id, ownerId);
   if (!run) {
     res.status(404).json({ error: "run not found" });
     return;
   }
   res.json({ runId: run.id, finished: run.finished });
-});
+}));
 
 // server/routes/files.ts
 import { Router as Router3 } from "express";
@@ -2959,10 +4371,25 @@ filesRouter.post("/", asyncHandler(async (req, res) => {
     return;
   }
   try {
-    const saved = saveDataUrl(dataUrl);
-    await query(`
-      INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, $2, 'upload', $3)
-    `, [saved.id, requestUser(req).id, (/* @__PURE__ */ new Date()).toISOString()]);
+    const saved = await saveNormalizedUploadDataUrl(dataUrl);
+    try {
+      await query(`
+        INSERT INTO files (
+          id, owner_id, source_type, mime_type, width, height, byte_length, normalized, created_at
+        ) VALUES ($1, $2, 'upload', $3, $4, $5, $6, TRUE, $7)
+      `, [
+        saved.id,
+        requestUser(req).id,
+        saved.mimeType,
+        saved.width,
+        saved.height,
+        saved.byteLength,
+        (/* @__PURE__ */ new Date()).toISOString()
+      ]);
+    } catch (error) {
+      deleteStoredImage(saved.id);
+      throw error;
+    }
     res.json(saved);
   } catch (err) {
     if (err instanceof ProviderError || err instanceof ImageValidationError) {
@@ -3713,22 +5140,33 @@ assetsRouter.post("/", asyncHandler(async (req, res) => {
     res.status(403).json({ error: "\u53EA\u6709\u7BA1\u7406\u5458\u53EF\u4EE5\u521B\u5EFA\u901A\u7528\u7D20\u6750" });
     return;
   }
+  let saved;
   try {
     if (sourceNote !== void 0 && (typeof sourceNote !== "string" || sourceNote.length > 2e3)) {
       throw new ImageValidationError("sourceNote must be a string of at most 2000 characters");
     }
     const finalScope = scope === "global" && user.role === "admin" ? "global" : scope === "shared" ? "shared" : "private";
-    const saved = image.startsWith("data:") ? saveDataUrl(image) : void 0;
-    const imageUrl = saved?.url ?? (isLocalImageReference(image) ? image : "");
-    if (!imageUrl) throw new ImageValidationError("image must be a local image reference or valid image dataURL");
+    saved = image.startsWith("data:") ? await saveNormalizedUploadDataUrl(image) : void 0;
+    const imageUrl2 = saved?.url ?? (isLocalImageReference(image) ? image : "");
+    if (!imageUrl2) throw new ImageValidationError("image must be a local image reference or valid image dataURL");
     const id = nanoid9(10);
     const createdAt = (/* @__PURE__ */ new Date()).toISOString();
     const created = await transaction(async (client) => {
       if (saved) {
         await client.query(`
-          INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, $2, 'asset', $3)
+          INSERT INTO files (
+            id, owner_id, source_type, mime_type, width, height, byte_length, normalized, created_at
+          ) VALUES ($1, $2, 'asset', $3, $4, $5, $6, TRUE, $7)
           ON CONFLICT (id) DO NOTHING
-        `, [saved.id, finalScope === "global" ? null : user.id, createdAt]);
+        `, [
+          saved.id,
+          finalScope === "global" ? null : user.id,
+          saved.mimeType,
+          saved.width,
+          saved.height,
+          saved.byteLength,
+          createdAt
+        ]);
       } else {
         const access = await queryOne(`
           SELECT f.owner_id,
@@ -3737,7 +5175,7 @@ assetsRouter.post("/", asyncHandler(async (req, res) => {
               WHERE a.image = $1 AND a.deleted_at IS NULL AND a.scope IN ('global','shared')
             ) AS shared
           FROM files f WHERE f.id = $2
-        `, [imageUrl, path7.basename(imageUrl)], client);
+        `, [imageUrl2, path7.basename(imageUrl2)], client);
         if (!access || access.owner_id !== null && access.owner_id !== user.id && user.role !== "admin" && !access.shared) {
           return false;
         }
@@ -3745,20 +5183,22 @@ assetsRouter.post("/", asyncHandler(async (req, res) => {
       if (finalScope === "global") {
         await client.query(`
           UPDATE files SET owner_id = NULL, deleted_at = NULL, purge_after = NULL WHERE id = $1
-        `, [path7.basename(imageUrl)]);
+        `, [path7.basename(imageUrl2)]);
       }
       await client.query(`
         INSERT INTO assets (id, owner_id, scope, name, category, image, source_note, created_at)
         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-      `, [id, finalScope === "global" ? null : user.id, finalScope, name.trim(), category, imageUrl, sourceNote ?? null, createdAt]);
+      `, [id, finalScope === "global" ? null : user.id, finalScope, name.trim(), category, imageUrl2, sourceNote ?? null, createdAt]);
       return true;
     });
     if (!created) {
+      if (saved) deleteStoredImage(saved.id);
       res.status(404).json({ error: "image file not found" });
       return;
     }
     res.status(201).json({ ok: true, id });
   } catch (error) {
+    if (saved) deleteStoredImage(saved.id);
     res.status(error instanceof ImageValidationError ? 400 : 500).json({ error: error instanceof Error ? error.message : String(error) });
   }
 }));
@@ -4134,7 +5574,7 @@ function decodeCursor(value) {
   }
   return { before: Number(decoded.before), startedAt: Number(decoded.startedAt), runId: decoded.runId };
 }
-function parseJson(value, fallback) {
+function parseJson2(value, fallback) {
   if (typeof value !== "string" || !value) return fallback;
   try {
     return JSON.parse(value);
@@ -4171,7 +5611,7 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
         OR (r.started_at = $3 AND r.id < $4)
       )
       AND (
-        r.status IN ('queued','running')
+        r.status IN ('queued','running','retry_wait','cancel_requested','cancelled','outcome_unknown','failed','succeeded')
         OR EXISTS (SELECT 1 FROM generation_outputs output WHERE output.run_id = r.id)
       )
     ORDER BY r.started_at DESC, r.id DESC
@@ -4185,37 +5625,42 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
   }
   const rows = await query(`
     SELECT r.*, o.id AS output_id, o.image, o.prompt AS output_prompt,
-      o.status AS output_status, o.error AS output_error, u.display_name AS owner_name
+      o.provider_output_size, o.status AS output_status, o.error AS output_error,
+      u.display_name AS owner_name
     FROM generation_runs r
     JOIN users u ON u.id = r.owner_id
     LEFT JOIN generation_outputs o ON o.run_id = r.id
     WHERE r.id = ANY($1::text[])
     ORDER BY r.started_at DESC, r.id DESC, o.created_at ASC, o.id ASC
   `, [pageRuns.map((run) => run.id)]);
-  const records = rows.map((row) => ({
-    id: row.output_id ?? row.id,
-    runId: row.id,
-    image: row.image ?? "",
-    thumbnail: row.image ? thumbnailUrlForImage(row.image) : "",
-    nodeId: row.node_id,
-    nodeLabel: row.node_label,
-    kind: row.kind,
-    projectId: row.project_id,
-    projectName: row.project_name,
-    ownerId: row.owner_id,
-    ownerName: row.owner_name,
-    prompt: row.output_prompt ?? row.prompt,
-    parameters: parseJson(row.parameters_json, {}),
-    referenceImages: parseJson(row.reference_images_json, []),
-    model: row.model,
-    requestedCount: row.requested_count,
-    successfulCount: row.successful_count,
-    providerRequests: row.provider_requests,
-    startedAt: row.started_at,
-    finishedAt: row.finished_at,
-    status: row.output_status ?? row.status,
-    error: row.output_error ?? row.error
-  }));
+  const records = rows.map((row) => {
+    const runStatus = row.status === "succeeded" ? "success" : row.status === "failed" ? "error" : row.status;
+    return {
+      id: row.output_id ?? row.id,
+      runId: row.id,
+      image: row.image ?? "",
+      thumbnail: row.image ? thumbnailUrlForImage(row.image) : "",
+      nodeId: row.node_id,
+      nodeLabel: row.node_label,
+      kind: row.kind,
+      projectId: row.project_id,
+      projectName: row.project_name,
+      ownerId: row.owner_id,
+      ownerName: row.owner_name,
+      prompt: row.output_prompt ?? row.prompt,
+      parameters: parseJson2(row.parameters_json, {}),
+      referenceImages: parseJson2(row.reference_images_json, []),
+      model: row.model,
+      requestedCount: row.requested_count,
+      successfulCount: row.successful_count,
+      providerRequests: row.provider_requests,
+      providerOutputSize: row.provider_output_size,
+      startedAt: row.started_at,
+      finishedAt: row.finished_at,
+      status: row.output_status ?? runStatus,
+      error: row.output_error ?? row.error
+    };
+  });
   const lastRun = pageRuns.at(-1);
   res.json({
     records,
@@ -4306,35 +5751,56 @@ usageRouter.get("/", asyncHandler(async (req, res) => {
 }));
 
 // server/routes/aiDiagnostics.ts
+import sharp6 from "sharp";
 import { Router as Router10 } from "express";
+function configuredGateway() {
+  const url = new URL(config.apiyiBaseUrl());
+  if (url.protocol !== "https:") throw new Error("APIYI_BASE_URL \u5FC5\u987B\u4F7F\u7528 HTTPS");
+  config.apiyiApiKey();
+  return { host: url.host };
+}
 function providerSettings(providerId) {
-  const nanobanana = providerId === "nanobanana";
+  configuredGateway();
+  const contract = getImageModelContract(providerId);
+  const probes = [
+    ...contract.generation ? ["generate"] : [],
+    "edit"
+  ];
   return {
     providerId,
-    model: nanobanana ? config.nanobananaModel() : config.image2Model(),
-    capabilities: nanobanana ? config.nanobananaCapabilities() : config.image2Capabilities(),
-    apiKey: nanobanana ? config.nanobananaApiKey() : config.change2proApiKey()
+    model: providerId,
+    label: contract.label,
+    channel: contract.channel,
+    probes,
+    capabilities: {
+      supportsGeneration: contract.generation !== null,
+      supportsEdit: true,
+      maxReferenceImages: modelMaxReferenceImages(providerId),
+      maxImagesPerRequest: modelMaximumImagesPerRequest(providerId),
+      timeoutMs: contract.timeoutMs
+    }
   };
 }
 var getDiagnostics = asyncHandler(async (_req, res) => {
   let gateway = "\u672A\u914D\u7F6E";
   try {
-    gateway = new URL(config.change2proBaseUrl()).host;
+    gateway = configuredGateway().host;
   } catch {
   }
-  const providers2 = ["nanobanana", "gpt-image-2"].map((providerId) => {
+  const providers2 = IMAGE_MODEL_IDS.map((providerId) => {
     try {
-      const settings = providerSettings(providerId);
-      return {
-        providerId,
-        model: settings.model,
-        capabilities: settings.capabilities,
-        configured: true
-      };
+      return { ...providerSettings(providerId), configured: true };
     } catch (error) {
+      const contract = getImageModelContract(providerId);
       return {
         providerId,
-        model: "",
+        model: providerId,
+        label: contract.label,
+        channel: contract.channel,
+        probes: [
+          ...contract.generation ? ["generate"] : [],
+          "edit"
+        ],
         configured: false,
         error: error instanceof Error ? error.message : "\u914D\u7F6E\u7F3A\u5931"
       };
@@ -4342,60 +5808,86 @@ var getDiagnostics = asyncHandler(async (_req, res) => {
   });
   res.json({ gateway, providers: providers2 });
 });
-var DIAGNOSTIC_IMAGE = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
+function diagnosticModelOptions(modelId) {
+  switch (modelId) {
+    case "gpt-image-2":
+      return {};
+    case "gpt-image-2-vip":
+      return { size: "1280x1280" };
+    case "gemini-3.1-flash-image":
+      return { aspectRatio: "1:1", imageSize: "512" };
+    case "flux-2-pro":
+      return { width: 512, height: 512, outputFormat: "png" };
+    case "seedream-5-0-260128":
+      return { size: "2K" };
+    case "grok-imagine-image":
+      return { aspectRatio: "1:1", resolution: "1k" };
+  }
+}
+var diagnosticImagesPromise;
+function diagnosticImages() {
+  diagnosticImagesPromise ??= (async () => {
+    const width = 1024;
+    const height = 1024;
+    const source = await sharp6({
+      create: { width, height, channels: 3, background: { r: 255, g: 255, b: 255 } }
+    }).png().toBuffer();
+    const pixels = Buffer.alloc(width * height * 4);
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const offset = (y * width + x) * 4;
+        pixels[offset] = 255;
+        pixels[offset + 1] = 255;
+        pixels[offset + 2] = 255;
+        pixels[offset + 3] = x < width / 2 ? 0 : 255;
+      }
+    }
+    const mask = await sharp6(pixels, { raw: { width, height, channels: 4 } }).png().toBuffer();
+    return {
+      source: `data:image/png;base64,${source.toString("base64")}`,
+      mask: `data:image/png;base64,${mask.toString("base64")}`
+    };
+  })();
+  return diagnosticImagesPromise;
+}
 var probeDiagnostics = asyncHandler(async (req, res) => {
   const { providerId, mode } = req.body;
-  if (providerId !== "nanobanana" && providerId !== "gpt-image-2" || !["model", "generate", "edit"].includes(String(mode))) {
+  if (!isImageModelId(providerId) || mode !== "generate" && mode !== "edit") {
     res.status(400).json({ error: "providerId \u6216\u8BCA\u65AD\u65B9\u5F0F\u65E0\u6548" });
     return;
   }
   const settings = providerSettings(providerId);
+  if (!settings.probes.includes(mode)) {
+    res.status(400).json({ error: `${providerId} \u4E0D\u652F\u6301${mode === "generate" ? "\u6587\u751F\u56FE" : "\u53C2\u8003\u56FE\u7F16\u8F91"}\u8BCA\u65AD` });
+    return;
+  }
   const startedAt = Date.now();
   try {
-    let imageCount;
-    if (mode === "model") {
-      const requestOptions = { providerId, maxRetries: 0, timeoutMs: Math.min(config.aiTimeoutMs(), 3e4) };
-      const requestInit = () => ({ headers: { Authorization: `Bearer ${settings.apiKey}` } });
-      try {
-        await fetchWithRetry(
-          `${config.change2proBaseUrl()}/models/${encodeURIComponent(settings.model)}`,
-          requestInit,
-          requestOptions
-        );
-      } catch (error) {
-        if (!(error instanceof ProviderError) || error.status !== 404) throw error;
-        const response = await fetchWithRetry(
-          `${config.change2proBaseUrl()}/models`,
-          requestInit,
-          requestOptions
-        );
-        const body = await response.json();
-        const exists = Array.isArray(body.data) && body.data.some((item) => item?.id === settings.model);
-        if (!exists) {
-          throw new ProviderError(
-            "\u5F53\u524D AI \u6A21\u578B\u4E0D\u53EF\u7528\uFF0C\u8BF7\u8054\u7CFB\u7BA1\u7406\u5458\u68C0\u67E5\u6A21\u578B\u914D\u7F6E",
-            404,
-            providerId,
-            "model_unavailable",
-            `Configured model ${settings.model} was not present in GET /models`
-          );
-        }
-      }
-    } else {
-      const provider = getProvider(providerId);
-      const prompt = "\u670D\u88C5\u8BBE\u8BA1\u7CFB\u7EDF\u8FDE\u901A\u6027\u6D4B\u8BD5\uFF1A\u751F\u6210\u4E00\u5757\u7EAF\u767D\u8272\u65B9\u5F62\u9762\u6599\u8272\u5361\uFF0C\u4E0D\u5305\u542B\u6587\u5B57";
-      const result = mode === "generate" ? await provider.generate({ prompt, batchSize: 1, aspectRatio: "1:1" }) : await provider.edit({
+    const provider = getProvider(providerId);
+    const prompt = "\u670D\u88C5\u8BBE\u8BA1\u7CFB\u7EDF\u8FDE\u901A\u6027\u6D4B\u8BD5\uFF1A\u751F\u6210\u4E00\u5757\u7EAF\u767D\u8272\u65B9\u5F62\u9762\u6599\u8272\u5361\uFF0C\u4E0D\u5305\u542B\u6587\u5B57";
+    const modelOptions = diagnosticModelOptions(providerId);
+    const result = mode === "generate" ? await provider.generate({ prompt, batchSize: 1, aspectRatio: "1:1", modelOptions }) : await (async () => {
+      const images = await diagnosticImages();
+      return provider.edit({
         prompt: "\u4FDD\u6301\u753B\u9762\u4E3A\u7EAF\u767D\u8272\u65B9\u5F62\u8272\u5361\uFF0C\u4E0D\u6DFB\u52A0\u6587\u5B57",
-        referenceImages: [DIAGNOSTIC_IMAGE],
+        referenceImages: [images.source],
+        mask: providerId === "gpt-image-2" ? images.mask : void 0,
         batchSize: 1,
-        aspectRatio: "1:1"
+        aspectRatio: "1:1",
+        modelOptions
       });
-      imageCount = result.images.length;
-    }
-    res.json({ ok: true, providerId, mode, model: settings.model, imageCount, durationMs: Date.now() - startedAt });
+    })();
+    res.json({
+      ok: true,
+      providerId,
+      mode,
+      model: settings.model,
+      imageCount: result.images.length,
+      durationMs: Date.now() - startedAt
+    });
   } catch (error) {
     if (error instanceof ProviderError && error.diagnostic) {
-      console.error(`[ai-diagnostic:${providerId}:${String(mode)}] ${error.diagnostic}`);
+      console.error(`[ai-diagnostic:${providerId}:${mode}] ${error.diagnostic}`);
     }
     res.status(error instanceof ProviderError && error.status === 429 ? 429 : 502).json({
       ok: false,
@@ -4604,7 +6096,8 @@ app.use("/api/auth/login", loginRateLimit);
 app.use("/api/auth", authRouter);
 app.use("/api", requireAuth, requirePasswordChanged);
 app.use("/api/generate", aiRateLimit, generateRouter);
-app.use("/api/run-plan", aiRateLimit, runPlanRouter);
+app.post("/api/run-plan", aiRateLimit);
+app.use("/api/run-plan", runPlanRouter);
 app.use("/api/files", filesRouter);
 app.use("/api/projects", projectsRouter);
 app.use("/api/templates", templatesRouter);
@@ -4639,6 +6132,7 @@ async function start() {
     });
   }, 6 * 60 * 60 * 1e3);
   sessionPruneTimer.unref();
+  startGenerationWorker();
   app.listen(port, () => {
     console.log(`[garment-canvas] server listening on http://localhost:${port} (${initialReadiness.mode})`);
   });

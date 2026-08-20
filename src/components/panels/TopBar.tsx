@@ -10,6 +10,13 @@ const SAVE_TEXT = {
   error: "保存失败，重试",
 } as const;
 
+const SAVE_TEXT_COMPACT = {
+  idle: "保存",
+  saving: "保存中",
+  saved: "已保存",
+  error: "重试",
+} as const;
+
 /** 打开项目：下拉列出已保存项目，加载恢复画布 */
 function ProjectPicker() {
   const [open, setOpen] = useState(false);
@@ -85,7 +92,7 @@ function ProjectPicker() {
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className={`rounded-md border px-2.5 py-1 text-[10px] transition-colors ${
+        className={`h-8 rounded-md border px-2 py-1 text-[10px] transition-colors sm:h-auto sm:px-2.5 ${
           open
             ? "border-gold text-gold"
             : "border-[#262626] text-neutral-400 hover:border-gold/50 hover:text-neutral-200"
@@ -94,7 +101,7 @@ function ProjectPicker() {
         打开
       </button>
       {open && (
-        <div className="absolute left-0 top-full z-50 mt-1.5 w-64 rounded-lg border border-[#333] bg-[#161616] p-1.5 shadow-xl shadow-black/60">
+        <div className="fixed left-2 right-2 top-12 z-50 rounded-lg border border-[#333] bg-[#161616] p-1.5 shadow-xl shadow-black/60 sm:absolute sm:left-0 sm:right-auto sm:top-full sm:mt-1.5 sm:w-64">
           <div className="px-2.5 pb-1.5 pt-1 text-[10px] uppercase tracking-widest text-neutral-600">
             已保存的项目
           </div>
@@ -167,8 +174,10 @@ function ThemeSwitcher() {
     <div ref={rootRef} className="relative">
       <button
         type="button"
+        aria-label={`切换主题，当前为${current.label}`}
+        title={`切换主题，当前为${current.label}`}
         onClick={() => setOpen((v) => !v)}
-        className={`flex items-center gap-1.5 rounded-full border px-3 py-1.5 text-[10px] transition-colors ${
+        className={`flex h-8 w-8 items-center justify-center gap-1.5 rounded-full border px-0 text-[10px] transition-colors sm:h-auto sm:w-auto sm:px-3 sm:py-1.5 ${
           open
             ? "border-gold text-gold"
             : "border-[#262626] text-neutral-400 hover:border-gold/50 hover:text-neutral-200"
@@ -178,8 +187,8 @@ function ThemeSwitcher() {
           className="h-2.5 w-2.5 rounded-full border border-white/20"
           style={{ backgroundColor: current.swatch }}
         />
-        {current.label}
-        <span className="text-[8px] text-neutral-600">{open ? "▲" : "▼"}</span>
+        <span className="hidden sm:inline">{current.label}</span>
+        <span className="hidden text-[8px] text-neutral-600 sm:inline">{open ? "▲" : "▼"}</span>
       </button>
 
       {open && (
@@ -226,40 +235,45 @@ export function TopBar() {
   const saveProject = useFlowStore((s) => s.saveProject);
 
   return (
-    <header className="gc-panel relative flex h-11 shrink-0 items-center gap-3 border-b border-[#262626] bg-[#141414] px-4">
+    <header className="gc-panel relative z-40 flex h-11 min-w-0 shrink-0 items-center gap-1.5 border-b border-[#262626] bg-[#141414] px-2 sm:gap-3 sm:px-4">
       {/* 左：品牌 + 项目名 */}
-      <span className="text-xs font-semibold tracking-widest text-gold">GARMENT CANVAS</span>
-      <span className="h-4 w-px bg-[#262626]" />
+      <span className="hidden text-xs font-semibold tracking-widest text-gold lg:inline">GARMENT CANVAS</span>
+      <span className="hidden h-4 w-px bg-[#262626] lg:block" />
       <input
         value={projectName}
         onChange={(e) => setProjectName(e.target.value)}
-        className="w-56 rounded-md border border-transparent bg-transparent px-2 py-1 text-xs text-neutral-200 hover:border-[#262626] focus:border-gold focus:outline-none"
+        className="min-w-0 flex-1 rounded-md border border-transparent bg-transparent px-1.5 py-1 text-xs text-neutral-200 hover:border-[#262626] focus:border-gold focus:outline-none sm:w-44 sm:flex-none sm:px-2 lg:w-56"
         placeholder="项目名称"
       />
-      {dirty && <span className="-ml-2 text-[10px] text-gold" title="有未保存修改">●</span>}
-      {readOnly && <span className="rounded border border-blue-400/40 px-2 py-0.5 text-[9px] text-blue-400">管理员只读</span>}
+      {dirty && <span className="shrink-0 text-[10px] text-gold" title="有未保存修改">●</span>}
+      {readOnly && (
+        <span className="shrink-0 rounded border border-blue-400/40 px-1.5 py-0.5 text-[9px] text-blue-400">
+          <span className="sm:hidden">只读</span>
+          <span className="hidden sm:inline">管理员只读</span>
+        </span>
+      )}
       <button
         type="button"
         onClick={() => void saveProject()}
         disabled={readOnly || saveState === "saving" || (!dirty && saveState === "saved")}
-        className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+        className={`h-8 shrink-0 rounded-md px-2 text-[10px] font-medium transition-colors sm:h-auto sm:px-3 sm:py-1.5 sm:text-xs ${
           saveState === "error"
             ? "bg-red-900/60 text-red-300 hover:bg-red-900"
             : "bg-gold text-ink hover:opacity-90"
         } disabled:opacity-50`}
       >
-        {SAVE_TEXT[saveState]}
+        <span className="sm:hidden">{SAVE_TEXT_COMPACT[saveState]}</span>
+        <span className="hidden sm:inline">{SAVE_TEXT[saveState]}</span>
       </button>
 
-      {/* 中：快捷键提示 + 打开（绝对居中） */}
-      <div className="absolute left-1/2 flex -translate-x-1/2 items-center gap-3">
-        <span className="hidden text-[10px] text-neutral-600 sm:inline">
+      <div className="flex shrink-0 items-center gap-3">
+        <span className="hidden text-[10px] text-neutral-600 xl:inline">
           Ctrl+S 保存 · Ctrl+Z 撤销 · Ctrl+C/V 复制粘贴节点
         </span>
         <ProjectPicker />
       </div>
 
-      <div className="ml-auto flex items-center gap-2">
+      <div className="flex shrink-0 items-center gap-1 sm:ml-auto sm:gap-2">
         <ThemeSwitcher />
         <AccountMenu />
       </div>

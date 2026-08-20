@@ -39,49 +39,10 @@ function required(name: string): string {
   return v;
 }
 
-function booleanEnv(name: string, fallback: boolean): boolean {
-  const value = process.env[name]?.trim().toLowerCase();
-  if (value === undefined || value === "") return fallback;
-  return value === "true" || value === "1" || value === "yes";
-}
-
-function boundedIntegerEnv(name: string, fallback: number, min: number, max: number): number {
-  const value = Number(process.env[name]);
-  return Number.isInteger(value) ? Math.max(min, Math.min(max, value)) : fallback;
-}
-
-export interface ImageProviderCapabilities {
-  supportsBatchN: boolean;
-  maxBatchSize: number;
-  supportsMultiReference: boolean;
-  maxReferenceImages: number;
-}
-
 export const config = {
-  /** change2pro 中转站 */
-  change2proBaseUrl: () =>
-    (process.env.CHANGE2PRO_BASE_URL ?? "https://your-change2pro-host/v1").replace(/\/+$/, ""),
-  change2proApiKey: () => required("CHANGE2PRO_API_KEY"),
-
-  /** nanobanana 可用独立 Key（如中转站按平台分组发 Key），缺省回退主 Key */
-  nanobananaApiKey: () =>
-    process.env.NANOBANANA_API_KEY || required("CHANGE2PRO_API_KEY"),
-
-  // 不再假定任意 OpenAI 兼容网关都存在某个固定模型；部署必须明确声明模型 ID。
-  nanobananaModel: () => required("NANOBANANA_MODEL"),
-  image2Model: () => required("IMAGE2_MODEL"),
-  nanobananaCapabilities: (): ImageProviderCapabilities => ({
-    supportsBatchN: booleanEnv("NANOBANANA_SUPPORTS_N", false),
-    maxBatchSize: boundedIntegerEnv("NANOBANANA_MAX_BATCH", 1, 1, 4),
-    supportsMultiReference: booleanEnv("NANOBANANA_SUPPORTS_MULTI_REFERENCE", true),
-    maxReferenceImages: boundedIntegerEnv("NANOBANANA_MAX_REFERENCE_IMAGES", 8, 1, 8),
-  }),
-  image2Capabilities: (): ImageProviderCapabilities => ({
-    supportsBatchN: booleanEnv("IMAGE2_SUPPORTS_N", false),
-    maxBatchSize: boundedIntegerEnv("IMAGE2_MAX_BATCH", 1, 1, 4),
-    supportsMultiReference: booleanEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", true),
-    maxReferenceImages: boundedIntegerEnv("IMAGE2_MAX_REFERENCE_IMAGES", 8, 1, 8),
-  }),
+  /** API易图片接口；路径由本地模型知识库逐模型声明。 */
+  apiyiBaseUrl: () => (process.env.APIYI_BASE_URL ?? "https://api.apiyi.com").replace(/\/+$/, ""),
+  apiyiApiKey: () => required("APIYI_API_KEY"),
 
   port: () => Number(process.env.PORT ?? 3001),
   dataDir: () => path.resolve(ROOT_DIR, process.env.DATA_DIR ?? "./data"),
@@ -99,18 +60,13 @@ export const config = {
   apiOnly: () => process.env.API_ONLY === "true",
 
   /** AI 调用超时（中转站网关限制，可配） */
-  aiTimeoutMs: () => Number(process.env.AI_TIMEOUT_MS ?? 300_000),
-  /** 失败重试次数（不含首次） */
-  aiMaxRetries: () => Number(process.env.AI_MAX_RETRIES ?? 2),
+  aiTimeoutMs: (fallback = 300_000) => Number(process.env.AI_TIMEOUT_MS ?? fallback),
 
   /** 不发外部请求的 AI 配置就绪检查，供 readiness 使用。 */
   aiConfigReady: () => {
-    const key = process.env.CHANGE2PRO_API_KEY || process.env.NANOBANANA_API_KEY;
-    const baseUrl = process.env.CHANGE2PRO_BASE_URL ?? "";
-    if (
-      !key || !baseUrl || /your-change2pro-host/i.test(baseUrl) ||
-      !process.env.IMAGE2_MODEL?.trim() || !process.env.NANOBANANA_MODEL?.trim()
-    ) return false;
+    const key = process.env.APIYI_API_KEY?.trim();
+    const baseUrl = config.apiyiBaseUrl();
+    if (!key) return false;
     try {
       const url = new URL(baseUrl);
       return url.protocol === "https:";

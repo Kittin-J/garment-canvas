@@ -1,8 +1,9 @@
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import { useFlowStore } from "@/store/flowStore";
-import type { UpscaleNodeData } from "@/types/workflow";
+import { isNodeRunActive, type UpscaleNodeData } from "@/types/workflow";
 import { NodeFrame, RunButton, Developing } from "./NodeFrame";
 import { ImageGrid } from "./ImageGrid";
+import { ModelControls } from "./ModelControls";
 
 const IMAGE_SIZES = [
   { value: "2K", label: "2K · 长边 2048" },
@@ -12,7 +13,8 @@ const IMAGE_SIZES = [
 export function UpscaleNode({ id, data, selected }: NodeProps<Node<UpscaleNodeData>>) {
   const updateNodeData = useFlowStore((s) => s.updateNodeData);
   const runNode = useFlowStore((s) => s.runNode);
-  const running = data.status === "running" || data.status === "queued";
+  const cancelNodeRun = useFlowStore((s) => s.cancelNodeRun);
+  const running = isNodeRunActive(data.status);
 
   return (
     <>
@@ -40,7 +42,8 @@ export function UpscaleNode({ id, data, selected }: NodeProps<Node<UpscaleNodeDa
             })}
           </div>
         </div>
-        <RunButton running={running} queued={data.status === "queued"} onClick={() => void runNode(id)} label="高清放大" />
+        <ModelControls nodeId={id} modelId={data.modelId} modelOptions={data.modelOptions} disabled={running} />
+        <RunButton status={data.status} onClick={() => void runNode(id)} onCancel={() => void cancelNodeRun(id)} label="高清放大" />
         {running && <Developing />}
         <ImageGrid images={data.outputImages} />
       </NodeFrame>

@@ -106,7 +106,7 @@ await initializeDatabase();
 const preAppliedVersions = await query<{ version: number }>(
   "SELECT version FROM schema_migrations ORDER BY version",
 );
-assert.deepEqual(preAppliedVersions.map((row) => row.version), [1, 2, 3, 4, 5]);
+assert.deepEqual(preAppliedVersions.map((row) => row.version), [1, 2, 3, 4, 5, 6, 7, 8]);
 assert.equal((await queryOne<{ count: number }>("SELECT COUNT(*)::int AS count FROM users"))?.count, 0);
 await closeDatabaseForTests();
 

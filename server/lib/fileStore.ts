@@ -14,6 +14,7 @@ import { config } from "../config";
 import { toDataUrl } from "../providers/base";
 import { withImageProcessingSlot } from "./imageProcessingLimit";
 import { MAX_IMAGE_BYTES, detectImageMime, validateImageDataUrl } from "./imageValidation";
+import { normalizeUploadImageDataUrl } from "./uploadImageNormalization";
 
 const MAX_THUMBNAIL_INPUT_PIXELS = 40_000_000;
 
@@ -114,6 +115,44 @@ export function saveDataUrl(dataUrl: string): { id: string; url: string } {
     fs.closeSync(fd);
   }
   return { id, url: `/api/files/${id}` };
+}
+
+export interface SavedNormalizedUpload {
+  id: string;
+  url: string;
+  mimeType: "image/png" | "image/jpeg";
+  width: number;
+  height: number;
+  byteLength: number;
+  normalized: true;
+}
+
+/** 用户输入先完成 API易推荐标准化，再以独占创建 + fsync 原子落盘。 */
+export async function saveNormalizedUploadDataUrl(dataUrl: string): Promise<SavedNormalizedUpload> {
+  const normalized = await normalizeUploadImageDataUrl(dataUrl);
+  const ext = MIME_EXT[normalized.mimeType];
+  const id = `${nanoid(12)}.${ext}`;
+  const filePath = path.join(uploadsDir(), id);
+  let handle: fs.promises.FileHandle | undefined;
+  try {
+    handle = await fs.promises.open(filePath, "wx", 0o600);
+    await handle.writeFile(normalized.buffer);
+    await handle.sync();
+  } catch (error) {
+    try { await fs.promises.rm(filePath, { force: true }); } catch { /* best-effort cleanup */ }
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+  return {
+    id,
+    url: `/api/files/${id}`,
+    mimeType: normalized.mimeType,
+    width: normalized.width,
+    height: normalized.height,
+    byteLength: normalized.byteLength,
+    normalized: true,
+  };
 }
 
 /** /api/files/:id 读取为 dataURL；非文件引用（已是 dataURL 或 http URL）原样返回 */

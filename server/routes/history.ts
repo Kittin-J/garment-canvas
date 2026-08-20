@@ -68,7 +68,7 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
         OR (r.started_at = $3 AND r.id < $4)
       )
       AND (
-        r.status IN ('queued','running')
+        r.status IN ('queued','running','retry_wait','cancel_requested','cancelled','outcome_unknown','failed','succeeded')
         OR EXISTS (SELECT 1 FROM generation_outputs output WHERE output.run_id = r.id)
       )
     ORDER BY r.started_at DESC, r.id DESC
@@ -82,14 +82,17 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
   }
   const rows = await query<Record<string, unknown>>(`
     SELECT r.*, o.id AS output_id, o.image, o.prompt AS output_prompt,
-      o.status AS output_status, o.error AS output_error, u.display_name AS owner_name
+      o.provider_output_size, o.status AS output_status, o.error AS output_error,
+      u.display_name AS owner_name
     FROM generation_runs r
     JOIN users u ON u.id = r.owner_id
     LEFT JOIN generation_outputs o ON o.run_id = r.id
     WHERE r.id = ANY($1::text[])
     ORDER BY r.started_at DESC, r.id DESC, o.created_at ASC, o.id ASC
   `, [pageRuns.map((run) => run.id)]);
-  const records = rows.map((row) => ({
+  const records = rows.map((row) => {
+    const runStatus = row.status === "succeeded" ? "success" : row.status === "failed" ? "error" : row.status;
+    return ({
     id: (row.output_id as string | null) ?? (row.id as string),
     runId: row.id,
     image: (row.image as string | null) ?? "",
@@ -108,11 +111,13 @@ historyRouter.get("/", asyncHandler(async (req, res) => {
     requestedCount: row.requested_count,
     successfulCount: row.successful_count,
     providerRequests: row.provider_requests,
+    providerOutputSize: row.provider_output_size,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
-    status: (row.output_status as string | null) ?? row.status,
+    status: (row.output_status as string | null) ?? runStatus,
     error: (row.output_error as string | null) ?? row.error,
-  }));
+    });
+  });
   const lastRun = pageRuns.at(-1);
   res.json({
     records,

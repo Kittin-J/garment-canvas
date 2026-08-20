@@ -58,6 +58,7 @@ export async function completeGenerationRecord(args: {
   runId: string;
   images: string[];
   prompts?: string[];
+  providerOutputSizes?: Array<string | null>;
   failures?: Array<{ prompt?: string; error: string }>;
   model?: string;
   providerRequests: number;
@@ -74,9 +75,13 @@ export async function completeGenerationRecord(args: {
     await client.query("DELETE FROM generation_outputs WHERE run_id = $1", [args.runId]);
     for (const [index, image] of args.images.entries()) {
       await client.query(`
-        INSERT INTO generation_outputs (id, run_id, image, prompt, status, error, created_at)
-        VALUES ($1, $2, $3, $4, 'success', NULL, $5)
-      `, [nanoid(12), args.runId, image, args.prompts?.[index] ?? null, args.finishedAt + index]);
+        INSERT INTO generation_outputs (
+          id, run_id, image, prompt, provider_output_size, status, error, created_at
+        ) VALUES ($1, $2, $3, $4, $5, 'success', NULL, $6)
+      `, [
+        nanoid(12), args.runId, image, args.prompts?.[index] ?? null,
+        args.providerOutputSizes?.[index] ?? null, args.finishedAt + index,
+      ]);
       if (image.startsWith("/api/files/")) {
         await client.query(`
           INSERT INTO files (id, owner_id, source_type, project_id, node_id, run_id, created_at)

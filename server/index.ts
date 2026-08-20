@@ -22,6 +22,7 @@ import { migrateLegacyData } from "./lib/legacyMigration";
 import { asyncHandler } from "./lib/asyncHandler";
 import { mountProductionFrontend } from "./lib/staticFrontend";
 import type { ErrorRequestHandler } from "express";
+import { startGenerationWorker } from "./engine/runQueue";
 
 const app = express();
 
@@ -86,7 +87,9 @@ app.use("/api/auth/login", loginRateLimit);
 app.use("/api/auth", authRouter);
 app.use("/api", requireAuth, requirePasswordChanged);
 app.use("/api/generate", aiRateLimit, generateRouter);
-app.use("/api/run-plan", aiRateLimit, runPlanRouter);
+// 仅入队请求消耗 AI 限流额度；状态、SSE 重连和取消必须始终可达。
+app.post("/api/run-plan", aiRateLimit);
+app.use("/api/run-plan", runPlanRouter);
 app.use("/api/files", filesRouter);
 app.use("/api/projects", projectsRouter);
 app.use("/api/templates", templatesRouter);
@@ -126,6 +129,7 @@ async function start(): Promise<void> {
     });
   }, 6 * 60 * 60 * 1000);
   sessionPruneTimer.unref();
+  startGenerationWorker();
   app.listen(port, () => {
     console.log(`[garment-canvas] server listening on http://localhost:${port} (${initialReadiness.mode})`);
   });

@@ -410,10 +410,8 @@ await test("下游失败不会让已提前完成的目标记录假 success", asy
 
 await test("成功的多 AI 节点按整次运行汇总 provider_requests", async () => {
   const originalFetch = globalThis.fetch;
-  process.env.CHANGE2PRO_BASE_URL = "https://provider.test/v1";
-  process.env.CHANGE2PRO_API_KEY = "test-key";
-  process.env.IMAGE2_MODEL = "test-image-model";
-  process.env.NANOBANANA_MODEL = "test-nanobanana-model";
+  process.env.APIYI_BASE_URL = "https://provider.test";
+  process.env.APIYI_API_KEY = "test-key";
   globalThis.fetch = async () => Response.json({ data: [{ b64_json: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==" }] });
   try {
     const run = await createRun(

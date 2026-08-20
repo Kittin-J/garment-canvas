@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import type { Edge } from "@xyflow/react";
 import { applyRunEventToTab, useFlowStore, type FlowNode } from "../src/store/flowStore";
 
@@ -173,6 +174,53 @@ await test("保存期间继续编辑会排队并最终写入最新版本", async
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+await test("React Flow 初始化尺寸不会移动节点或标记项目未保存", () => {
+  useFlowStore.getState().openFlowTab({
+    projectId: "dimension-init-project",
+    projectName: "尺寸初始化测试",
+    nodes: [imageNode("dimension-node", "尺寸初始化节点")],
+    edges: [],
+  });
+  const before = useFlowStore.getState();
+  const originalPosition = { ...before.nodes[0].position };
+
+  before.onNodesChange([{
+    id: "dimension-node",
+    type: "dimensions",
+    dimensions: { width: 280, height: 162 },
+  }]);
+
+  const after = useFlowStore.getState();
+  assert.equal(after.revision, before.revision);
+  assert.equal(after.dirty, false);
+  assert.deepEqual(after.nodes[0].position, originalPosition);
+  assert.deepEqual(after.nodes[0].measured, { width: 280, height: 162 });
+});
+
+await test("打开含蒙版节点的项目时只订阅稳定的首张输入图", () => {
+  const source = fs.readFileSync(
+    new URL("../src/components/nodes/MaskRedrawNode.tsx", import.meta.url),
+    "utf8",
+  );
+  assert.ok(source.includes("const source = useFlowStore((state) => selectNodeInputImages(state, id)[0]);"));
+  assert.doesNotMatch(source, /const sourceImages = useFlowStore/);
+});
+
+await test("窄屏侧栏使用抽屉且顶栏不再依赖绝对居中", () => {
+  const appSource = fs.readFileSync(new URL("../src/App.tsx", import.meta.url), "utf8");
+  const topBarSource = fs.readFileSync(
+    new URL("../src/components/panels/TopBar.tsx", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(appSource, /type MobilePanel = "library" | "inspector" | null/);
+  assert.match(appSource, /invisible -translate-x-full/);
+  assert.match(appSource, /invisible translate-x-full/);
+  assert.match(appSource, /md:static md:visible md:translate-x-0/);
+  assert.match(topBarSource, /min-w-0 flex-1/);
+  assert.doesNotMatch(topBarSource, /absolute left-1\/2/);
 });
 
 console.log(`\n通过 ${passed} 项`);

@@ -1,0 +1,124 @@
+{
+  "schemaVersion": 2,
+  "reviewedOn": "2026-08-20",
+  "baseUrl": "https://api.apiyi.com",
+  "runtime": {
+    "upstreamMode": "synchronous",
+    "businessQueue": "postgresql",
+    "retryableHttpStatuses": [429, 503],
+    "maxAutomaticRetries": 2,
+    "ambiguousTransportFailure": "outcome_unknown",
+    "persistTemporaryUrlsImmediately": true
+  },
+  "inputNormalization": {
+    "acceptedMimeTypes": ["image/png", "image/jpeg", "image/webp", "image/gif"],
+    "outputMimeTypes": ["image/png", "image/jpeg"],
+    "maxInputBytes": 20971520,
+    "maxInputPixels": 40000000,
+    "maxLongEdge": 4096,
+    "targetBytes": 1500000,
+    "jpegQuality": {"initial": 92, "minimum": 80},
+    "animationPolicy": "first-frame",
+    "applyExifOrientation": true,
+    "outputColourspace": "srgb",
+    "preserveMeaningfulAlpha": true
+  },
+  "models": [
+    {
+      "id": "gpt-image-2",
+      "upstreamModelId": "gpt-image-2",
+      "label": "GPT Image 2 局部重绘",
+      "channel": "official",
+      "allowedNodeKinds": ["mask-redraw"],
+      "timeoutMs": 360000,
+      "generation": null,
+      "edit": {
+        "path": "/v1/images/edits",
+        "contentType": "multipart/form-data",
+        "minReferences": 1,
+        "maxReferences": 8,
+        "singleImageField": "image[]",
+        "multipleImageField": "image[]",
+        "mask": {
+          "required": true,
+          "mimeTypes": ["image/png"],
+          "maxBytes": 4194304,
+          "requiresAlpha": true,
+          "mustMatchFirstImageDimensions": true,
+          "editableAlpha": 0,
+          "preservedAlpha": 255
+        }
+      },
+      "forbiddenParameters": ["input_fidelity", "response_format"],
+      "output": {"kind": "openai-image", "fields": ["b64_json"], "maxImages": 1}
+    },
+    {
+      "id": "gpt-image-2-vip",
+      "upstreamModelId": "gpt-image-2-vip",
+      "label": "GPT Image 2 VIP",
+      "channel": "reverse-codex",
+      "allowedNodeKinds": ["image-generation"],
+      "timeoutMs": 300000,
+      "generation": {"path": "/v1/images/generations", "contentType": "application/json"},
+      "edit": {"path": "/v1/images/edits", "contentType": "multipart/form-data", "minReferences": 1, "maxReferences": 8, "singleImageField": "image", "multipleImageField": "image"},
+      "sizes": ["auto", "1280x1280", "848x1280", "1280x848", "960x1280", "1280x960", "1024x1280", "1280x1024", "720x1280", "1280x720", "1280x544", "2048x2048", "1360x2048", "2048x1360", "1536x2048", "2048x1536", "1632x2048", "2048x1632", "1152x2048", "2048x1152", "2048x864", "2880x2880", "2336x3520", "3520x2336", "2480x3312", "3312x2480", "2560x3216", "3216x2560", "2160x3840", "3840x2160", "3840x1632"],
+      "forbiddenParameters": ["quality", "n", "aspect_ratio"],
+      "output": {"kind": "openai-image", "fields": ["b64_json", "url"], "maxImages": 1}
+    },
+    {
+      "id": "gemini-3.1-flash-image",
+      "upstreamModelId": "gemini-3.1-flash-image",
+      "label": "Gemini 3.1 Flash Image",
+      "channel": "official",
+      "allowedNodeKinds": ["image-generation"],
+      "timeoutMs": 360000,
+      "generation": {"path": "/v1beta/models/{model}:generateContent", "contentType": "application/json"},
+      "edit": {"path": "/v1beta/models/{model}:generateContent", "contentType": "application/json", "minReferences": 1, "maxReferences": 8},
+      "aspectRatios": ["1:1", "1:4", "4:1", "1:8", "8:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
+      "imageSizes": ["512", "1K", "2K", "4K"],
+      "output": {"kind": "gemini-parts", "fields": ["inlineData"], "scanAllParts": true}
+    },
+    {
+      "id": "flux-2-pro",
+      "upstreamModelId": "flux-2-pro",
+      "label": "FLUX.2 Pro",
+      "channel": "official",
+      "allowedNodeKinds": ["image-generation"],
+      "timeoutMs": 120000,
+      "generation": {"path": "/v1/images/generations", "contentType": "application/json"},
+      "edit": {"path": "/v1/images/generations", "contentType": "application/json", "minReferences": 1, "maxReferences": 8},
+      "dimensions": {"multipleOf": 16, "minSide": 64, "maxPixels": 4194304},
+      "outputFormats": ["jpeg", "png"],
+      "forbiddenParameters": ["n"],
+      "output": {"kind": "openai-image", "fields": ["url"], "maxImages": 1, "urlTtlSeconds": 600}
+    },
+    {
+      "id": "seedream-5-0-260128",
+      "upstreamModelId": "seedream-5-0-260128",
+      "label": "Seedream 5.0",
+      "channel": "official",
+      "allowedNodeKinds": ["image-generation"],
+      "timeoutMs": 120000,
+      "generation": {"path": "/v1/images/generations", "contentType": "application/json"},
+      "edit": {"path": "/v1/images/generations", "contentType": "application/json", "minReferences": 1, "maxReferences": 8},
+      "sizes": ["2K", "3K"],
+      "requiredParameters": {"watermark": false, "sequential_image_generation": "disabled"},
+      "forbiddenParameters": ["n"],
+      "output": {"kind": "openai-image", "fields": ["url", "b64_json"], "recordActualSize": true}
+    },
+    {
+      "id": "grok-imagine-image",
+      "upstreamModelId": "grok-imagine-image",
+      "label": "Grok Imagine 2",
+      "channel": "official",
+      "allowedNodeKinds": ["image-generation"],
+      "timeoutMs": 360000,
+      "generation": {"path": "/v1/images/generations", "contentType": "application/json"},
+      "edit": {"path": "/v1/images/edits", "contentType": "multipart/form-data", "minReferences": 1, "maxReferences": 4, "singleImageField": "image", "multipleImageField": "image[]", "firstReferenceControlsDimensions": true},
+      "aspectRatios": ["1:1", "16:9", "9:16", "4:3", "3:4"],
+      "resolutions": ["1k", "2k"],
+      "outputCounts": {"min": 1, "max": 10},
+      "output": {"kind": "openai-image", "fields": ["url", "b64_json"], "usageIsAccountingSource": false}
+    }
+  ]
+}

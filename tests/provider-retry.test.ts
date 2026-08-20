@@ -1,51 +1,74 @@
 import assert from "node:assert/strict";
-import { ProviderError, sanitizedProviderDiagnostic } from "../server/providers/base";
+import {
+  fetchWithRetry,
+  ProviderError,
+  providerErrorFromResponse,
+  sanitizedProviderDiagnostic,
+} from "../server/providers/base";
 import { generateExactImages } from "../server/providers/exact";
 import type { AIProvider } from "../src/types/workflow";
 
-let calls = 0;
-const transientProvider: AIProvider = {
+const originalFetch = globalThis.fetch;
+
+let providerCalls = 0;
+const retryableProvider: AIProvider = {
   id: "stub",
   async generate() {
-    calls += 1;
-    if (calls === 1) {
-      throw new ProviderError(
-        "当前 AI 模型不可用，请联系管理员检查模型配置",
-        404,
-        "stub",
-        "model_unavailable",
-        'HTTP 404: {"error":{"message":"model temporarily not available"}}',
-      );
+    providerCalls += 1;
+    if (providerCalls === 1) {
+      throw new ProviderError("AI 服务当前繁忙，请稍后重试", 429, "stub", "rate_limited");
     }
-    return { images: ["recovered"], model: "stub-model" };
+    return { images: ["unexpected-local-retry"], model: "stub-model" };
   },
   async edit() { throw new Error("unexpected edit"); },
 };
 
-const recovered = await generateExactImages(
-  transientProvider,
-  { prompt: "重试" },
-  1,
-  { runId: "run-test", transientRetryDelaysMs: [0, 0] },
-);
-assert.equal(calls, 2);
-assert.deepEqual(recovered.images, ["recovered"]);
-assert.deepEqual(recovered.failures, []);
-
-let permanentCalls = 0;
-const permanentProvider: AIProvider = {
-  id: "stub",
-  async generate() {
-    permanentCalls += 1;
-    throw new ProviderError("参数错误", 400, "stub", "invalid_request", "HTTP 400: bad size");
-  },
-  async edit() { throw new Error("unexpected edit"); },
-};
 await assert.rejects(
-  generateExactImages(permanentProvider, { prompt: "错误参数" }, 1, { transientRetryDelaysMs: [0, 0] }),
-  /参数错误/,
+  () => generateExactImages(retryableProvider, { prompt: "重试归队列" }, 1),
+  (error: unknown) => error instanceof ProviderError && error.status === 429,
 );
-assert.equal(permanentCalls, 1);
+assert.equal(providerCalls, 1, "Provider/精确批量层不得自行重放付费请求");
+
+let fetchCalls = 0;
+globalThis.fetch = (async () => {
+  fetchCalls += 1;
+  return new Response(JSON.stringify({ error: { message: "temporary channel capacity unavailable" } }), {
+    status: 503,
+  });
+}) as typeof fetch;
+try {
+  await assert.rejects(
+    () => fetchWithRetry("https://gateway.example/v1/images/generations", () => ({}), {
+      providerId: "stub", maxRetries: 99,
+    }),
+    (error: unknown) => error instanceof ProviderError && error.category === "gateway_unavailable",
+  );
+  assert.equal(fetchCalls, 1);
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
+let networkCalls = 0;
+globalThis.fetch = (async () => {
+  networkCalls += 1;
+  throw new TypeError("connection reset after upload");
+}) as typeof fetch;
+try {
+  await assert.rejects(
+    () => fetchWithRetry("https://gateway.example/v1/images/edits", () => ({}), { providerId: "stub" }),
+    (error: unknown) => error instanceof ProviderError && error.category === "outcome_unknown",
+  );
+  assert.equal(networkCalls, 1);
+} finally {
+  globalThis.fetch = originalFetch;
+}
+
+const deterministic503 = providerErrorFromResponse(
+  503,
+  JSON.stringify({ error: { message: "resolution=4k is unsupported; resolution must be 1k or 2k" } }),
+  "grok-imagine-image",
+);
+assert.equal(deterministic503.category, "invalid_request");
 
 const diagnostic = sanitizedProviderDiagnostic(new ProviderError(
   "失败",
@@ -60,4 +83,4 @@ assert.ok(diagnostic?.includes("[redacted-image]"));
 assert.ok(!diagnostic?.includes("sk-secret"));
 assert.ok(!diagnostic?.includes("signed.example"));
 
-console.log("  ✓ provider transient retry and diagnostic redaction");
+console.log("  ✓ Provider 单次发送、未知结果保护与诊断脱敏");

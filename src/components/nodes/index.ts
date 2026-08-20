@@ -7,6 +7,7 @@ import { UpscaleNode } from "./UpscaleNode";
 import { PrintExtractNode } from "./PrintExtractNode";
 import { PrintMutateNode } from "./PrintMutateNode";
 import { ResultNode } from "./ResultNode";
+import { MaskRedrawNode } from "./MaskRedrawNode";
 
 export const nodeTypes: NodeTypes = {
   "image-input": ImageInputNode,
@@ -16,6 +17,7 @@ export const nodeTypes: NodeTypes = {
   upscale: UpscaleNode,
   "print-extract": PrintExtractNode,
   "print-mutate": PrintMutateNode,
+  "mask-redraw": MaskRedrawNode,
   result: ResultNode,
 };
 
@@ -26,3 +28,4 @@ export { FabricRecolorNode } from "./FabricRecolorNode";
 export { UpscaleNode } from "./UpscaleNode";
 export { PrintExtractNode } from "./PrintExtractNode";
 export { ResultNode } from "./ResultNode";
+export { MaskRedrawNode } from "./MaskRedrawNode";

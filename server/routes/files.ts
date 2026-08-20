@@ -1,12 +1,15 @@
 /**
  * 文件上传/读取：
- *   POST /api/files      { dataUrl } → { id, url }（base64 JSON，body limit 50mb）
+ *   POST /api/files      { dataUrl } → 标准化图片元数据（base64 JSON，body limit 50mb）
  *   GET  /api/files/:id  读取图片（id 含扩展名，如 abc12.png）
  */
 import { Router, type Response } from "express";
 import fs from "node:fs";
 import path from "node:path";
-import { ensureThumbnail, isSupportedImageFile, mimeOfFile, saveDataUrl, uploadsDir } from "../lib/fileStore";
+import {
+  deleteStoredImage, ensureThumbnail, isSupportedImageFile, mimeOfFile,
+  saveNormalizedUploadDataUrl, uploadsDir,
+} from "../lib/fileStore";
 import { ProviderError } from "../providers/base";
 import { ImageValidationError } from "../lib/imageValidation";
 import { requestUser } from "../lib/auth";
@@ -45,10 +48,20 @@ filesRouter.post("/", asyncHandler(async (req, res) => {
     return;
   }
   try {
-    const saved = saveDataUrl(dataUrl);
-    await query(`
-      INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, $2, 'upload', $3)
-    `, [saved.id, requestUser(req).id, new Date().toISOString()]);
+    const saved = await saveNormalizedUploadDataUrl(dataUrl);
+    try {
+      await query(`
+        INSERT INTO files (
+          id, owner_id, source_type, mime_type, width, height, byte_length, normalized, created_at
+        ) VALUES ($1, $2, 'upload', $3, $4, $5, $6, TRUE, $7)
+      `, [
+        saved.id, requestUser(req).id, saved.mimeType, saved.width, saved.height,
+        saved.byteLength, new Date().toISOString(),
+      ]);
+    } catch (error) {
+      deleteStoredImage(saved.id);
+      throw error;
+    }
     res.json(saved);
   } catch (err) {
     if (err instanceof ProviderError || err instanceof ImageValidationError) {

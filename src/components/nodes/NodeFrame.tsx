@@ -1,21 +1,29 @@
 import { useState, type ReactNode } from "react";
-import type { NodeRunStatus } from "@/types/workflow";
+import { isNodeRunActive, type NodeRunStatus } from "@/types/workflow";
 import { useFlowStore } from "@/store/flowStore";
 
 const STATUS_STYLE: Record<NodeRunStatus, string> = {
   idle: "bg-neutral-500",
   queued: "bg-yellow-400",
   running: "bg-blue-400 animate-pulse",
+  retry_wait: "bg-amber-400 animate-pulse",
+  cancel_requested: "bg-orange-400 animate-pulse",
   success: "bg-emerald-400",
   error: "bg-red-500",
+  outcome_unknown: "bg-orange-500",
+  cancelled: "bg-neutral-600",
 };
 
 export const STATUS_TEXT: Record<NodeRunStatus, string> = {
   idle: "空闲",
   queued: "排队中",
   running: "运行中",
+  retry_wait: "等待重试",
+  cancel_requested: "取消请求中",
   success: "成功",
   error: "失败",
+  outcome_unknown: "结果未知",
+  cancelled: "已取消",
 };
 
 export function StatusDot({ status }: { status: NodeRunStatus }) {
@@ -97,27 +105,37 @@ export function NodeFrame({ title, status, error, selected, nodeId, children }: 
 }
 
 interface RunButtonProps {
-  running: boolean;
-  queued?: boolean;
+  status: NodeRunStatus;
   onClick: () => void;
+  onCancel?: () => void;
   label?: string;
   disabled?: boolean;
 }
 
-export function RunButton({ running, queued = false, onClick, label = "运行", disabled }: RunButtonProps) {
+export function RunButton({ status, onClick, onCancel, label = "运行", disabled }: RunButtonProps) {
+  const active = isNodeRunActive(status);
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      disabled={running || disabled}
-      className={`nodrag w-full rounded-md px-3 py-1.5 text-xs font-medium transition-opacity hover:opacity-90 disabled:cursor-not-allowed ${
-        running
-          ? "btn-running-breathe bg-[#3a3226] text-gold"
-          : "bg-gold text-ink disabled:opacity-40"
-      }`}
-    >
-      {running ? (queued ? "排队中…" : "显影中…") : label}
-    </button>
+    <div className={active && onCancel ? "grid grid-cols-[1fr_auto] gap-2" : undefined}>
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={active || disabled}
+        className={`nodrag w-full rounded-md px-3 py-1.5 text-xs font-medium transition-opacity hover:opacity-90 disabled:cursor-not-allowed ${
+          active ? "btn-running-breathe bg-[#3a3226] text-gold" : "bg-gold text-ink disabled:opacity-40"
+        }`}
+      >
+        {active ? STATUS_TEXT[status] : label}
+      </button>
+      {active && onCancel && status !== "cancel_requested" && (
+        <button
+          type="button"
+          onClick={onCancel}
+          className="nodrag rounded-md border border-[#3a3226] px-2.5 text-[10px] text-neutral-400 hover:border-red-500/60 hover:text-red-400"
+        >
+          取消
+        </button>
+      )}
+    </div>
   );
 }
 

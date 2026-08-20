@@ -38,7 +38,7 @@ fi
 
 if /usr/bin/awk '
   /^[[:space:]]*#/ { next }
-  /sk-your-(key|gemini-group-key)|your-change2pro-host/ { found=1 }
+  /sk-your-apiyi-key/ { found=1 }
   END { exit found ? 0 : 1 }
 ' "$ENV_FILE"; then
   print -u2 "Edit the gateway placeholders first:"

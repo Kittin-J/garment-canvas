@@ -52,14 +52,16 @@ const legacyAiFlow = () => ({
 async function main() {
   console.log("工作流 Schema / 图片 / SSRF 回归测试");
 
-  await test("无版本 v0 确定性迁移到 v1，并补 ai-modify 默认字段", () => {
+  await test("无版本 v0 确定性迁移到 v2，并补模型默认字段", () => {
     const first = validateAndMigrateFlow(legacyAiFlow());
     const second = validateAndMigrateFlow(first);
-    assert.equal(first.schemaVersion, 1);
+    assert.equal(first.schemaVersion, 2);
     assert.equal(first.nodes[0].data.kind, "ai-modify");
     if (first.nodes[0].data.kind !== "ai-modify") throw new Error("unexpected node kind");
     assert.equal(first.nodes[0].data.aspectRatio, "1:1");
     assert.equal(first.nodes[0].data.batchSize, 1);
+    assert.equal(first.nodes[0].data.modelId, "gpt-image-2-vip");
+    assert.deepEqual(first.nodes[0].data.modelOptions, { size: "2048x2048" });
     assert.deepEqual(second, first);
   });
 
@@ -137,14 +139,14 @@ async function main() {
       updatedAt: "2026-01-01T00:00:00.000Z",
       flow: legacyAiFlow(),
     };
-    assert.equal(validateAndMigrateFlow(legacyProject.flow).schemaVersion, 1);
+    assert.equal(validateAndMigrateFlow(legacyProject.flow).schemaVersion, 2);
 
     const builtinRoot = "data/templates/builtin";
     const builtinFiles = fs.readdirSync(builtinRoot).filter((name) => name.endsWith(".json"));
     assert.equal(builtinFiles.length, 6, "仓库应包含六份内置模板");
     for (const file of builtinFiles) {
       const value = JSON.parse(fs.readFileSync(path.join(builtinRoot, file), "utf-8")) as { flow: unknown };
-      assert.equal(validateAndMigrateFlow(value.flow).schemaVersion, 1, `${builtinRoot}/${file}`);
+      assert.equal(validateAndMigrateFlow(value.flow).schemaVersion, 2, `${builtinRoot}/${file}`);
     }
     for (const [file, expected] of [
       ["builtin-person-scene-transfer.json", ["subject", "scene"]],

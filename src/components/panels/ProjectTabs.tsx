@@ -1,7 +1,8 @@
 import { useFlowStore, type ProjectTab } from "@/store/flowStore";
+import { isNodeRunActive } from "@/types/workflow";
 
 function hasRunningNode(tab: ProjectTab): boolean {
-  return tab.nodes.some((node) => node.data.status === "queued" || node.data.status === "running");
+  return tab.nodes.some((node) => isNodeRunActive(node.data.status));
 }
 
 export function ProjectTabs() {

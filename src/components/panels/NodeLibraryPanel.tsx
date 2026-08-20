@@ -12,6 +12,7 @@ const KIND_ORDER: NodeKind[] = [
   "upscale",
   "print-extract",
   "print-mutate",
+  "mask-redraw",
   "result",
 ];
 

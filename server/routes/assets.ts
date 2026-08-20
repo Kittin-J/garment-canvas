@@ -4,7 +4,7 @@ import path from "node:path";
 import { requestUser } from "../lib/auth";
 import { asyncHandler } from "../lib/asyncHandler";
 import { query, queryOne, transaction } from "../lib/database";
-import { saveDataUrl, thumbnailUrlForImage } from "../lib/fileStore";
+import { deleteStoredImage, saveNormalizedUploadDataUrl, thumbnailUrlForImage } from "../lib/fileStore";
 import { ImageValidationError, isLocalImageReference } from "../lib/imageValidation";
 import type { Asset } from "../../src/types/workflow";
 
@@ -90,12 +90,13 @@ assetsRouter.post("/", asyncHandler(async (req, res) => {
     res.status(403).json({ error: "只有管理员可以创建通用素材" });
     return;
   }
+  let saved: Awaited<ReturnType<typeof saveNormalizedUploadDataUrl>> | undefined;
   try {
     if (sourceNote !== undefined && (typeof sourceNote !== "string" || sourceNote.length > 2_000)) {
       throw new ImageValidationError("sourceNote must be a string of at most 2000 characters");
     }
     const finalScope = scope === "global" && user.role === "admin" ? "global" : scope === "shared" ? "shared" : "private";
-    const saved = image.startsWith("data:") ? saveDataUrl(image) : undefined;
+    saved = image.startsWith("data:") ? await saveNormalizedUploadDataUrl(image) : undefined;
     const imageUrl = saved?.url ?? (isLocalImageReference(image) ? image : "");
     if (!imageUrl) throw new ImageValidationError("image must be a local image reference or valid image dataURL");
     const id = nanoid(10);
@@ -103,9 +104,14 @@ assetsRouter.post("/", asyncHandler(async (req, res) => {
     const created = await transaction(async (client) => {
       if (saved) {
         await client.query(`
-          INSERT INTO files (id, owner_id, source_type, created_at) VALUES ($1, $2, 'asset', $3)
+          INSERT INTO files (
+            id, owner_id, source_type, mime_type, width, height, byte_length, normalized, created_at
+          ) VALUES ($1, $2, 'asset', $3, $4, $5, $6, TRUE, $7)
           ON CONFLICT (id) DO NOTHING
-        `, [saved.id, finalScope === "global" ? null : user.id, createdAt]);
+        `, [
+          saved.id, finalScope === "global" ? null : user.id, saved.mimeType, saved.width,
+          saved.height, saved.byteLength, createdAt,
+        ]);
       } else {
         const access = await queryOne<{ owner_id: string | null; shared: boolean }>(`
           SELECT f.owner_id,
@@ -131,11 +137,13 @@ assetsRouter.post("/", asyncHandler(async (req, res) => {
       return true;
     });
     if (!created) {
+      if (saved) deleteStoredImage(saved.id);
       res.status(404).json({ error: "image file not found" });
       return;
     }
     res.status(201).json({ ok: true, id });
   } catch (error) {
+    if (saved) deleteStoredImage(saved.id);
     res.status(error instanceof ImageValidationError ? 400 : 500)
       .json({ error: error instanceof Error ? error.message : String(error) });
   }

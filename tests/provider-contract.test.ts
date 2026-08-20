@@ -1,22 +1,25 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import type { AddressInfo } from "node:net";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import express from "express";
-import type { NextFunction, Request, Response } from "express";
 import sharp from "sharp";
+import sources from "../docs/ai/apiyi/sources.json";
 import { config } from "../server/config";
-import { validateImageDataUrl } from "../server/lib/imageValidation";
+import { compositeMaskedEdit, validateMaskForSource } from "../server/lib/maskProcessing";
 import { createRateLimitMiddleware } from "../server/lib/rateLimit";
-import { image2Provider } from "../server/providers/image2";
-import { IMAGE2_COLLAGE_LAYOUT, MAX_REFERENCE_INPUT_PIXELS } from "../server/providers/image2References";
-import { nanobananaProvider } from "../server/providers/nanobanana";
+import { apiyiProviders } from "../server/providers/apiyi";
 import { fetchWithRetry, ProviderError } from "../server/providers/base";
 import { createAiDiagnosticsRouter } from "../server/routes/aiDiagnostics";
+import {
+  IMAGE_MODEL_IDS,
+  getImageModelContract,
+  imageModelOptionsError,
+} from "../src/types/imageModels";
 
 let passed = 0;
-
-const VALID_PNG_BASE64 =
-  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
-const VALID_PNG_DATA_URL = `data:image/png;base64,${VALID_PNG_BASE64}`;
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 async function test(name: string, fn: () => void | Promise<void>): Promise<void> {
   try {
@@ -44,29 +47,49 @@ function installFetchMock(
 ): () => void {
   const original = globalThis.fetch;
   globalThis.fetch = implementation as typeof fetch;
-  return () => {
-    globalThis.fetch = original;
-  };
+  return () => { globalThis.fetch = original; };
 }
 
-async function solidPngDataUrl(color: { r: number; g: number; b: number }): Promise<string> {
-  const buffer = await sharp({
-    create: {
-      width: 24,
-      height: 24,
-      channels: 3,
-      background: color,
-    },
-  }).png().toBuffer();
+async function imageDataUrl(
+  width: number,
+  height: number,
+  color: { r: number; g: number; b: number },
+  format: "png" | "jpeg" | "webp" = "png",
+): Promise<string> {
+  const pipeline = sharp({
+    create: { width, height, channels: 3, background: color },
+  });
+  const buffer = format === "webp"
+    ? await pipeline.webp().toBuffer()
+    : format === "jpeg" ? await pipeline.jpeg().toBuffer() : await pipeline.png().toBuffer();
+  const mime = format === "jpeg" ? "image/jpeg" : `image/${format}`;
+  return `data:${mime};base64,${buffer.toString("base64")}`;
+}
+
+async function halfEditableMask(width: number, height: number): Promise<string> {
+  const pixels = Buffer.alloc(width * height * 4);
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const offset = (y * width + x) * 4;
+      pixels[offset] = 255;
+      pixels[offset + 1] = 255;
+      pixels[offset + 2] = 255;
+      pixels[offset + 3] = x < width / 2 ? 0 : 255;
+    }
+  }
+  const buffer = await sharp(pixels, { raw: { width, height, channels: 4 } }).png().toBuffer();
   return `data:image/png;base64,${buffer.toString("base64")}`;
 }
 
-function svgDataUrl(width: number, height: number): string {
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}"><rect width="100%" height="100%" fill="white"/></svg>`;
-  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+function jsonBody(init: RequestInit | undefined): Record<string, unknown> {
+  return JSON.parse(String(init?.body)) as Record<string, unknown>;
 }
 
-function assertPixelColor(
+function pngPayload(dataUrl: string): { data: Array<{ b64_json: string }> } {
+  return { data: [{ b64_json: dataUrl.split(",")[1] }] };
+}
+
+function assertPixel(
   data: Buffer,
   width: number,
   channels: number,
@@ -81,700 +104,538 @@ function assertPixelColor(
 }
 
 async function main(): Promise<void> {
-  console.log("Provider / 限流契约测试");
+  console.log("API易 Provider 契约测试");
+  const restoreBase = setEnv("APIYI_BASE_URL", "https://gateway.example");
+  const restoreKey = setEnv("APIYI_API_KEY", "apiyi-test-key");
+  const white = await imageDataUrl(4, 2, { r: 255, g: 255, b: 255 });
+  const blue = await imageDataUrl(4, 2, { r: 20, g: 80, b: 220 });
+  const red = await imageDataUrl(4, 2, { r: 220, g: 30, b: 30 });
+  const mask = await halfEditableMask(4, 2);
 
-  await test("模型 ID 必须由部署显式配置", () => {
-    const restoreModel = setEnv("NANOBANANA_MODEL", undefined);
-    const restoreTimeout = setEnv("AI_TIMEOUT_MS", undefined);
-    try {
-      assert.throws(() => config.nanobananaModel(), /NANOBANANA_MODEL/);
-      assert.equal(config.aiTimeoutMs(), 300_000);
-    } finally {
-      restoreTimeout();
-      restoreModel();
-    }
-  });
-
-  await test("Provider 公共请求出口拒绝非 HTTPS 且不会发送 Bearer 请求", async () => {
-    let calls = 0;
-    const restoreFetch = installFetchMock(() => {
-      calls += 1;
-      return Response.json({ data: [] });
+  try {
+    await test("本地知识库与 Provider 注册表严格覆盖首轮六个模型", () => {
+      assert.deepEqual(Object.keys(apiyiProviders).sort(), [...IMAGE_MODEL_IDS].sort());
+      for (const modelId of IMAGE_MODEL_IDS) {
+        assert.equal(apiyiProviders[modelId].id, modelId);
+        assert.equal(getImageModelContract(modelId).id, modelId);
+        assert.ok(getImageModelContract(modelId).upstreamModelId);
+      }
+      assert.equal(getImageModelContract("gpt-image-2").generation, null);
     });
-    try {
-      await assert.rejects(
-        () => fetchWithRetry("http://gateway.example/v1/images/generations", () => ({
-          headers: { Authorization: "Bearer secret" },
-        })),
-        (error: unknown) => error instanceof ProviderError && error.category === "invalid_request",
-      );
-      assert.equal(calls, 0);
-    } finally {
-      restoreFetch();
-    }
-  });
 
-  await test("nanobanana 文生图调用 Images generations 契约", async () => {
-    const restoreBase = setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1");
-    const restoreKey = setEnv("NANOBANANA_API_KEY", "nanobanana-test-key");
-    const restoreModel = setEnv("NANOBANANA_MODEL", "gpt-image-2");
-    const restoreN = setEnv("NANOBANANA_SUPPORTS_N", "false");
-    const restoreRetries = setEnv("AI_MAX_RETRIES", "0");
-    let capturedUrl = "";
-    let capturedInit: RequestInit | undefined;
-    const restoreFetch = installFetchMock((input, init) => {
-      capturedUrl = String(input);
-      capturedInit = init;
-      return Response.json({ data: [{ b64_json: VALID_PNG_BASE64 }] });
+    await test("API易来源清单指向存在的本地整理契约", () => {
+      assert.equal(sources.sourceFormat, "official-markdown");
+      assert.equal(sources.localKnowledgeBase.rawSourcePagesStored, false);
+      for (const document of sources.localKnowledgeBase.documents) {
+        assert.ok(fs.statSync(path.join(REPO_ROOT, "docs/ai/apiyi", document)).isFile(), document);
+      }
+      for (const source of sources.sources) {
+        assert.ok(source.markdownUrl.endsWith(".md"), source.markdownUrl);
+        assert.match(source.sha256, /^[a-f0-9]{64}$/);
+        assert.ok(fs.statSync(path.join(REPO_ROOT, "docs/ai/apiyi", source.localDocument)).isFile());
+      }
     });
-    try {
-      const result = await nanobananaProvider.generate({
-        prompt: "服装效果图",
-        aspectRatio: "3:4",
-        batchSize: 1,
+
+    await test("API易配置要求非空 Key 与 HTTPS Base URL", () => {
+      const restoreMissingKey = setEnv("APIYI_API_KEY", undefined);
+      try {
+        assert.throws(() => config.apiyiApiKey(), /APIYI_API_KEY/);
+        assert.equal(config.aiConfigReady(), false);
+      } finally {
+        restoreMissingKey();
+      }
+      const restoreHttp = setEnv("APIYI_BASE_URL", "http://gateway.example");
+      try {
+        assert.equal(config.aiConfigReady(), false);
+      } finally {
+        restoreHttp();
+      }
+      assert.equal(config.aiConfigReady(), true);
+    });
+
+    await test("公共请求出口拒绝非 HTTPS 且不会发送 Bearer 请求", async () => {
+      let calls = 0;
+      const restoreFetch = installFetchMock(() => {
+        calls += 1;
+        return Response.json({ data: [] });
       });
-      assert.equal(capturedUrl, "https://gateway.example/v1/images/generations");
-      assert.equal(new Headers(capturedInit?.headers).get("authorization"), "Bearer nanobanana-test-key");
-      assert.deepEqual(JSON.parse(String(capturedInit?.body)), {
-        model: "gpt-image-2",
-        prompt: "服装效果图",
-        size: "1024x1536",
-        quality: "low",
-        output_format: "png",
-      });
-      assert.deepEqual(result.images, [VALID_PNG_DATA_URL]);
-    } finally {
-      restoreFetch();
-      restoreRetries();
-      restoreN();
-      restoreModel();
-      restoreKey();
-      restoreBase();
-    }
-  });
-
-  await test("nanobanana 多参考图使用单数 image 拼图和官方 edits 参数", async () => {
-    const restores = [
-      setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1"),
-      setEnv("NANOBANANA_API_KEY", "nanobanana-test-key"),
-      setEnv("NANOBANANA_MODEL", "gpt-image-2"),
-      setEnv("NANOBANANA_SUPPORTS_N", "false"),
-      setEnv("NANOBANANA_SUPPORTS_MULTI_REFERENCE", "true"),
-      setEnv("NANOBANANA_MAX_REFERENCE_IMAGES", "8"),
-      setEnv("AI_MAX_RETRIES", "0"),
-    ];
-    let capturedUrl = "";
-    let capturedForm: FormData | undefined;
-    const restoreFetch = installFetchMock((input, init) => {
-      capturedUrl = String(input);
-      capturedForm = init?.body as FormData;
-      return Response.json({ data: [{ url: "https://cdn.example/result.png" }] });
+      try {
+        await assert.rejects(
+          () => fetchWithRetry("http://gateway.example/v1/images/generations", () => ({
+            headers: { Authorization: "Bearer secret" },
+          })),
+          (error: unknown) => error instanceof ProviderError && error.category === "invalid_request",
+        );
+        assert.equal(calls, 0);
+      } finally {
+        restoreFetch();
+      }
     });
-    try {
-      const referenceImages = await Promise.all([
-        solidPngDataUrl({ r: 220, g: 30, b: 30 }),
-        solidPngDataUrl({ r: 30, g: 30, b: 220 }),
-      ]);
-      const result = await nanobananaProvider.edit!({
-        prompt: "延伸款式",
-        aspectRatio: "1:1",
-        batchSize: 2,
-        referenceImages,
-      });
-      assert.equal(capturedUrl, "https://gateway.example/v1/images/edits");
-      assert.equal(capturedForm?.get("model"), "gpt-image-2");
-      const sentPrompt = String(capturedForm?.get("prompt"));
-      assert.match(sentPrompt, /^Reference collage: Image 1\.\.2 are arranged row by row/);
-      assert.ok(sentPrompt.endsWith("延伸款式"));
-      assert.equal(capturedForm?.get("n"), null);
-      assert.equal(capturedForm?.get("size"), "1024x1024");
-      assert.equal(capturedForm?.get("quality"), "low");
-      assert.equal(capturedForm?.get("output_format"), "png");
-      assert.ok(capturedForm?.get("image") instanceof Blob);
-      assert.equal(capturedForm?.getAll("image").length, 1);
-      assert.equal(capturedForm?.getAll("image[]").length, 0);
-      assert.deepEqual(result.images, ["https://cdn.example/result.png"]);
-    } finally {
-      restoreFetch();
-      restores.reverse().forEach((restore) => restore());
-    }
-  });
 
-  await test("image2 的 2 图和 8 图按顺序编号合成单张拼图，且限制最多 8 图", async () => {
-    const restores = [
-      setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1"),
-      setEnv("CHANGE2PRO_API_KEY", "image2-test-key"),
-      setEnv("IMAGE2_MODEL", "gpt-image-2"),
-      setEnv("IMAGE2_SUPPORTS_N", "false"),
-      setEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", "true"),
-      setEnv("IMAGE2_MAX_REFERENCE_IMAGES", "8"),
-      setEnv("AI_MAX_RETRIES", "0"),
-    ];
-    let capturedForm: FormData | undefined;
-    let calls = 0;
-    const restoreFetch = installFetchMock((_input, init) => {
-      calls += 1;
-      capturedForm = init?.body as FormData;
-      return Response.json({ data: [{ b64_json: VALID_PNG_BASE64 }] });
+    await test("gpt-image-2-vip 文生图与多参考图编辑使用文档字段", async () => {
+      const captures: Array<{ url: string; init?: RequestInit }> = [];
+      const restoreFetch = installFetchMock((input, init) => {
+        captures.push({ url: String(input), init });
+        return Response.json(pngPayload(white));
+      });
+      try {
+        const generated = await apiyiProviders["gpt-image-2-vip"].generate({
+          prompt: "礼服",
+          modelOptions: { size: "1280x1280" },
+        });
+        assert.deepEqual(generated.images, [white]);
+        assert.equal(captures[0].url, "https://gateway.example/v1/images/generations");
+        assert.equal(new Headers(captures[0].init?.headers).get("authorization"), "Bearer apiyi-test-key");
+        assert.deepEqual(jsonBody(captures[0].init), {
+          model: "gpt-image-2-vip",
+          prompt: "礼服",
+          size: "1280x1280",
+        });
+
+        await apiyiProviders["gpt-image-2-vip"].edit({
+          prompt: "融合参考图",
+          referenceImages: [white, blue],
+          modelOptions: { size: "2048x2048" },
+        });
+        const form = captures[1].init?.body as FormData;
+        assert.equal(captures[1].url, "https://gateway.example/v1/images/edits");
+        assert.equal(form.get("model"), "gpt-image-2-vip");
+        assert.equal(form.get("size"), "2048x2048");
+        assert.equal(form.get("response_format"), null);
+        assert.equal(form.getAll("image").length, 2);
+        assert.equal(form.getAll("image[]").length, 0);
+        assert.equal(form.get("quality"), null);
+        assert.equal(form.get("n"), null);
+        assert.equal(form.get("aspect_ratio"), null);
+      } finally {
+        restoreFetch();
+      }
     });
-    const colors = [
-      { r: 230, g: 20, b: 20 },
-      { r: 20, g: 180, b: 20 },
-      { r: 20, g: 20, b: 230 },
-      { r: 230, g: 180, b: 20 },
-      { r: 220, g: 20, b: 200 },
-      { r: 20, g: 200, b: 200 },
-      { r: 230, g: 100, b: 20 },
-      { r: 100, g: 40, b: 180 },
-    ];
-    const refs = await Promise.all(colors.map((color) => solidPngDataUrl(color)));
-    try {
-      for (const count of [2, 8]) {
-        await image2Provider.edit({ prompt: "多图融合", referenceImages: refs.slice(0, count) });
-        const image = capturedForm?.get("image");
-        assert.ok(image instanceof Blob);
-        assert.equal(capturedForm?.getAll("image").length, 1);
-        assert.equal(capturedForm?.getAll("image[]").length, 0);
-        assert.equal(capturedForm?.get("quality"), "low");
+
+    await test("gpt-image-2 只接受有效 PNG Alpha 蒙版且不发送禁用字段", async () => {
+      let calls = 0;
+      let capturedForm: FormData | undefined;
+      const restoreFetch = installFetchMock((_input, init) => {
+        calls += 1;
+        capturedForm = init?.body as FormData;
+        return Response.json(pngPayload(red));
+      });
+      try {
+        await assert.rejects(
+          () => apiyiProviders["gpt-image-2"].generate({ prompt: "禁止文生图" }),
+          /只能由蒙版局部重绘节点调用|仅用于带 PNG 蒙版的局部重绘|不支持文生图/,
+        );
+        assert.equal(calls, 0);
+
+        const opaqueMask = await imageDataUrl(4, 2, { r: 0, g: 0, b: 0 });
+        await assert.rejects(
+          () => apiyiProviders["gpt-image-2"].edit({
+            prompt: "局部改红", referenceImages: [blue], mask: opaqueMask, modelOptions: {},
+          }),
+          /Alpha 通道/,
+        );
+        assert.equal(calls, 0);
+
+        await apiyiProviders["gpt-image-2"].edit({
+          prompt: "局部改红", referenceImages: [blue], mask, modelOptions: {},
+        });
+        assert.equal(calls, 1);
+        assert.equal(capturedForm?.get("model"), "gpt-image-2");
+        assert.equal(capturedForm?.get("n"), null);
         assert.equal(capturedForm?.get("output_format"), "png");
-        const sentPrompt = String(capturedForm?.get("prompt"));
-        assert.match(sentPrompt, new RegExp(`^Reference collage: Image 1\\.\\.${count} are arranged row by row`));
-        assert.ok(sentPrompt.endsWith("多图融合"));
+        assert.equal(capturedForm?.get("response_format"), null);
+        assert.equal(capturedForm?.get("input_fidelity"), null);
+        assert.ok(capturedForm?.get("image[]") instanceof Blob);
+        assert.equal(capturedForm?.get("image"), null);
+        assert.ok(capturedForm?.get("mask") instanceof Blob);
+      } finally {
+        restoreFetch();
+      }
+    });
 
-        const decoded = await sharp(Buffer.from(await image.arrayBuffer()))
-          .raw()
-          .toBuffer({ resolveWithObject: true });
-        const { padding, gap, labelHeight, tileSize, maxColumns } = IMAGE2_COLLAGE_LAYOUT;
-        const columns = Math.min(count, maxColumns);
-        const rows = Math.ceil(count / columns);
-        assert.equal(decoded.info.width, padding * 2 + columns * tileSize + (columns - 1) * gap);
-        assert.equal(decoded.info.height, padding * 2 + rows * (labelHeight + tileSize) + (rows - 1) * gap);
+    await test("蒙版外像素由服务端合成硬保护", async () => {
+      await validateMaskForSource(blue, mask);
+      const output = await compositeMaskedEdit(blue, mask, red);
+      const decoded = await sharp(Buffer.from(output.split(",")[1], "base64"))
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      assertPixel(decoded.data, decoded.info.width, decoded.info.channels, 0, 0, { r: 220, g: 30, b: 30 });
+      assertPixel(decoded.data, decoded.info.width, decoded.info.channels, 3, 0, { r: 20, g: 80, b: 220 });
+    });
 
-        for (let index = 0; index < count; index += 1) {
-          const column = index % columns;
-          const row = Math.floor(index / columns);
-          const x = padding + column * (tileSize + gap) + Math.floor(tileSize / 2);
-          const y = padding + row * (labelHeight + tileSize + gap) + labelHeight + Math.floor(tileSize / 2);
-          assertPixelColor(decoded.data, decoded.info.width, decoded.info.channels, x, y, colors[index]);
+    await test("Gemini 文生图与 WebP 参考图编辑使用 parts 契约并扫描所有图片 part", async () => {
+      const captures: Array<{ url: string; init: RequestInit }> = [];
+      const restoreFetch = installFetchMock((input, init) => {
+        captures.push({ url: String(input), init: init ?? {} });
+        return Response.json({
+          candidates: [{
+            finishReason: "STOP",
+            content: { parts: [{ text: "done" }, { inlineData: { mimeType: "image/png", data: white.split(",")[1] } }] },
+          }],
+        });
+      });
+      try {
+        const options = { aspectRatio: "3:4", imageSize: "1K" };
+        const generated = await apiyiProviders["gemini-3.1-flash-image"].generate({
+          prompt: "时装大片", modelOptions: options,
+        });
+        assert.deepEqual(generated.images, [white]);
+        assert.equal(
+          captures[0].url,
+          "https://gateway.example/v1beta/models/gemini-3.1-flash-image:generateContent",
+        );
+        const generateBody = jsonBody(captures[0].init);
+        assert.deepEqual(generateBody, {
+          contents: [{ parts: [{ text: "时装大片" }] }],
+          generationConfig: { responseModalities: ["IMAGE"], imageConfig: options },
+        });
+
+        const webp = await imageDataUrl(4, 2, { r: 90, g: 120, b: 150 }, "webp");
+        await apiyiProviders["gemini-3.1-flash-image"].edit({
+          prompt: "改图", referenceImages: [webp], modelOptions: options,
+        });
+        assert.equal(captures[1].url, captures[0].url);
+        const editBody = jsonBody(captures[1].init) as { contents: Array<{ parts: Array<Record<string, unknown>> }> };
+        const parts = editBody.contents[0].parts;
+        assert.deepEqual(parts[0], { text: "改图" });
+        assert.equal((parts[1].inlineData as { mimeType: string }).mimeType, "image/png");
+      } finally {
+        restoreFetch();
+      }
+    });
+
+    await test("FLUX.2 Pro 使用 generations 端点、显式尺寸和有序参考图字段", async () => {
+      const captures: Array<{ url: string; init?: RequestInit }> = [];
+      const resultUrl = "https://cdn.example/flux.png?token=temporary";
+      const restoreFetch = installFetchMock((input, init) => {
+        captures.push({ url: String(input), init });
+        return Response.json({ data: [{ url: resultUrl }] });
+      });
+      try {
+        const modelOptions = { width: 1024, height: 768, outputFormat: "png" as const };
+        const generated = await apiyiProviders["flux-2-pro"].generate({ prompt: "生成", modelOptions });
+        assert.deepEqual(generated.images, [resultUrl]);
+        assert.deepEqual(jsonBody(captures[0].init), {
+          model: "flux-2-pro", prompt: "生成", width: 1024, height: 768, output_format: "png",
+        });
+        await apiyiProviders["flux-2-pro"].edit({
+          prompt: "融合", referenceImages: [white, blue], modelOptions,
+        });
+        const editedBody = jsonBody(captures[1].init);
+        const firstInput = String(editedBody.input_image);
+        const secondInput = String(editedBody.input_image_2);
+        delete editedBody.input_image;
+        delete editedBody.input_image_2;
+        assert.deepEqual(editedBody, {
+          model: "flux-2-pro", prompt: "融合", width: 1024, height: 768, output_format: "png",
+        });
+        for (const input of [firstInput, secondInput]) {
+          assert.match(input, /^data:image\/(?:jpeg|png);base64,/);
+          const metadata = await sharp(Buffer.from(input.split(",")[1], "base64")).metadata();
+          assert.ok(metadata.width && metadata.height);
+          assert.equal(metadata.width % 16, 0);
+          assert.equal(metadata.height % 16, 0);
+          assert.ok(metadata.width >= 64 && metadata.height >= 64);
+          assert.ok(metadata.width * metadata.height <= 4_194_304);
         }
+
+        const largeReference = await imageDataUrl(3000, 2000, { r: 120, g: 80, b: 40 }, "jpeg");
+        await apiyiProviders["flux-2-pro"].edit({
+          prompt: "缩放输入", referenceImages: [largeReference], modelOptions,
+        });
+        const adapted = String(jsonBody(captures[2].init).input_image);
+        const adaptedMetadata = await sharp(Buffer.from(adapted.split(",")[1], "base64")).metadata();
+        assert.ok(adaptedMetadata.width && adaptedMetadata.height);
+        assert.equal(adaptedMetadata.width % 16, 0);
+        assert.equal(adaptedMetadata.height % 16, 0);
+        assert.ok(adaptedMetadata.width * adaptedMetadata.height <= 4_194_304);
+        assert.ok(captures.every((capture) => capture.url === "https://gateway.example/v1/images/generations"));
+      } finally {
+        restoreFetch();
       }
-
-      const callsBeforeRejection = calls;
-      await assert.rejects(
-        () => image2Provider.edit({ prompt: "超量", referenceImages: [...refs, refs[0]] }),
-        /最多支持 8 张参考图/,
-      );
-      assert.equal(calls, callsBeforeRejection, "超过 8 图应在调用网关前拒绝");
-    } finally {
-      restoreFetch();
-      restores.reverse().forEach((restore) => restore());
-    }
-  });
-
-  await test("image2 单参考图原样使用单数 image，并发送官方 edits 输出参数", async () => {
-    const restores = [
-      setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1"),
-      setEnv("CHANGE2PRO_API_KEY", "image2-test-key"),
-      setEnv("IMAGE2_MODEL", "gpt-image-2"),
-      setEnv("IMAGE2_SUPPORTS_N", "false"),
-      setEnv("AI_MAX_RETRIES", "0"),
-    ];
-    let capturedForm: FormData | undefined;
-    const restoreFetch = installFetchMock((_input, init) => {
-      capturedForm = init?.body as FormData;
-      return Response.json({ data: [{ b64_json: VALID_PNG_BASE64 }] });
     });
-    try {
-      const referenceImage = await solidPngDataUrl({ r: 80, g: 120, b: 160 });
-      await image2Provider.edit({
-        prompt: "印花裂变",
-        referenceImages: [referenceImage],
+
+    await test("Seedream 固定关闭水印与序列生成且禁止发送 n", async () => {
+      const bodies: Record<string, unknown>[] = [];
+      const restoreFetch = installFetchMock((_input, init) => {
+        bodies.push(jsonBody(init));
+        return Response.json({
+          data: [{
+            b64_json: white.split(",")[1],
+            size: bodies.length === 1 ? "2048x2048" : "3072x3072",
+          }],
+        });
       });
-      assert.equal(capturedForm?.get("model"), "gpt-image-2");
-      assert.equal(capturedForm?.get("size"), null);
-      assert.equal(capturedForm?.get("n"), null);
-      assert.equal(capturedForm?.get("quality"), "low");
-      assert.equal(capturedForm?.get("output_format"), "png");
-      assert.equal(capturedForm?.get("prompt"), "印花裂变");
-      const image = capturedForm?.get("image");
-      assert.ok(image instanceof Blob);
-      assert.equal(capturedForm?.getAll("image").length, 1);
-      assert.equal(capturedForm?.getAll("image[]").length, 0);
-      assert.deepEqual(
-        Buffer.from(await image.arrayBuffer()),
-        Buffer.from(referenceImage.split(",")[1], "base64"),
-      );
-    } finally {
-      restoreFetch();
-      restores.reverse().forEach((restore) => restore());
-    }
-  });
-
-  await test("多参考图与 mask 组合在拼图和网关请求前被两个 Provider 拒绝", async () => {
-    const restores = [
-      setEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", "true"),
-      setEnv("IMAGE2_MAX_REFERENCE_IMAGES", "8"),
-      setEnv("NANOBANANA_SUPPORTS_MULTI_REFERENCE", "true"),
-      setEnv("NANOBANANA_MAX_REFERENCE_IMAGES", "8"),
-    ];
-    let calls = 0;
-    const restoreFetch = installFetchMock(() => {
-      calls += 1;
-      return Response.json({ data: [{ b64_json: VALID_PNG_BASE64 }] });
+      try {
+        const generated = await apiyiProviders["seedream-5-0-260128"].generate({
+          prompt: "生成", batchSize: 8, modelOptions: { size: "2K" },
+        });
+        const edited = await apiyiProviders["seedream-5-0-260128"].edit({
+          prompt: "融合", referenceImages: [white, blue], modelOptions: { size: "3K" },
+        });
+        assert.deepEqual(generated.providerOutputSizes, ["2048x2048"]);
+        assert.deepEqual(edited.providerOutputSizes, ["3072x3072"]);
+        assert.deepEqual(bodies[0], {
+          model: "seedream-5-0-260128", prompt: "生成", size: "2K", response_format: "b64_json",
+          watermark: false, sequential_image_generation: "disabled",
+        });
+        assert.deepEqual(bodies[1], {
+          model: "seedream-5-0-260128", prompt: "融合", image: [white, blue], size: "3K",
+          response_format: "b64_json", watermark: false, sequential_image_generation: "disabled",
+        });
+        assert.equal("n" in bodies[0], false);
+      } finally {
+        restoreFetch();
+      }
     });
-    const invalidReferences = [
-      "data:image/png;base64,not-a-valid-image",
-      "data:image/png;base64,still-not-a-valid-image",
-    ];
-    try {
-      for (const provider of [image2Provider, nanobananaProvider]) {
+
+    await test("Grok 文生图保留 n，编辑端点不发送无效尺寸参数并限制 4 张参考图", async () => {
+      const captures: Array<{ url: string; init?: RequestInit }> = [];
+      const restoreFetch = installFetchMock((input, init) => {
+        captures.push({ url: String(input), init });
+        const count = captures.length === 1 ? 6 : 1;
+        return Response.json({ data: Array.from({ length: count }, () => ({ b64_json: white.split(",")[1] })) });
+      });
+      try {
+        const generated = await apiyiProviders["grok-imagine-image"].generate({
+          prompt: "生成", batchSize: 6, modelOptions: { aspectRatio: "16:9", resolution: "2k" },
+        });
+        assert.equal(generated.images.length, 6);
+        assert.deepEqual(jsonBody(captures[0].init), {
+          model: "grok-imagine-image", prompt: "生成", aspect_ratio: "16:9",
+          resolution: "2k", n: 6, response_format: "b64_json",
+        });
+
+        await apiyiProviders["grok-imagine-image"].edit({
+          prompt: "单图编辑", referenceImages: [white],
+          modelOptions: { aspectRatio: "1:1", resolution: "1k" },
+        });
+        const singleForm = captures[1].init?.body as FormData;
+        assert.equal(singleForm.getAll("image").length, 1);
+        assert.equal(singleForm.getAll("image[]").length, 0);
+
+        await apiyiProviders["grok-imagine-image"].edit({
+          prompt: "编辑", referenceImages: [white, blue],
+          modelOptions: { aspectRatio: "1:1", resolution: "1k" },
+        });
+        const form = captures[2].init?.body as FormData;
+        assert.equal(captures[2].url, "https://gateway.example/v1/images/edits");
+        assert.equal(form.getAll("image[]").length, 2);
+        assert.equal(form.getAll("image").length, 0);
+        assert.equal(form.get("resolution"), null);
+        assert.equal(form.get("aspect_ratio"), null);
+        assert.equal(form.get("n"), null);
+
+        const callsBeforeReject = captures.length;
         await assert.rejects(
-          () => provider.edit!({
-            prompt: "修改",
-            referenceImages: invalidReferences,
-            mask: "data:image/png;base64,also-invalid",
+          () => apiyiProviders["grok-imagine-image"].edit({
+            prompt: "超量", referenceImages: [white, white, white, white, white],
+            modelOptions: { aspectRatio: "1:1", resolution: "1k" },
           }),
-          (error: unknown) => error instanceof ProviderError &&
-            error.status === 400 &&
-            error.message.includes("多参考图拼图暂不支持蒙版"),
+          /最多支持 4 张参考图/,
         );
+        assert.equal(captures.length, callsBeforeReject);
+      } finally {
+        restoreFetch();
       }
-      assert.equal(calls, 0);
-    } finally {
-      restoreFetch();
-      restores.reverse().forEach((restore) => restore());
-    }
-  });
-
-  await test("多参考图能力开关关闭时在拼图和网关请求前拒绝", async () => {
-    const restores = [
-      setEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", "false"),
-      setEnv("NANOBANANA_SUPPORTS_MULTI_REFERENCE", "false"),
-    ];
-    let calls = 0;
-    const restoreFetch = installFetchMock(() => {
-      calls += 1;
-      return Response.json({ data: [{ b64_json: VALID_PNG_BASE64 }] });
     });
-    const invalidReferences = [
-      "data:image/png;base64,not-a-valid-image",
-      "data:image/png;base64,still-not-a-valid-image",
-    ];
-    try {
-      for (const provider of [image2Provider, nanobananaProvider]) {
+
+    await test("非法模型原生参数在付费调用前拒绝", async () => {
+      assert.match(imageModelOptionsError("flux-2-pro", { width: 513, height: 512, outputFormat: "png" }) ?? "", /unsupported/);
+      assert.match(imageModelOptionsError("grok-imagine-image", { aspectRatio: "1:1", resolution: "4k" }) ?? "", /unsupported/);
+      let calls = 0;
+      const restoreFetch = installFetchMock(() => {
+        calls += 1;
+        return Response.json(pngPayload(white));
+      });
+      try {
         await assert.rejects(
-          () => provider.edit!({ prompt: "修改", referenceImages: invalidReferences }),
-          (error: unknown) => error instanceof ProviderError &&
-            error.status === 400 &&
-            error.message.includes("未开启多参考图"),
+          () => apiyiProviders["flux-2-pro"].generate({
+            prompt: "非法尺寸",
+            modelOptions: { width: 513, height: 512, outputFormat: "png" },
+          }),
+          /模型参数无效/,
         );
+        assert.equal(calls, 0);
+      } finally {
+        restoreFetch();
       }
-      assert.equal(calls, 0);
-    } finally {
-      restoreFetch();
-      restores.reverse().forEach((restore) => restore());
-    }
-  });
-
-  await test("多参考图拼图在解码时限制每张图最多 40MP", async () => {
-    const restores = [
-      setEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", "true"),
-      setEnv("IMAGE2_MAX_REFERENCE_IMAGES", "8"),
-    ];
-    let calls = 0;
-    const restoreFetch = installFetchMock(() => {
-      calls += 1;
-      return Response.json({ data: [{ b64_json: VALID_PNG_BASE64 }] });
     });
-    try {
-      assert.equal(MAX_REFERENCE_INPUT_PIXELS, 40_000_000);
-      const smallReference = await solidPngDataUrl({ r: 20, g: 30, b: 40 });
-      await assert.rejects(
-        () => image2Provider.edit({
-          prompt: "大图",
-          referenceImages: [
-            svgDataUrl(7_000, 6_000),
-            smallReference,
-          ],
-        }),
-        /pixel limit/i,
-      );
-      assert.equal(calls, 0);
-    } finally {
-      restoreFetch();
-      restores.reverse().forEach((restore) => restore());
-    }
-  });
 
-  await test("image2 edits 收到 400 时只请求一次", async () => {
-    const restores = [
-      setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1"),
-      setEnv("CHANGE2PRO_API_KEY", "image2-test-key"),
-      setEnv("IMAGE2_MODEL", "gpt-image-2"),
-      setEnv("IMAGE2_SUPPORTS_N", "false"),
-      setEnv("AI_MAX_RETRIES", "3"),
-    ];
-    let calls = 0;
-    const restoreFetch = installFetchMock(() => {
-      calls += 1;
-      return new Response(JSON.stringify({ error: { message: "invalid image request" } }), { status: 400 });
-    });
-    try {
-      const referenceImage = await solidPngDataUrl({ r: 40, g: 80, b: 120 });
-      await assert.rejects(
-        () => image2Provider.edit({ prompt: "修改", referenceImages: [referenceImage] }),
-        (error: unknown) => error instanceof ProviderError && error.status === 400,
-      );
-      assert.equal(calls, 1);
-    } finally {
-      restoreFetch();
-      restores.reverse().forEach((restore) => restore());
-    }
-  });
-
-  await test("image2 文生图保留低质量 PNG 输出参数", async () => {
-    const restoreBase = setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1");
-    const restoreKey = setEnv("CHANGE2PRO_API_KEY", "image2-test-key");
-    const restoreModel = setEnv("IMAGE2_MODEL", "gpt-image-2");
-    const restoreN = setEnv("IMAGE2_SUPPORTS_N", "false");
-    const restoreRetries = setEnv("AI_MAX_RETRIES", "0");
-    let body: Record<string, unknown> = {};
-    const restoreFetch = installFetchMock((_input, init) => {
-      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      return Response.json({ data: [{ b64_json: VALID_PNG_BASE64 }] });
-    });
-    try {
-      await image2Provider.generate({ prompt: "印花", batchSize: 8 });
-      assert.equal("n" in body, false, "不支持批量 n 的网关不得收到 n 参数");
-      assert.equal(body.quality, "low");
-      assert.equal(body.output_format, "png");
-    } finally {
-      restoreFetch();
-      restoreRetries();
-      restoreN();
-      restoreModel();
-      restoreKey();
-      restoreBase();
-    }
-  });
-
-  await test("声明支持批量 n 时按网关上限发送", async () => {
-    const restores = [
-      setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1"),
-      setEnv("CHANGE2PRO_API_KEY", "image2-test-key"),
-      setEnv("IMAGE2_MODEL", "image-model"),
-      setEnv("IMAGE2_SUPPORTS_N", "true"),
-      setEnv("IMAGE2_MAX_BATCH", "2"),
-      setEnv("AI_MAX_RETRIES", "0"),
-    ];
-    let body: Record<string, unknown> = {};
-    const restoreFetch = installFetchMock((_input, init) => {
-      body = JSON.parse(String(init?.body)) as Record<string, unknown>;
-      return Response.json({ data: [{ b64_json: VALID_PNG_BASE64 }] });
-    });
-    try {
-      await image2Provider.generate({ prompt: "批量", batchSize: 4 });
-      assert.equal(body.n, 2);
-    } finally {
-      restoreFetch();
-      restores.reverse().forEach((restore) => restore());
-    }
-  });
-
-  await test("GPT Images 响应拒绝损坏 base64、仅 PNG 签名、截断 IDAT、JPEG 伪装和非法 URL", async () => {
-    const restores = [
-      setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1"),
-      setEnv("CHANGE2PRO_API_KEY", "image2-test-key"),
-      setEnv("NANOBANANA_API_KEY", "nanobanana-test-key"),
-      setEnv("IMAGE2_MODEL", "gpt-image-2"),
-      setEnv("NANOBANANA_MODEL", "gpt-image-2"),
-      setEnv("AI_MAX_RETRIES", "3"),
-    ];
-    const jpegBase64 = (await sharp({
-      create: { width: 2, height: 2, channels: 3, background: { r: 120, g: 80, b: 40 } },
-    }).jpeg().toBuffer()).toString("base64");
-    const invalidBase64 = "not-canonical-base64-response";
-    const signatureOnlyBase64 = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString("base64");
-    const validPng = Buffer.from(VALID_PNG_BASE64, "base64");
-    const idatTypeOffset = validPng.indexOf(Buffer.from("IDAT"));
-    assert.ok(idatTypeOffset > 12, "PNG fixture must contain an IDAT chunk");
-    const idatLength = validPng.readUInt32BE(idatTypeOffset - 4);
-    assert.ok(idatLength > 1, "PNG fixture IDAT must be large enough to truncate");
-    const truncatedPngBase64 = validPng
-      .subarray(0, idatTypeOffset + 4 + Math.floor(idatLength / 2))
-      .toString("base64");
-    assert.doesNotThrow(
-      () => validateImageDataUrl(`data:image/png;base64,${signatureOnlyBase64}`),
-      "signature-only fixture must demonstrate the old magic-byte-only gap",
-    );
-    assert.doesNotThrow(
-      () => validateImageDataUrl(`data:image/png;base64,${truncatedPngBase64}`),
-      "truncated-IDAT fixture must pass the old magic-byte-only check",
-    );
-    const signedRelativeUrl = "/result.png?token=must-not-appear-in-diagnostics";
-    let responsePayload: unknown = {};
-    let calls = 0;
-    const restoreFetch = installFetchMock(() => {
-      calls += 1;
-      return Response.json(responsePayload);
-    });
-    try {
-      const scenarios = [
-        {
-          provider: image2Provider,
-          providerId: "gpt-image-2",
-          payload: { data: [{ b64_json: invalidBase64 }] },
-          itemIndex: 0,
-          secret: invalidBase64,
-        },
-        {
-          provider: nanobananaProvider,
-          providerId: "nanobanana",
-          payload: { data: [{ b64_json: signatureOnlyBase64 }] },
-          itemIndex: 0,
-          secret: signatureOnlyBase64,
-        },
-        {
-          provider: image2Provider,
-          providerId: "gpt-image-2",
-          payload: { data: [{ b64_json: truncatedPngBase64 }] },
-          itemIndex: 0,
-          secret: truncatedPngBase64.slice(-24),
-        },
-        {
-          provider: nanobananaProvider,
-          providerId: "nanobanana",
-          payload: { data: [{ b64_json: jpegBase64 }] },
-          itemIndex: 0,
-          secret: jpegBase64.slice(0, 24),
-        },
-        {
-          provider: image2Provider,
-          providerId: "gpt-image-2",
-          payload: { data: [{ b64_json: VALID_PNG_BASE64 }, { url: signedRelativeUrl }] },
-          itemIndex: 1,
-          secret: "must-not-appear-in-diagnostics",
-        },
-      ];
-
-      for (const scenario of scenarios) {
-        responsePayload = scenario.payload;
-        calls = 0;
+    await test("HTTP 200 响应体截断标记 outcome_unknown 且只请求一次", async () => {
+      let calls = 0;
+      const restoreFetch = installFetchMock(() => {
+        calls += 1;
+        return new Response("{", { status: 200, headers: { "Content-Type": "application/json" } });
+      });
+      try {
         await assert.rejects(
-          () => scenario.provider.generate({ prompt: "响应校验" }),
-          (error: unknown) => {
-            assert.ok(error instanceof ProviderError);
-            assert.equal(error.status, 502);
-            assert.equal(error.category, "invalid_response");
-            assert.equal(error.providerId, scenario.providerId);
-            assert.match(error.message, /无效图片/);
-            assert.match(error.diagnostic ?? "", new RegExp(`item ${scenario.itemIndex}`));
-            assert.equal((error.diagnostic ?? "").includes(scenario.secret), false);
-            assert.equal(error.message.includes(scenario.secret), false);
-            return true;
+          () => apiyiProviders["gpt-image-2-vip"].generate({
+            prompt: "截断", modelOptions: { size: "1280x1280" },
+          }),
+          (error: unknown) => error instanceof ProviderError && error.category === "outcome_unknown",
+        );
+        assert.equal(calls, 1);
+      } finally {
+        restoreFetch();
+      }
+    });
+
+    await test("HTTP 200 中的损坏 Base64、伪造 MIME 与非法 URL 均确定失败且只请求一次", async () => {
+      const jpeg = await imageDataUrl(4, 2, { r: 70, g: 110, b: 160 }, "jpeg");
+      const signatureOnly = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString("base64");
+      let payload: unknown = {};
+      let calls = 0;
+      const restoreFetch = installFetchMock(() => {
+        calls += 1;
+        return Response.json(payload);
+      });
+      const vipRequest = () => apiyiProviders["gpt-image-2-vip"].generate({
+        prompt: "响应校验", modelOptions: { size: "1280x1280" },
+      });
+      try {
+        const scenarios: Array<{ payload: unknown; invoke: () => Promise<unknown> }> = [
+          { payload: { data: [{ b64_json: "not-canonical-base64-response" }] }, invoke: vipRequest },
+          { payload: { data: [{ b64_json: signatureOnly }] }, invoke: vipRequest },
+          {
+            payload: {
+              candidates: [{ content: { parts: [{
+                inlineData: { mimeType: "image/png", data: jpeg.split(",")[1] },
+              }] } }],
+            },
+            invoke: () => apiyiProviders["gemini-3.1-flash-image"].generate({
+              prompt: "响应校验", modelOptions: { aspectRatio: "1:1", imageSize: "1K" },
+            }),
           },
-        );
-        assert.equal(calls, 1, "200 响应内的损坏图片不应触发付费重试");
+          { payload: { data: [{ url: "/relative-result.png?token=secret" }] }, invoke: vipRequest },
+          {
+            payload: pngPayload(white),
+            invoke: () => apiyiProviders["seedream-5-0-260128"].generate({
+              prompt: "响应校验", modelOptions: { size: "2K" },
+            }),
+          },
+        ];
+        for (const scenario of scenarios) {
+          payload = scenario.payload;
+          calls = 0;
+          await assert.rejects(
+            scenario.invoke,
+            (error: unknown) => error instanceof ProviderError &&
+              error.status === 502 && error.category === "invalid_response",
+          );
+          assert.equal(calls, 1, "HTTP 200 内的坏图片不得触发第二次付费请求");
+        }
+      } finally {
+        restoreFetch();
       }
-    } finally {
-      restoreFetch();
-      restores.reverse().forEach((restore) => restore());
-    }
-  });
-
-  await test("GPT Images 合法 HTTPS URL 只做结构校验，Provider 不额外下载", async () => {
-    const restores = [
-      setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1"),
-      setEnv("CHANGE2PRO_API_KEY", "image2-test-key"),
-      setEnv("IMAGE2_MODEL", "gpt-image-2"),
-      setEnv("AI_MAX_RETRIES", "3"),
-    ];
-    const signedUrl = "https://cdn.example/result.png?token=private-signed-value";
-    let calls = 0;
-    const restoreFetch = installFetchMock(() => {
-      calls += 1;
-      return Response.json({ data: [{ url: signedUrl }] });
     });
-    try {
-      const result = await image2Provider.generate({ prompt: "URL 响应" });
-      assert.deepEqual(result.images, [signedUrl]);
-      assert.equal(calls, 1, "Provider 只应请求一次网关，URL 下载留给持久化边界");
-    } finally {
-      restoreFetch();
-      restores.reverse().forEach((restore) => restore());
-    }
-  });
 
-  await test("安全拒绝的常见正反向措辞均正确分类，且 4xx 不重试", async () => {
-    const restoreRetries = setEnv("AI_MAX_RETRIES", "2");
-    let responseBody: unknown = {};
-    let calls = 0;
-    const restoreFetch = installFetchMock(() => {
-      calls += 1;
-      return new Response(JSON.stringify(responseBody), { status: 400 });
-    });
-    try {
-      for (const error of [
-        { message: "content policy violation: raw gateway detail" },
-        { message: "Your request was rejected as a result of our safety system." },
-        { code: "content_filter", message: "The response was filtered by the content management policy." },
-        { code: "ResponsibleAIPolicyViolation", message: "The request was blocked." },
-      ]) {
-        responseBody = { error };
-        calls = 0;
-        await assert.rejects(
-          () => fetchWithRetry("https://gateway.example/v1/images/edits", () => ({}), { providerId: "test" }),
-          (caught: unknown) => caught instanceof ProviderError &&
-            caught.category === "content_refused" &&
-            caught.message === "本次请求未通过 AI 安全审核，请调整提示词或参考图片后重试",
-        );
-        assert.equal(calls, 1);
-      }
-
-      responseBody = {
-        error: {
-          code: "unknown_parameter",
-          message: "Unknown parameter: tools[0].n",
-        },
-      };
-      calls = 0;
-      await assert.rejects(
-        () => fetchWithRetry("https://gateway.example/v1/images/edits", () => ({}), { providerId: "test" }),
-        (caught: unknown) => caught instanceof ProviderError && caught.category === "invalid_request",
-      );
-      assert.equal(calls, 1);
-    } finally {
-      restoreFetch();
-      restoreRetries();
-    }
-  });
-
-  await test("网关 401/403 鉴权失败提示管理员检查配置，且不重试", async () => {
-    let status = 401;
-    let responseMessage = "content policy violation while validating the API key";
-    let calls = 0;
-    const restoreFetch = installFetchMock(() => {
-      calls += 1;
-      return new Response(JSON.stringify({ error: { message: responseMessage } }), { status });
-    });
-    try {
-      for (const scenario of [
-        { status: 401, message: "content policy violation while validating the API key" },
-        { status: 403, message: "model gpt-image-2 is not available for this API key" },
-      ]) {
-        status = scenario.status;
-        responseMessage = scenario.message;
-        calls = 0;
-        await assert.rejects(
-          () => fetchWithRetry("https://gateway.example/v1/images/generations", () => ({}), {
-            maxRetries: 2,
-            providerId: "test",
-          }),
-          (error: unknown) => error instanceof ProviderError &&
-            error.status === status &&
-            error.category === "gateway_authentication" &&
-            error.message === "AI 网关鉴权失败，请联系管理员检查 API Key 或账号权限",
-        );
-        assert.equal(calls, 1);
-      }
-    } finally {
-      restoreFetch();
-    }
-  });
-
-  await test("AI 诊断只对 POST probe 限流，GET 配置检查不消耗额度", async () => {
-    const restores = [
-      setEnv("CHANGE2PRO_BASE_URL", "https://gateway.example/v1"),
-      setEnv("CHANGE2PRO_API_KEY", "diagnostic-test-key"),
-      setEnv("NANOBANANA_MODEL", "nanobanana-test-model"),
-      setEnv("IMAGE2_MODEL", "image2-test-model"),
-    ];
-    const app = express();
-    app.use(express.json());
-    app.use((req, _res, next) => {
-      (req as Request & { authUser: unknown }).authUser = {
-        id: "admin-test",
-        accountId: "admin-test",
-        displayName: "Admin Test",
-        role: "admin",
-        mustChangePassword: false,
-      };
-      next();
-    });
-    app.use("/api/ai-diagnostics", createAiDiagnosticsRouter(createRateLimitMiddleware({
-      windowMs: 60_000,
-      maxRequests: 1,
-    })));
-    const server = app.listen(0, "127.0.0.1");
-    await new Promise<void>((resolve, reject) => {
-      server.once("listening", resolve);
-      server.once("error", reject);
-    });
-    const address = server.address() as AddressInfo;
-    const baseUrl = `http://127.0.0.1:${address.port}/api/ai-diagnostics`;
-    try {
-      assert.equal((await fetch(baseUrl)).status, 200);
-      assert.equal((await fetch(baseUrl)).status, 200);
-
-      const firstProbe = await fetch(`${baseUrl}/probe`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ providerId: "invalid", mode: "invalid" }),
+    await test("内容审核常见错误码与措辞统一分类为确定拒绝", async () => {
+      let responseBody: unknown = {};
+      let calls = 0;
+      const restoreFetch = installFetchMock(() => {
+        calls += 1;
+        return new Response(JSON.stringify(responseBody), { status: 400 });
       });
-      assert.equal(firstProbe.status, 400);
-      const limitedProbe = await fetch(`${baseUrl}/probe`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ providerId: "invalid", mode: "invalid" }),
-      });
-      assert.equal(limitedProbe.status, 429);
-    } finally {
-      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
-      restores.reverse().forEach((restore) => restore());
-    }
-  });
-
-  await test("AI 限流按 IP 计数并在窗口结束后重置", () => {
-    let currentTime = 10_000;
-    const middleware = createRateLimitMiddleware({
-      windowMs: 60_000,
-      maxRequests: 2,
-      now: () => currentTime,
+      try {
+        for (const errorBody of [
+          { message: "content policy violation: raw gateway detail" },
+          { message: "Your request was rejected as a result of our safety system." },
+          { code: "content_filter", message: "The response was filtered by the content management policy." },
+          { code: "ResponsibleAIPolicyViolation", message: "The request was blocked." },
+        ]) {
+          responseBody = { error: errorBody };
+          calls = 0;
+          await assert.rejects(
+            () => fetchWithRetry("https://gateway.example/v1/images/edits", () => ({}), { providerId: "test" }),
+            (error: unknown) => error instanceof ProviderError &&
+              error.category === "content_refused" &&
+              error.message === "本次请求未通过 AI 安全审核，请调整提示词或参考图片后重试",
+          );
+          assert.equal(calls, 1);
+        }
+      } finally {
+        restoreFetch();
+      }
     });
-    let statusCode = 200;
-    let payload: unknown;
-    let nextCalls = 0;
-    const req = { ip: "127.0.0.1", socket: {} } as Request;
-    const res = {
-      status(code: number) {
-        statusCode = code;
-        return this;
-      },
-      json(value: unknown) {
-        payload = value;
-        return this;
-      },
-    } as unknown as Response;
-    const next = (() => {
-      nextCalls += 1;
-    }) as NextFunction;
 
-    middleware(req, res, next);
-    middleware(req, res, next);
-    middleware(req, res, next);
-    assert.equal(nextCalls, 2);
-    assert.equal(statusCode, 429);
-    assert.deepEqual(payload, { error: "Too many requests, please slow down", retryAfter: 60 });
+    await test("网关 401/403 始终优先归类为鉴权失败且不重试", async () => {
+      let status = 401;
+      let responseMessage = "content policy violation while validating the API key";
+      let calls = 0;
+      const restoreFetch = installFetchMock(() => {
+        calls += 1;
+        return new Response(JSON.stringify({ error: { message: responseMessage } }), { status });
+      });
+      try {
+        for (const scenario of [
+          { status: 401, message: "content policy violation while validating the API key" },
+          { status: 403, message: "model gpt-image-2 is not available for this API key" },
+        ]) {
+          status = scenario.status;
+          responseMessage = scenario.message;
+          calls = 0;
+          await assert.rejects(
+            () => fetchWithRetry("https://gateway.example/v1/images/generations", () => ({}), { providerId: "test" }),
+            (error: unknown) => error instanceof ProviderError &&
+              error.status === status && error.category === "gateway_authentication" &&
+              error.message === "AI 网关鉴权失败，请联系管理员检查 API Key 或账号权限",
+          );
+          assert.equal(calls, 1);
+        }
+      } finally {
+        restoreFetch();
+      }
+    });
 
-    currentTime += 60_000;
-    middleware(req, res, next);
-    assert.equal(nextCalls, 3);
-  });
+    await test("AI 诊断列出六个 API易模型且 gpt-image-2 只开放改图探针", async () => {
+      const app = express();
+      app.use(express.json());
+      app.use((req, _res, next) => {
+        (req as express.Request & { authUser: unknown }).authUser = {
+          id: "admin-test", accountId: "admin-test", displayName: "Admin Test",
+          role: "admin", mustChangePassword: false,
+        };
+        next();
+      });
+      app.use("/api/ai-diagnostics", createAiDiagnosticsRouter(createRateLimitMiddleware({
+        windowMs: 60_000, maxRequests: 1,
+      })));
+      const server = app.listen(0, "127.0.0.1");
+      await new Promise<void>((resolve, reject) => {
+        server.once("listening", resolve);
+        server.once("error", reject);
+      });
+      const address = server.address() as AddressInfo;
+      const baseUrl = `http://127.0.0.1:${address.port}/api/ai-diagnostics`;
+      try {
+        const response = await fetch(baseUrl);
+        assert.equal(response.status, 200);
+        const body = await response.json() as {
+          gateway: string;
+          providers: Array<{ providerId: string; configured: boolean; probes: string[] }>;
+        };
+        assert.equal(body.gateway, "gateway.example");
+        assert.deepEqual(body.providers.map((item) => item.providerId), IMAGE_MODEL_IDS);
+        assert.ok(body.providers.every((item) => item.configured));
+        assert.deepEqual(body.providers.find((item) => item.providerId === "gpt-image-2")?.probes, ["edit"]);
+
+        const invalid = {
+          method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ providerId: "invalid", mode: "invalid" }),
+        };
+        assert.equal((await fetch(`${baseUrl}/probe`, invalid)).status, 400);
+        assert.equal((await fetch(`${baseUrl}/probe`, invalid)).status, 429);
+      } finally {
+        await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+      }
+    });
+  } finally {
+    restoreKey();
+    restoreBase();
+  }
 
   console.log(`\n通过 ${passed} 项`);
 }
 
-void main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+await main();

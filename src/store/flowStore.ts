@@ -14,11 +14,21 @@ import { nanoid } from "nanoid";
 import {
   NODE_SPECS,
   WORKFLOW_SCHEMA_VERSION,
+  isNodeRunActive,
+  isNodeRunTerminal,
   type NodeKind,
   type WorkflowNodeData,
   type NodeRunStatus,
   type ImageInputNodeData,
 } from "@/types/workflow";
+import {
+  DEFAULT_GENERATION_MODEL_ID,
+  MASK_REDRAW_MODEL_ID,
+  defaultImageModelOptions,
+  isImageModelId,
+  isModelAllowedForNode,
+  normalizeImageModelOptions,
+} from "@/types/imageModels";
 
 export type FlowNode = Node<WorkflowNodeData>;
 
@@ -40,13 +50,14 @@ export interface RecentResult {
   model?: string;
   startedAt: number;
   finishedAt?: number;
-  status: "queued" | "running" | "success" | "error";
+  status: Exclude<NodeRunStatus, "idle">;
   error?: string;
   ownerId?: string;
   ownerName?: string;
   requestedCount?: number;
   successfulCount?: number;
   providerRequests?: number;
+  providerOutputSize?: string;
   parameters?: Record<string, unknown>;
   referenceImages?: string[];
 }
@@ -127,6 +138,7 @@ interface FlowState {
   updateNodeDataInTab: (tabId: string, id: string, patch: Record<string, unknown>) => void;
   setNodeStatus: (id: string, status: NodeRunStatus, error?: string) => void;
   runNode: (id: string) => Promise<void>;
+  cancelNodeRun: (id: string) => Promise<void>;
   saveProject: () => Promise<void>;
   /**
    * 整组载入画布（打开项目 / 从模板新建）：
@@ -217,17 +229,46 @@ function defaultNodeData(kind: NodeKind): WorkflowNodeData {
     case "image-input":
       return { ...base, kind, imageRole: "default" };
     case "sketch-to-render":
-      return { ...base, kind, prompt: "", aspectRatio: "3:4", batchSize: 1, outputImages: [] };
+      return {
+        ...base, kind, prompt: "", aspectRatio: "3:4", batchSize: 1, outputImages: [],
+        modelId: DEFAULT_GENERATION_MODEL_ID,
+        modelOptions: defaultImageModelOptions(DEFAULT_GENERATION_MODEL_ID, "3:4"),
+      };
     case "ai-modify":
-      return { ...base, kind, prompt: "", aspectRatio: "1:1", batchSize: 1, outputImages: [] };
+      return {
+        ...base, kind, prompt: "", aspectRatio: "1:1", batchSize: 1, outputImages: [],
+        modelId: DEFAULT_GENERATION_MODEL_ID,
+        modelOptions: defaultImageModelOptions(DEFAULT_GENERATION_MODEL_ID),
+      };
     case "fabric-recolor":
-      return { ...base, kind, colors: [], prompt: "", outputImages: [] };
+      return {
+        ...base, kind, colors: [], prompt: "", outputImages: [],
+        modelId: DEFAULT_GENERATION_MODEL_ID,
+        modelOptions: defaultImageModelOptions(DEFAULT_GENERATION_MODEL_ID),
+      };
     case "upscale":
-      return { ...base, kind, imageSize: "2K", outputImages: [] };
+      return {
+        ...base, kind, imageSize: "2K", outputImages: [],
+        modelId: DEFAULT_GENERATION_MODEL_ID,
+        modelOptions: defaultImageModelOptions(DEFAULT_GENERATION_MODEL_ID),
+      };
     case "print-extract":
-      return { ...base, kind, prompt: "", outputImages: [], savedAsAssets: [] };
+      return {
+        ...base, kind, prompt: "", outputImages: [], savedAsAssets: [],
+        modelId: DEFAULT_GENERATION_MODEL_ID,
+        modelOptions: defaultImageModelOptions(DEFAULT_GENERATION_MODEL_ID),
+      };
     case "print-mutate":
-      return { ...base, kind, prompt: "", count: 4, outputImages: [] };
+      return {
+        ...base, kind, prompt: "", count: 4, outputImages: [],
+        modelId: DEFAULT_GENERATION_MODEL_ID,
+        modelOptions: defaultImageModelOptions(DEFAULT_GENERATION_MODEL_ID),
+      };
+    case "mask-redraw":
+      return {
+        ...base, kind, prompt: "", outputImages: [],
+        modelId: MASK_REDRAW_MODEL_ID, modelOptions: {},
+      };
     case "result":
       return { ...base, kind, images: [] };
   }
@@ -388,7 +429,10 @@ interface PersistedTabSession {
 }
 
 const NODE_KINDS = new Set<NodeKind>(Object.keys(NODE_SPECS) as NodeKind[]);
-const NODE_STATUSES = new Set<NodeRunStatus>(["idle", "queued", "running", "success", "error"]);
+const NODE_STATUSES = new Set<NodeRunStatus>([
+  "idle", "queued", "running", "retry_wait", "cancel_requested",
+  "success", "error", "outcome_unknown", "cancelled",
+]);
 
 function finiteNonNegative(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : fallback;
@@ -437,6 +481,14 @@ function normalizeSessionNode(value: unknown): FlowNode | undefined {
     status,
   };
   if (typeof input.error !== "string") delete data.error;
+  if (NODE_SPECS[kind].providerId) {
+    const modelId = isImageModelId(input.modelId) && isModelAllowedForNode(input.modelId, kind)
+      ? input.modelId
+      : kind === "mask-redraw" ? MASK_REDRAW_MODEL_ID : DEFAULT_GENERATION_MODEL_ID;
+    const preferredAspectRatio = typeof input.aspectRatio === "string" ? input.aspectRatio : "1:1";
+    data.modelId = modelId;
+    data.modelOptions = normalizeImageModelOptions(modelId, input.modelOptions, preferredAspectRatio);
+  }
 
   switch (kind) {
     case "image-input":
@@ -475,6 +527,14 @@ function normalizeSessionNode(value: unknown): FlowNode | undefined {
         ? input.count
         : 4;
       data.outputImages = stringList(input.outputImages);
+      break;
+    case "mask-redraw":
+      data.modelId = MASK_REDRAW_MODEL_ID;
+      data.modelOptions = {};
+      data.prompt = typeof input.prompt === "string" ? input.prompt : "";
+      data.outputImages = stringList(input.outputImages);
+      if (typeof input.mask !== "string") delete data.mask;
+      if (typeof input.maskSourceRef !== "string") delete data.maskSourceRef;
       break;
     case "result":
       data.images = stringList(input.images);
@@ -643,7 +703,7 @@ function loadRecentResults(): RecentResult[] {
     if (!Array.isArray(arr)) return [];
     const now = Date.now();
     return (arr as RecentResult[]).map((record) => {
-      if ((record.status === "queued" || record.status === "running") && !record.runId) {
+      if (isNodeRunActive(record.status) && !record.runId) {
         return {
           ...record,
           status: "error" as const,
@@ -676,6 +736,7 @@ interface RunEventMeta {
   error?: string;
   model?: string;
   prompts?: string[];
+  providerOutputSizes?: Array<string | null>;
   failures?: RunFailure[];
   startedAt?: number;
   finishedAt?: number;
@@ -685,7 +746,7 @@ export type NodeStatusRunEvent =
   | (RunEventMeta & {
       type: "node-status";
       nodeId: string;
-      status: "queued" | "running";
+      status: "queued" | "running" | "retry_wait" | "cancel_requested";
       images?: never;
     })
   | (RunEventMeta & {
@@ -698,7 +759,7 @@ export type NodeStatusRunEvent =
   | (Omit<RunEventMeta, "error"> & {
       type: "node-status";
       nodeId: string;
-      status: "error";
+      status: "error" | "outcome_unknown" | "cancelled";
       error: string;
       images?: never;
     });
@@ -719,6 +780,11 @@ function optionalString(value: unknown): string | undefined {
 function stringArray(value: unknown): string[] | undefined {
   if (!Array.isArray(value)) return undefined;
   return value.filter((item): item is string => typeof item === "string" && item.trim().length > 0);
+}
+
+function nullableStringArray(value: unknown): Array<string | null> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  return value.map((item) => optionalString(item) ?? null);
 }
 
 function runFailures(value: unknown): RunFailure[] | undefined {
@@ -756,6 +822,9 @@ export function normalizeRunEvent(value: unknown): RunEvent {
     ...(optionalString(raw.error) ? { error: optionalString(raw.error) } : {}),
     ...(optionalString(raw.model) ? { model: optionalString(raw.model) } : {}),
     ...(stringArray(raw.prompts) ? { prompts: stringArray(raw.prompts) } : {}),
+    ...(nullableStringArray(raw.providerOutputSizes)
+      ? { providerOutputSizes: nullableStringArray(raw.providerOutputSizes) }
+      : {}),
     ...(runFailures(raw.failures) ? { failures: runFailures(raw.failures) } : {}),
     ...(optionalFiniteNumber(raw.startedAt) !== undefined ? { startedAt: optionalFiniteNumber(raw.startedAt) } : {}),
     ...(optionalFiniteNumber(raw.finishedAt) !== undefined ? { finishedAt: optionalFiniteNumber(raw.finishedAt) } : {}),
@@ -763,11 +832,12 @@ export function normalizeRunEvent(value: unknown): RunEvent {
   if (raw.status === "success") {
     return { ...common, type: "node-status", nodeId, status: "success", images: stringArray(raw.images) ?? [] };
   }
-  if (raw.status === "error") {
+  if (raw.status === "error" || raw.status === "outcome_unknown" || raw.status === "cancelled") {
     const { error: commonError, ...meta } = common;
-    return { ...meta, type: "node-status", nodeId, status: "error", error: commonError ?? "生成失败" };
+    const fallback = raw.status === "cancelled" ? "任务已取消" : raw.status === "outcome_unknown" ? "生成结果未知" : "生成失败";
+    return { ...meta, type: "node-status", nodeId, status: raw.status, error: commonError ?? fallback };
   }
-  if (raw.status === "queued" || raw.status === "running") {
+  if (raw.status === "queued" || raw.status === "running" || raw.status === "retry_wait" || raw.status === "cancel_requested") {
     return { ...common, type: "node-status", nodeId, status: raw.status };
   }
   throw new Error("运行事件状态无效");
@@ -804,11 +874,13 @@ export function requestedResultCount(data: WorkflowNodeData): number {
   switch (data.kind) {
     case "sketch-to-render":
     case "ai-modify":
-      return Math.max(1, Math.min(4, Number(data.batchSize) || 1));
+      return Math.max(1, Math.min(8, Number(data.batchSize) || 1));
     case "print-mutate":
       return Math.max(1, Math.min(8, Number(data.count) || 1));
     case "fabric-recolor":
       return Math.max(1, Math.min(8, data.colors.length || 1));
+    case "mask-redraw":
+      return 1;
     default:
       return 1;
   }
@@ -847,7 +919,7 @@ export function applyRunEventToRecentResults(
     record.id.startsWith(pendingPrefix) ||
     record.id.startsWith(terminalPrefix) ||
     (Boolean(current.runId) && record.runId === current.runId);
-  if (event.status === "queued" || event.status === "running") {
+  if (isNodeRunActive(event.status)) {
     const status = event.status;
     return records.map((record) =>
       isBatchSibling(record)
@@ -861,12 +933,13 @@ export function applyRunEventToRecentResults(
         : record,
     );
   }
-  if (event.status !== "success" && event.status !== "error") return records;
+  if (!isNodeRunTerminal(event.status)) return records;
 
   const startedAt = event.startedAt ?? current.startedAt;
   const finishedAt = event.finishedAt ?? Date.now();
+  const { providerOutputSize: _previousProviderOutputSize, ...currentWithoutProviderOutputSize } = current;
   const base = {
-    ...current,
+    ...currentWithoutProviderOutputSize,
     model: event.model ?? current.model,
     startedAt,
     finishedAt,
@@ -885,6 +958,9 @@ export function applyRunEventToRecentResults(
       image: images[index],
       thumbnail: undefined,
       prompt: event.prompts?.[index] ?? current.prompt,
+      ...(event.providerOutputSizes?.[index]
+        ? { providerOutputSize: event.providerOutputSizes[index] as string }
+        : {}),
       status: "success",
       error: undefined,
     });
@@ -900,7 +976,7 @@ export function applyRunEventToRecentResults(
       image: "",
       thumbnail: undefined,
       prompt: failure?.prompt ?? current.prompt,
-      status: "error",
+      status: event.status === "success" ? "error" : event.status,
       error: failure?.error || event.error || (images.length > 0 ? "未返回图片" : "运行完成但未返回图片"),
     });
     failureIndex += 1;
@@ -984,7 +1060,7 @@ function consumeRunEvents(
         if (
           event.type === "node-status" &&
           event.nodeId === targetNodeId &&
-          (event.status === "success" || event.status === "error")
+          isNodeRunTerminal(event.status)
         ) {
           targetTerminalSeen = true;
         }
@@ -1055,7 +1131,7 @@ export const useFlowStore = create<FlowState>()(
         const closingIndex = syncedTabs.findIndex((tab) => tab.id === tabId);
         if (closingIndex < 0) return;
         const closingTab = syncedTabs[closingIndex];
-        if (closingTab.nodes.some((node) => node.data.status === "queued" || node.data.status === "running")) {
+        if (closingTab.nodes.some((node) => isNodeRunActive(node.data.status))) {
           return;
         }
         const remaining = syncedTabs.filter((tab) => tab.id !== tabId);
@@ -1224,7 +1300,7 @@ export const useFlowStore = create<FlowState>()(
         const initialState = get();
         if (initialState.readOnly) return;
         const node = initialState.nodes.find((n) => n.id === id);
-        if (!node || node.data.status === "running" || node.data.status === "queued") return;
+        if (!node || isNodeRunActive(node.data.status)) return;
         const kind = node.data.kind;
         const spec = NODE_SPECS[kind];
         if (!spec.providerId) return;
@@ -1312,7 +1388,7 @@ export const useFlowStore = create<FlowState>()(
               recentResults: applyRunEventToRecentResults(state.recentResults, recordId, event),
             }));
             updateTabFromRunEvent(set, tabId, id, event);
-            if (event.status === "success" || event.status === "error") terminalRecorded = true;
+            if (isNodeRunTerminal(event.status)) terminalRecorded = true;
           });
         } catch (err) {
           if (!terminalRecorded) {
@@ -1332,6 +1408,25 @@ export const useFlowStore = create<FlowState>()(
           }
         } finally {
           releaseNonUndoableRun();
+        }
+      },
+
+      cancelNodeRun: async (id) => {
+        const state = get();
+        const active = state.recentResults.find((record) =>
+          record.nodeId === id &&
+          record.projectId === state.projectId &&
+          Boolean(record.runId) &&
+          isNodeRunActive(record.status),
+        );
+        if (!active?.runId) return;
+        const response = await fetch(`/api/run-plan/${encodeURIComponent(active.runId)}/cancel`, { method: "POST" });
+        if (!response.ok) {
+          const body = await response.json().catch(() => ({}));
+          const message = responseErrorMessage(response.status, body);
+          updateTabNodes(set, state.activeTabId, (nodes) => nodes.map((node) =>
+            node.id === id ? { ...node, data: { ...node.data, error: `取消失败：${message}` } } : node,
+          ));
         }
       },
 
@@ -1539,7 +1634,7 @@ if (typeof window !== "undefined") {
 export function resumeRecentResults(records: RecentResult[]): void {
   const resumable = records.filter(
     (record) =>
-      (record.status === "queued" || record.status === "running") && Boolean(record.runId),
+      isNodeRunActive(record.status) && Boolean(record.runId),
   );
   for (const record of resumable) {
     const runId = record.runId!;
@@ -1567,7 +1662,7 @@ export function resumeRecentResults(records: RecentResult[]): void {
           if (tabId && event.status) {
             updateTabFromRunEvent(useFlowStore.setState, tabId, record.nodeId, event);
           }
-          if (event.status === "success" || event.status === "error") terminalRecorded = true;
+          if (isNodeRunTerminal(event.status)) terminalRecorded = true;
         });
       } catch (error) {
         if (terminalRecorded) return;
@@ -1619,6 +1714,17 @@ export function selectResultImages(state: FlowState, nodeId: string): string[] {
     if (e.target !== nodeId) continue;
     const src = state.nodes.find((n) => n.id === e.source);
     if (src) urls.push(...nodeOutputImages(src.data));
+  }
+  return urls;
+}
+
+/** 按连线顺序读取节点当前可见的上游图片，蒙版编辑器以第一张作为原图。 */
+export function selectNodeInputImages(state: FlowState, nodeId: string): string[] {
+  const urls: string[] = [];
+  for (const edge of state.edges) {
+    if (edge.target !== nodeId) continue;
+    const source = state.nodes.find((node) => node.id === edge.source);
+    if (source) urls.push(...nodeOutputImages(source.data));
   }
   return urls;
 }

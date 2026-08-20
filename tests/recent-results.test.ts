@@ -243,12 +243,11 @@ test("图片网格使用服务端缩略图但查看器仍保留原图引用", ()
 
 test("排队中的运行按钮禁用并明确显示排队状态", () => {
   const html = renderToStaticMarkup(createElement(RunButton, {
-    running: true,
-    queued: true,
+    status: "queued",
     onClick: () => undefined,
   }));
   assert.match(html, /disabled/);
-  assert.match(html, /排队中…/);
+  assert.match(html, /排队中/);
 });
 
 test("选择第 5 张对比图时给出上限提示且不改变选择", () => {
@@ -341,6 +340,30 @@ async function waitFor(condition: () => boolean, message: string): Promise<void>
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
   throw new Error(message);
+}
+
+{
+  const previousFetch = globalThis.fetch;
+  const cancelUrls: string[] = [];
+  try {
+    globalThis.fetch = (async (input) => {
+      cancelUrls.push(String(input));
+      return Response.json({ status: "cancel_requested", finished: false });
+    }) as typeof fetch;
+    useFlowStore.setState({
+      projectId: "project-current",
+      recentResults: [
+        { ...queued, id: "wrong-project", projectId: "project-other", runId: "run-other", status: "running" },
+        { ...queued, id: "right-project", projectId: "project-current", runId: "run-current", status: "running" },
+      ],
+    });
+    await useFlowStore.getState().cancelNodeRun(queued.nodeId);
+    assert.deepEqual(cancelUrls, ["/api/run-plan/run-current/cancel"]);
+    passed += 1;
+    console.log("  ✓ 取消节点运行按当前项目匹配 runId");
+  } finally {
+    globalThis.fetch = previousFetch;
+  }
 }
 
 const originalFetch = globalThis.fetch;

@@ -1,6 +1,6 @@
 /**
- * POST /api/generate  { providerId, kind?, request: ImageGenRequest } → ImageGenResult
- * 有参考图调 provider.edit，无参考图调 provider.generate。
+ * POST /api/generate  { modelId, kind?, request: ImageGenRequest } → 202 { runId, status }
+ * 请求事务入队后立即返回，由 PostgreSQL Worker 根据参考图选择生成或编辑。
  */
 import { Router } from "express";
 import {
@@ -10,13 +10,17 @@ import {
   type NodeKind,
 } from "../../src/types/workflow";
 import { postProcessGeneratedOutputImages } from "../engine/runner";
-import { getProvider, ProviderError, publicProviderErrorMessage } from "../providers";
-import { generateExactImages } from "../providers/exact";
-import { normalizeImageRef, persistImageRef } from "../lib/fileStore";
 import { EXACT_ASPECT_DIMENSIONS } from "../lib/imagePostProcessing";
-import { nanoid } from "nanoid";
 import { requestUser } from "../lib/auth";
-import { completeGenerationRecord, createGenerationRecord, failGenerationRecord, markGenerationRunning } from "../lib/generationRecords";
+import { asyncHandler } from "../lib/asyncHandler";
+import { enqueueGenerationRun } from "../engine/runQueue";
+import {
+  defaultImageModelOptions,
+  imageModelOptionsError,
+  isImageModelId,
+  isModelAllowedForNode,
+  modelMaxReferenceImages,
+} from "../../src/types/imageModels";
 
 export const generateRouter = Router();
 
@@ -72,18 +76,19 @@ export function postProcessDirectGenerateImages(
   );
 }
 
-generateRouter.post("/", async (req, res) => {
-  const { providerId, request, projectId, projectName, nodeId, nodeLabel, kind } = req.body as {
-    providerId?: string;
+generateRouter.post("/", asyncHandler(async (req, res) => {
+  const { providerId, modelId: requestedModelId, request, projectId, projectName, nodeId, nodeLabel, kind } = req.body as {
+    providerId?: string; modelId?: string;
     request?: ImageGenRequest;
     projectId?: string; projectName?: string; nodeId?: string; nodeLabel?: string; kind?: string;
   };
-  if (!providerId || !request?.prompt) {
-    res.status(400).json({ error: "providerId and request.prompt are required" });
+  const modelId = requestedModelId ?? providerId;
+  if (!modelId || !request?.prompt) {
+    res.status(400).json({ error: "modelId and request.prompt are required" });
     return;
   }
-  if (request.referenceImages && request.referenceImages.length > MAX_REFERENCE_IMAGES) {
-    res.status(400).json({ error: `referenceImages must contain at most ${MAX_REFERENCE_IMAGES} images` });
+  if (!isImageModelId(modelId)) {
+    res.status(400).json({ error: "modelId must identify a supported API易 image model" });
     return;
   }
   const validation = validateDirectGenerateRequest(kind, request);
@@ -91,56 +96,56 @@ generateRouter.post("/", async (req, res) => {
     res.status(400).json({ error: validation.error });
     return;
   }
-  const runId = nanoid(10);
-  const startedAt = Date.now();
+  const resolvedKind = validation.kind ?? (modelId === "gpt-image-2" ? "mask-redraw" : "sketch-to-render");
+  if (!isModelAllowedForNode(modelId, resolvedKind)) {
+    res.status(400).json({ error: `${modelId} is not allowed for ${resolvedKind}` });
+    return;
+  }
+  const maskSourceRef = request.referenceImages?.[0];
+  if (
+    resolvedKind === "mask-redraw" &&
+    (typeof maskSourceRef !== "string" || !maskSourceRef.trim() || typeof request.mask !== "string" || !request.mask.trim())
+  ) {
+    res.status(400).json({ error: "mask-redraw requires a source image and PNG mask" });
+    return;
+  }
+  const maxReferences = Math.min(MAX_REFERENCE_IMAGES, modelMaxReferenceImages(modelId));
+  if (request.referenceImages && request.referenceImages.length > maxReferences) {
+    res.status(400).json({ error: `referenceImages must contain at most ${maxReferences} images for ${modelId}` });
+    return;
+  }
+  const modelOptions = request.modelOptions ?? defaultImageModelOptions(modelId, request.aspectRatio);
+  const optionsError = imageModelOptionsError(modelId, modelOptions);
+  if (optionsError) {
+    res.status(400).json({ error: `request.modelOptions ${optionsError}` });
+    return;
+  }
   const requestedCount = Math.max(1, Math.min(8, Number(request.batchSize) || 1));
-  await createGenerationRecord(runId, {
-    userId: requestUser(req).id,
+  const user = requestUser(req);
+  const resolvedNodeId = nodeId ?? "direct-generate";
+  const resolvedRequest: ImageGenRequest = { ...request, modelOptions };
+  const run = await enqueueGenerationRun({
+    steps: [{
+      nodeId: resolvedNodeId,
+      kind: resolvedKind,
+      inputImages: request.referenceImages ?? [],
+      params: {
+        ...resolvedRequest,
+        modelId,
+        ...(resolvedKind === "mask-redraw" ? { maskSourceRef } : {}),
+      },
+    }],
+  }, user.id, {
+    userId: user.id,
     projectId,
     projectName,
-    nodeId: nodeId ?? "direct-generate",
+    nodeId: resolvedNodeId,
     nodeLabel: nodeLabel ?? "直接生成",
-    kind: validation.kind ?? "sketch-to-render",
+    kind: resolvedKind,
     prompt: request.prompt,
-    parameters: request as unknown as Record<string, unknown>,
+    parameters: { ...request, modelId, modelOptions } as unknown as Record<string, unknown>,
     referenceImages: request.referenceImages,
     requestedCount,
-  }, startedAt);
-  await markGenerationRunning(runId, startedAt);
-  try {
-    const provider = getProvider(providerId);
-    // 参考图统一归一化为 dataURL（http URL 会带 SSRF/体积/超时防护下载）
-    const resolved: ImageGenRequest = {
-      ...request,
-      referenceImages: request.referenceImages
-        ? await Promise.all(request.referenceImages.map(normalizeImageRef))
-        : undefined,
-      mask: request.mask ? await normalizeImageRef(request.mask) : undefined,
-    };
-    const raw = await generateExactImages(provider, resolved, requestedCount, { runId, nodeId });
-    const processedImages = await postProcessDirectGenerateImages(validation.kind, resolved, raw.images);
-    // 结果统一落盘为 /api/files URL：dataURL 与第三方临时 URL 都不进项目 JSON
-    const images = await Promise.all(processedImages.map(persistImageRef));
-    const finishedAt = Date.now();
-    const failures = raw.failures.map((error) => ({ prompt: request.prompt, error }));
-    await completeGenerationRecord({
-      runId, images, prompts: images.map(() => request.prompt), failures,
-      model: raw.model, providerRequests: raw.providerRequests, startedAt, finishedAt,
-    });
-    res.json({ ...raw, images, runId });
-  } catch (err) {
-    const message = err instanceof ProviderError
-      ? publicProviderErrorMessage(err)
-      : err instanceof Error ? err.message : String(err);
-    await failGenerationRecord(runId, message, Date.now());
-    if (err instanceof ProviderError) {
-      res.status(err.status && err.status >= 400 && err.status < 600 ? err.status : 502).json({
-        error: message,
-        providerId: err.providerId ?? providerId,
-        category: err.category,
-      });
-    } else {
-      res.status(500).json({ error: message });
-    }
-  }
-});
+  }, "direct");
+  res.status(202).json({ runId: run.id, status: "queued" });
+}));

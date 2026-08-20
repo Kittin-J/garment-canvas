@@ -2,9 +2,10 @@ import { useState } from "react";
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import { useFlowStore } from "@/store/flowStore";
 import { useCustomColors } from "@/store/customColors";
-import type { FabricRecolorNodeData } from "@/types/workflow";
+import { isNodeRunActive, type FabricRecolorNodeData } from "@/types/workflow";
 import { NodeFrame, RunButton, Developing } from "./NodeFrame";
 import { ImageGrid } from "./ImageGrid";
+import { ModelControls } from "./ModelControls";
 import {
   COLOR_CATEGORIES,
   buildRecolorPrompt,
@@ -23,10 +24,11 @@ export function FabricRecolorNode({
 }: NodeProps<Node<FabricRecolorNodeData>>) {
   const updateNodeData = useFlowStore((s) => s.updateNodeData);
   const runNode = useFlowStore((s) => s.runNode);
+  const cancelNodeRun = useFlowStore((s) => s.cancelNodeRun);
   const hasFabricInput = useFlowStore((s) =>
     s.edges.some((e) => e.target === id && e.targetHandle === "fabric"),
   );
-  const running = data.status === "running" || data.status === "queued";
+  const running = isNodeRunActive(data.status);
 
   const colors = data.colors ?? [];
   const [hexInput, setHexInput] = useState("");
@@ -210,10 +212,11 @@ export function FabricRecolorNode({
           )}
         </div>
 
+        <ModelControls nodeId={id} modelId={data.modelId} modelOptions={data.modelOptions} disabled={running} />
         <RunButton
-          running={running}
-          queued={data.status === "queued"}
+          status={data.status}
           onClick={() => void runNode(id)}
+          onCancel={() => void cancelNodeRun(id)}
           label="替换面料配色"
           disabled={colors.length === 0 && !hasFabricInput}
         />

@@ -1,0 +1,55 @@
+{
+  "capturedOn": "2026-08-20",
+  "sourceFormat": "official-markdown",
+  "sourceHashScope": "Exact response body returned by markdownUrl",
+  "documentationIndex": "https://docs.apiyi.com/llms.txt",
+  "fullDocumentationFingerprint": {
+    "url": "https://docs.apiyi.com/llms-full.txt",
+    "sha256": "a85be3955c9ee6788bb46c885e6c3de1986bbde4109e3a2462f2417dff8c9571"
+  },
+  "localKnowledgeBase": {
+    "kind": "curated-contract",
+    "rawSourcePagesStored": false,
+    "documents": [
+      "README.md",
+      "async-runtime.md",
+      "input-image-normalization.md",
+      "model-contracts.json",
+      "models/gpt-image-2.md",
+      "models/gpt-image-2-vip.md",
+      "models/gemini-3.1-flash-image.md",
+      "models/flux-2-pro.md",
+      "models/seedream-5-0-260128.md",
+      "models/grok-imagine-image.md"
+    ],
+    "policy": "Local files are concise implementation contracts, not copies of upstream pages. Each source keeps its canonical URL, official Markdown URL, capture date, and SHA-256 fingerprint."
+  },
+  "sources": [
+    {"url": "https://docs.apiyi.com/api-capabilities/gpt-image-2/overview", "markdownUrl": "https://docs.apiyi.com/api-capabilities/gpt-image-2/overview.md", "localDocument": "models/gpt-image-2.md", "sha256": "4e1425c9063e8c8fb7adb0274f6f8bfc37351807081862a3252dcf453a463b7a"},
+    {"url": "https://docs.apiyi.com/api-capabilities/gpt-image-2/image-edit", "markdownUrl": "https://docs.apiyi.com/api-capabilities/gpt-image-2/image-edit.md", "localDocument": "models/gpt-image-2.md", "sha256": "da9a305579a220bc7ec9821d42a505cdb61e2d70adb077ac05144a37917a0f48"},
+    {"url": "https://docs.apiyi.com/api-capabilities/gpt-image-2/mask-editing", "markdownUrl": "https://docs.apiyi.com/api-capabilities/gpt-image-2/mask-editing.md", "localDocument": "models/gpt-image-2.md", "sha256": "67f2fd051383ef7add5eb5a01f9ef5206656aa857892c296c4acd057cab56330"},
+    {"url": "https://docs.apiyi.com/api-capabilities/gpt-image-2-vip/overview", "markdownUrl": "https://docs.apiyi.com/api-capabilities/gpt-image-2-vip/overview.md", "localDocument": "models/gpt-image-2-vip.md", "sha256": "988326081558c5a95ef1255fef6915639e01ffa36f71f343f054cc11b4bd6360"},
+    {"url": "https://docs.apiyi.com/api-capabilities/gpt-image-2-vip/text-to-image", "markdownUrl": "https://docs.apiyi.com/api-capabilities/gpt-image-2-vip/text-to-image.md", "localDocument": "models/gpt-image-2-vip.md", "sha256": "7a39b7f014135fba139ff65816714df76aea6da51263ffb049881f66d1a1d6c6"},
+    {"url": "https://docs.apiyi.com/api-capabilities/gpt-image-2-vip/image-edit", "markdownUrl": "https://docs.apiyi.com/api-capabilities/gpt-image-2-vip/image-edit.md", "localDocument": "models/gpt-image-2-vip.md", "sha256": "bdff0e86d802ea1498a5b4e2cc14fc6af60460579942a22884a6996347a1c09f"},
+    {"url": "https://docs.apiyi.com/api-capabilities/nano-banana-2-image/overview", "markdownUrl": "https://docs.apiyi.com/api-capabilities/nano-banana-2-image/overview.md", "localDocument": "models/gemini-3.1-flash-image.md", "sha256": "fa09e73b9409805d3b7471205ff34eb1751e07472723edb516a25d1d3aca361a"},
+    {"url": "https://docs.apiyi.com/api-capabilities/nano-banana-2-image/text-to-image", "markdownUrl": "https://docs.apiyi.com/api-capabilities/nano-banana-2-image/text-to-image.md", "localDocument": "models/gemini-3.1-flash-image.md", "sha256": "8e81a7cb72d03886f7901c47ad8201db3d255259e6b29fec7b292f32ac4bdc28"},
+    {"url": "https://docs.apiyi.com/api-capabilities/nano-banana-2-image/image-edit", "markdownUrl": "https://docs.apiyi.com/api-capabilities/nano-banana-2-image/image-edit.md", "localDocument": "models/gemini-3.1-flash-image.md", "sha256": "5f4a0420bd9b6456710d8d0c1104055cefe510c28b84595b394bdacc8961b35d"},
+    {"url": "https://docs.apiyi.com/api-capabilities/flux/overview", "markdownUrl": "https://docs.apiyi.com/api-capabilities/flux/overview.md", "localDocument": "models/flux-2-pro.md", "sha256": "49be87b346057c59842fc9fe35044dd512b230e6045395962c50c58c1e0a7993"},
+    {"url": "https://docs.apiyi.com/api-capabilities/flux/text-to-image", "markdownUrl": "https://docs.apiyi.com/api-capabilities/flux/text-to-image.md", "localDocument": "models/flux-2-pro.md", "sha256": "88903c60516204c85952f8cd3f1b903a10f4d55c8333d514cc2a4b00088d2246"},
+    {"url": "https://docs.apiyi.com/api-capabilities/flux/image-edit", "markdownUrl": "https://docs.apiyi.com/api-capabilities/flux/image-edit.md", "localDocument": "models/flux-2-pro.md", "sha256": "8a8ad4925413776607d3d684c8438d7bf293c845d326fc7aab08b9e8fc3f0ec3"},
+    {"url": "https://docs.apiyi.com/api-capabilities/seedream-image/overview", "markdownUrl": "https://docs.apiyi.com/api-capabilities/seedream-image/overview.md", "localDocument": "models/seedream-5-0-260128.md", "sha256": "3f4d3b47ff5baa431f0d92faa35091355838da1c47e0f4428b11a27f0d111482"},
+    {"url": "https://docs.apiyi.com/api-capabilities/seedream-image/text-to-image", "markdownUrl": "https://docs.apiyi.com/api-capabilities/seedream-image/text-to-image.md", "localDocument": "models/seedream-5-0-260128.md", "sha256": "3301ab095fef5c3fc5369538671a68cf5a957fdb77084cc9dc94a4df2fb9a23a"},
+    {"url": "https://docs.apiyi.com/api-capabilities/seedream-image/image-edit", "markdownUrl": "https://docs.apiyi.com/api-capabilities/seedream-image/image-edit.md", "localDocument": "models/seedream-5-0-260128.md", "sha256": "1b83db2c465fd5259c1a2e116fa2b2585471d67da0c900ee583ed656ff2fab55"},
+    {"url": "https://docs.apiyi.com/api-capabilities/grok-imagine-image/overview", "markdownUrl": "https://docs.apiyi.com/api-capabilities/grok-imagine-image/overview.md", "localDocument": "models/grok-imagine-image.md", "sha256": "4784917e39499754590ebd46aca6d98836b9c4c418dca3e60e7b3576c82195ac"},
+    {"url": "https://docs.apiyi.com/api-capabilities/grok-imagine-image/text-to-image", "markdownUrl": "https://docs.apiyi.com/api-capabilities/grok-imagine-image/text-to-image.md", "localDocument": "models/grok-imagine-image.md", "sha256": "7d80d7942bc6b3b16da565af34e0a6b95126abd1998b525d0f7b9399d7472d14"},
+    {"url": "https://docs.apiyi.com/api-capabilities/grok-imagine-image/image-edit", "markdownUrl": "https://docs.apiyi.com/api-capabilities/grok-imagine-image/image-edit.md", "localDocument": "models/grok-imagine-image.md", "sha256": "a334b4803ea6f4d541b80efcbfad75c567aaffa964837faa4da4b186c6ed7e01"},
+    {"url": "https://docs.apiyi.com/api-capabilities/image-api-best-practices", "markdownUrl": "https://docs.apiyi.com/api-capabilities/image-api-best-practices.md", "localDocument": "input-image-normalization.md", "sha256": "e3c70183eb5bf2dc23e23363ad52a1da218a3f15d1214711b0cebde50f856c1a"},
+    {"url": "https://docs.apiyi.com/api-capabilities/image-async-queue", "markdownUrl": "https://docs.apiyi.com/api-capabilities/image-async-queue.md", "localDocument": "async-runtime.md", "sha256": "d17d4154af3f4cfb5df4e0972a4b26f69be47ca0643773dcdb76d14b423e42d5"}
+  ],
+  "pricingSnapshot": {
+    "sha256": "e586fe0f23fc13ab264d202205992891f4ef819457f295ad124c31406c7ef2f8",
+    "present": ["gpt-image-2", "gpt-image-2-vip", "gemini-3.1-flash-image", "flux-2-pro", "seedream-5-0-260128"],
+    "absent": ["grok-imagine-image"],
+    "policy": "Pricing visibility is an availability signal only. It does not silently add or remove product models."
+  }
+}

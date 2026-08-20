@@ -10,6 +10,15 @@ import {
   BATCH_SIZES,
 } from "../../src/types/workflow";
 import { isLocalImageReference, validateImageDataUrl } from "./imageValidation";
+import {
+  DEFAULT_GENERATION_MODEL_ID,
+  MASK_REDRAW_MODEL_ID,
+  defaultImageModelOptions,
+  imageModelOptionsError,
+  isImageModelId,
+  isModelAllowedForNode,
+  normalizeImageModelOptions,
+} from "../../src/types/imageModels";
 
 const NODE_KINDS: readonly NodeKind[] = [
   "image-input",
@@ -19,9 +28,13 @@ const NODE_KINDS: readonly NodeKind[] = [
   "upscale",
   "print-extract",
   "print-mutate",
+  "mask-redraw",
   "result",
 ];
-const STATUSES = ["idle", "queued", "running", "success", "error"] as const;
+const STATUSES = [
+  "idle", "queued", "running", "retry_wait", "cancel_requested",
+  "success", "error", "outcome_unknown", "cancelled",
+] as const;
 const IMAGE_ROLES = ["default", "sketch", "garment", "fabric", "reference"] as const;
 const ASPECT_RATIOS = ["1:1", "3:4", "4:3", "9:16", "16:9"] as const;
 const IMAGE_SIZES = ["2K", "4K"] as const;
@@ -103,40 +116,77 @@ function imageReferenceArray(value: unknown, path: string, max = MAX_IMAGE_REFS)
   return value.map((item, index) => imageReference(item, `${path}[${index}]`));
 }
 
+function migratedModelFields(
+  kind: NodeKind,
+  raw: Record<string, unknown>,
+  preferredAspectRatio = "1:1",
+): Record<string, unknown> {
+  const requested = isImageModelId(raw.modelId) && isModelAllowedForNode(raw.modelId, kind)
+    ? raw.modelId
+    : kind === "mask-redraw" ? MASK_REDRAW_MODEL_ID : DEFAULT_GENERATION_MODEL_ID;
+  return {
+    modelId: requested,
+    modelOptions: normalizeImageModelOptions(requested, raw.modelOptions, preferredAspectRatio),
+  };
+}
+
 function migrateNodeData(kind: NodeKind, raw: Record<string, unknown>): Record<string, unknown> {
-  // v0 文件保留现有值，只补当时尚不存在、而运行时已经依赖的确定性默认字段。
+  // v0/v1 文件保留现有值，只补后来新增且运行时依赖的确定性默认字段。
   switch (kind) {
     case "image-input":
       return { imageRole: "default", ...raw };
     case "sketch-to-render":
-      return { prompt: "", aspectRatio: "3:4", batchSize: 1, outputImages: [], ...raw };
+      return {
+        prompt: "", aspectRatio: "3:4", batchSize: 1, outputImages: [],
+        ...raw, ...migratedModelFields(kind, raw, typeof raw.aspectRatio === "string" ? raw.aspectRatio : "3:4"),
+      };
     case "ai-modify":
-      return { prompt: "", aspectRatio: "1:1", batchSize: 1, outputImages: [], ...raw };
+      return {
+        prompt: "", aspectRatio: "1:1", batchSize: 1, outputImages: [],
+        ...raw, ...migratedModelFields(kind, raw, typeof raw.aspectRatio === "string" ? raw.aspectRatio : "1:1"),
+      };
     case "fabric-recolor":
-      return { colors: [], prompt: "", outputImages: [], ...raw };
+      return { colors: [], prompt: "", outputImages: [], ...raw, ...migratedModelFields(kind, raw) };
     case "upscale":
-      return { imageSize: "2K", outputImages: [], ...raw };
+      return { imageSize: "2K", outputImages: [], ...raw, ...migratedModelFields(kind, raw) };
     case "print-extract":
-      return { prompt: "", outputImages: [], savedAsAssets: [], ...raw };
+      return { prompt: "", outputImages: [], savedAsAssets: [], ...raw, ...migratedModelFields(kind, raw) };
     case "print-mutate":
-      return { prompt: "", count: 4, outputImages: [], ...raw };
+      return { prompt: "", count: 4, outputImages: [], ...raw, ...migratedModelFields(kind, raw) };
+    case "mask-redraw":
+      return {
+        prompt: "", outputImages: [], ...raw,
+        modelId: MASK_REDRAW_MODEL_ID,
+        modelOptions: defaultImageModelOptions(MASK_REDRAW_MODEL_ID),
+      };
     case "result":
       return { images: [], ...raw };
   }
 }
 
+function validateModelSelection(kind: NodeKind, raw: Record<string, unknown>, path: string): void {
+  if (!NODE_SPECS[kind].providerId) return;
+  if (!isImageModelId(raw.modelId)) fail(`${path}.modelId`, "must be a supported API易 image model");
+  if (!isModelAllowedForNode(raw.modelId, kind)) {
+    fail(`${path}.modelId`, `${raw.modelId} is not allowed for ${kind}`);
+  }
+  const optionsError = imageModelOptionsError(raw.modelId, raw.modelOptions);
+  if (optionsError) fail(`${path}.modelOptions`, optionsError);
+}
+
 function validateData(kind: NodeKind, rawValue: unknown, path: string): WorkflowNodeData {
   const input = record(rawValue, path);
-  // queued/running/error 是单进程运行态，不能跨保存/模板/重启持久化。
+  // 运行中与失败状态不能跨保存/模板持久化；成功结果本身可以保留。
   const runtimeStatus = input.status;
   const raw =
-    runtimeStatus === "queued" || runtimeStatus === "running" || runtimeStatus === "error"
+    runtimeStatus !== "idle" && runtimeStatus !== "success"
       ? { ...input, status: "idle", error: undefined }
       : input;
   if (raw.kind !== kind) fail(`${path}.kind`, `must equal node type ${kind}`);
   stringValue(raw.label, `${path}.label`, { nonEmpty: true });
   oneOf(raw.status, STATUSES, `${path}.status`);
   optionalString(raw.error, `${path}.error`);
+  validateModelSelection(kind, raw, path);
 
   switch (kind) {
     case "image-input":
@@ -174,6 +224,12 @@ function validateData(kind: NodeKind, rawValue: unknown, path: string): Workflow
       if (!Number.isInteger(raw.count) || (raw.count as number) < 1 || (raw.count as number) > 8) {
         fail(`${path}.count`, "must be an integer from 1 to 8");
       }
+      imageReferenceArray(raw.outputImages, `${path}.outputImages`);
+      break;
+    case "mask-redraw":
+      stringValue(raw.prompt, `${path}.prompt`);
+      optionalImageReference(raw.mask, `${path}.mask`);
+      optionalImageReference(raw.maskSourceRef, `${path}.maskSourceRef`);
       imageReferenceArray(raw.outputImages, `${path}.outputImages`);
       break;
     case "result":
@@ -216,11 +272,11 @@ function validateEdge(value: unknown, index: number): PersistedWorkflowEdge {
   return { ...raw, id, source, target } as PersistedWorkflowEdge;
 }
 
-/** Validate untrusted JSON and migrate the sole legacy (unversioned/v0) format to v1. */
+/** Validate untrusted JSON and migrate legacy unversioned/v0/v1 formats to v2. */
 export function validateAndMigrateFlow(value: unknown): PersistedWorkflow {
   const raw = record(value, "flow");
   const version = raw.schemaVersion;
-  const migrateLegacy = version === undefined || version === 0;
+  const migrateLegacy = version === undefined || version === 0 || version === 1;
   if (!migrateLegacy && version !== WORKFLOW_SCHEMA_VERSION) {
     fail("flow.schemaVersion", `unsupported version ${String(version)}; current version is ${WORKFLOW_SCHEMA_VERSION}`);
   }

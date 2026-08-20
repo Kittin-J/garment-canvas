@@ -25,6 +25,7 @@ export type ProviderErrorCategory =
   | "invalid_request"
   | "rate_limited"
   | "timeout"
+  | "outcome_unknown"
   | "gateway_unavailable"
   | "empty_response"
   | "invalid_response"
@@ -45,7 +46,7 @@ function classifyProviderMessage(status: number | undefined, rawMessage: string)
     };
   }
   const contentRefused =
-    /content\s*(policy|filter)|content management policy|responsible\s*ai\s*policy\s*violation/i.test(message) ||
+    /content\s*(policy|filter)|content management policy|responsible\s*ai\s*policy\s*violation|responsibleaipolicyviolation/i.test(message) ||
     /(safety system|moderation).{0,50}(block|filter|reject|refus)/i.test(message) ||
     /(block|filter|reject|refus).{0,50}(safety system|moderation|content management policy)/i.test(message) ||
     /内容.{0,12}(安全|审核|政策|过滤).{0,12}(拦截|过滤|拒绝|违规)|内容.{0,10}(拒绝|违规)/i.test(message);
@@ -59,6 +60,15 @@ function classifyProviderMessage(status: number | undefined, rawMessage: string)
     return {
       category: "model_unavailable",
       publicMessage: "当前 AI 模型不可用，请联系管理员检查模型配置",
+    };
+  }
+  const deterministicParameterError =
+    /(invalid|unknown|unsupported|not supported|out of range).{0,60}(parameter|argument|field|resolution|aspect ratio|size|width|height|format|image count)/i.test(message) ||
+    /(parameter|argument|field|resolution|aspect ratio|size|width|height|format|image count).{0,60}(invalid|unknown|unsupported|not supported|out of range|must be|only supports?)/i.test(message);
+  if (deterministicParameterError) {
+    return {
+      category: "invalid_request",
+      publicMessage: "AI 服务暂不支持当前参数或参考图组合，请调整后重试",
     };
   }
   if (status === 429) {
@@ -133,7 +143,10 @@ export class NotImplementedError extends ProviderError {
   }
 }
 
-/** 4xx 不重试，5xx / 网络错误 / 超时按 maxRetries 重试，指数退避 */
+/**
+ * 单次 Provider 请求出口。重试必须由 PostgreSQL Worker 在拿到明确 429/503 后调度；
+ * 网络错误、超时或连接中断可能已经产生计费，因此一律标记为 outcome_unknown。
+ */
 export async function fetchWithRetry(
   url: string,
   initFactory: () => RequestInit,
@@ -155,57 +168,30 @@ export async function fetchWithRetry(
     );
   }
   const timeoutMs = opts?.timeoutMs ?? config.aiTimeoutMs();
-  const maxRetries = opts?.maxRetries ?? config.aiMaxRetries();
-
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= maxRetries; attempt++) {
-    if (attempt > 0) {
-      await sleep(500 * 2 ** (attempt - 1));
+  void opts?.maxRetries;
+  try {
+    const res = await fetch(url, {
+      ...initFactory(),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) {
+      const body = await res.text().catch(() => "");
+      throw providerErrorFromResponse(res.status, body, opts?.providerId);
     }
-    try {
-      const res = await fetch(url, {
-        ...initFactory(),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-      if (res.status >= 400 && res.status < 500) {
-        // 4xx：读取错误体后直接抛出，不重试
-        const body = await res.text().catch(() => "");
-        throw providerErrorFromResponse(res.status, body, opts?.providerId);
-      }
-      if (res.status >= 500) {
-        const body = await res.text().catch(() => "");
-        lastError = providerErrorFromResponse(res.status, body, opts?.providerId);
-        continue; // 5xx 重试
-      }
-      return res;
-    } catch (err) {
-      if (err instanceof ProviderError && err.status !== undefined && err.status < 500) {
-        throw err; // 4xx 不重试
-      }
-      lastError = err; // 网络错误 / 超时 / 5xx → 重试
-    }
-  }
-  if (lastError instanceof ProviderError) throw lastError;
-  if (lastError instanceof Error && (lastError.name === "TimeoutError" || lastError.name === "AbortError")) {
+    return res;
+  } catch (error) {
+    if (error instanceof ProviderError) throw error;
+    const timedOut = error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError");
     throw new ProviderError(
-      "AI 服务响应超时，请稍后重试",
-      504,
+      timedOut
+        ? "AI 请求已超时，结果可能已经生成；为避免重复计费，系统不会自动重试"
+        : "AI 连接中断，结果可能已经生成；为避免重复计费，系统不会自动重试",
+      timedOut ? 504 : 502,
       opts?.providerId,
-      "timeout",
-      lastError.message,
+      "outcome_unknown",
+      error instanceof Error ? error.message : String(error),
     );
   }
-  throw new ProviderError(
-    "AI 服务暂时不可用，请稍后重试",
-    502,
-    opts?.providerId,
-    "gateway_unavailable",
-    lastError instanceof Error ? lastError.message : String(lastError),
-  );
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((r) => setTimeout(r, ms));
 }
 
 // ---------- dataURL 工具 ----------

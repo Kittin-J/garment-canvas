@@ -1,14 +1,16 @@
 import { useState } from "react";
 import { Handle, Position, type NodeProps, type Node } from "@xyflow/react";
 import { appendSavedAsset, useFlowStore } from "@/store/flowStore";
-import type { PrintExtractNodeData } from "@/types/workflow";
+import { isNodeRunActive, type PrintExtractNodeData } from "@/types/workflow";
 import { NodeFrame, RunButton, Developing, inputClass } from "./NodeFrame";
 import { ImageGrid } from "./ImageGrid";
+import { ModelControls } from "./ModelControls";
 
 export function PrintExtractNode({ id, data, selected }: NodeProps<Node<PrintExtractNodeData>>) {
   const updateNodeData = useFlowStore((s) => s.updateNodeData);
   const runNode = useFlowStore((s) => s.runNode);
-  const running = data.status === "running" || data.status === "queued";
+  const cancelNodeRun = useFlowStore((s) => s.cancelNodeRun);
+  const running = isNodeRunActive(data.status);
   const [savingUrl, setSavingUrl] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const saved = data.savedAsAssets ?? [];
@@ -56,7 +58,8 @@ export function PrintExtractNode({ id, data, selected }: NodeProps<Node<PrintExt
           />
           <span className="text-[9px] text-neutral-600">可连接 1–8 张参考图，按连线顺序传入</span>
         </label>
-        <RunButton running={running} queued={data.status === "queued"} onClick={() => void runNode(id)} label="提取印花" />
+        <ModelControls nodeId={id} modelId={data.modelId} modelOptions={data.modelOptions} disabled={running} />
+        <RunButton status={data.status} onClick={() => void runNode(id)} onCancel={() => void cancelNodeRun(id)} label="提取印花" />
         {running && <Developing />}
         <ImageGrid
           images={data.outputImages}
