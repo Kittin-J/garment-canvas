@@ -41,15 +41,24 @@ function boundedIntegerEnv(name, fallback, min, max) {
   const value = Number(process.env[name]);
   return Number.isInteger(value) ? Math.max(min, Math.min(max, value)) : fallback;
 }
+function normalizeOpenAiBaseUrl(value) {
+  const normalized = value.replace(/\/+$/, "");
+  return /\/v1$/i.test(normalized) ? normalized : `${normalized}/v1`;
+}
 var config = {
   /** change2pro 中转站 */
   change2proBaseUrl: () => (process.env.CHANGE2PRO_BASE_URL ?? "https://your-change2pro-host/v1").replace(/\/+$/, ""),
   change2proApiKey: () => required("CHANGE2PRO_API_KEY"),
+  /** API易 OpenAI Images 兼容接口；旧变量仅作为升级时的回退。 */
+  apiyiBaseUrl: () => normalizeOpenAiBaseUrl(
+    process.env.APIYI_BASE_URL || process.env.CHANGE2PRO_BASE_URL || "https://api.apiyi.com/v1"
+  ),
+  apiyiApiKey: () => process.env.APIYI_API_KEY || required("CHANGE2PRO_API_KEY"),
   /** nanobanana 可用独立 Key（如中转站按平台分组发 Key），缺省回退主 Key */
   nanobananaApiKey: () => process.env.NANOBANANA_API_KEY || required("CHANGE2PRO_API_KEY"),
   // 不再假定任意 OpenAI 兼容网关都存在某个固定模型；部署必须明确声明模型 ID。
   nanobananaModel: () => required("NANOBANANA_MODEL"),
-  image2Model: () => required("IMAGE2_MODEL"),
+  image2Model: () => process.env.APIYI_IMAGE_MODEL?.trim() || process.env.IMAGE2_MODEL?.trim() || "gpt-image-2-all",
   nanobananaCapabilities: () => ({
     supportsBatchN: booleanEnv("NANOBANANA_SUPPORTS_N", false),
     maxBatchSize: boundedIntegerEnv("NANOBANANA_MAX_BATCH", 1, 1, 4),
@@ -57,10 +66,15 @@ var config = {
     maxReferenceImages: boundedIntegerEnv("NANOBANANA_MAX_REFERENCE_IMAGES", 8, 1, 8)
   }),
   image2Capabilities: () => ({
-    supportsBatchN: booleanEnv("IMAGE2_SUPPORTS_N", false),
-    maxBatchSize: boundedIntegerEnv("IMAGE2_MAX_BATCH", 1, 1, 4),
-    supportsMultiReference: booleanEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", true),
-    maxReferenceImages: boundedIntegerEnv("IMAGE2_MAX_REFERENCE_IMAGES", 8, 1, 8)
+    supportsBatchN: config.image2Model() === "gpt-image-2-all" ? false : booleanEnv("IMAGE2_SUPPORTS_N", false),
+    maxBatchSize: config.image2Model() === "gpt-image-2-all" ? 1 : boundedIntegerEnv("IMAGE2_MAX_BATCH", 1, 1, 4),
+    supportsMultiReference: config.image2Model() === "gpt-image-2-all" ? true : booleanEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", true),
+    maxReferenceImages: boundedIntegerEnv(
+      "APIYI_MAX_REFERENCE_IMAGES",
+      boundedIntegerEnv("IMAGE2_MAX_REFERENCE_IMAGES", 8, 1, 8),
+      1,
+      8
+    )
   }),
   port: () => Number(process.env.PORT ?? 3001),
   dataDir: () => path.resolve(ROOT_DIR, process.env.DATA_DIR ?? "./data"),
@@ -82,9 +96,9 @@ var config = {
   aiMaxRetries: () => Number(process.env.AI_MAX_RETRIES ?? 2),
   /** 不发外部请求的 AI 配置就绪检查，供 readiness 使用。 */
   aiConfigReady: () => {
-    const key = process.env.CHANGE2PRO_API_KEY || process.env.NANOBANANA_API_KEY;
-    const baseUrl = process.env.CHANGE2PRO_BASE_URL ?? "";
-    if (!key || !baseUrl || /your-change2pro-host/i.test(baseUrl) || !process.env.IMAGE2_MODEL?.trim() || !process.env.NANOBANANA_MODEL?.trim()) return false;
+    const key = process.env.APIYI_API_KEY || process.env.CHANGE2PRO_API_KEY;
+    const baseUrl = process.env.APIYI_BASE_URL || process.env.CHANGE2PRO_BASE_URL || "https://api.apiyi.com/v1";
+    if (!key || !baseUrl || /your-change2pro-host/i.test(baseUrl)) return false;
     try {
       const url = new URL(baseUrl);
       return url.protocol === "https:";
@@ -553,6 +567,22 @@ function extensionForMime(mime) {
       return "png";
   }
 }
+async function prepareApiyiReferenceUploads(referenceImages) {
+  return referenceImages.map((referenceImage, index) => {
+    const { buffer, mime } = parseDataUrl(referenceImage);
+    if (!(/* @__PURE__ */ new Set(["image/png", "image/jpeg", "image/webp"])).has(mime)) {
+      throw new Error(`API\u6613\u53C2\u8003\u56FE ${index + 1} \u4EC5\u652F\u6301 PNG\u3001JPEG \u6216 WebP`);
+    }
+    if (buffer.length > 10 * 1024 * 1024) {
+      throw new Error(`API\u6613\u53C2\u8003\u56FE ${index + 1} \u4E0D\u80FD\u8D85\u8FC7 10MB`);
+    }
+    return {
+      buffer,
+      filename: `reference-${index + 1}.${extensionForMime(mime)}`,
+      mime
+    };
+  });
+}
 function referenceLabel(index) {
   const { tileSize, labelHeight } = IMAGE2_COLLAGE_LAYOUT;
   return Buffer.from(
@@ -710,27 +740,44 @@ var nanobananaProvider = {
 
 // server/providers/image2.ts
 var PROVIDER_ID2 = "gpt-image-2";
+var ASPECT_RATIO_PROMPT = {
+  "1:1": "1:1 \u65B9\u5F62\u6784\u56FE",
+  "3:4": "3:4 \u7AD6\u7248\u6784\u56FE",
+  "4:3": "4:3 \u6A2A\u7248\u6784\u56FE",
+  "9:16": "\u7AD6\u5C4F 9:16",
+  "16:9": "\u6A2A\u7248 16:9"
+};
+function promptWithAspectRatio(prompt, aspectRatio) {
+  const prefix = aspectRatio ? ASPECT_RATIO_PROMPT[aspectRatio] : void 0;
+  return prefix ? `${prefix}\uFF0C${prompt}` : prompt;
+}
+function usesApiyiAllContract() {
+  return config.image2Model() === "gpt-image-2-all";
+}
 var image2Provider = {
   id: PROVIDER_ID2,
   /** 无参考图：/v1/images/generations */
   async generate(req) {
     const capabilities = config.image2Capabilities();
-    const url = `${config.change2proBaseUrl()}/images/generations`;
+    const apiyiAll = usesApiyiAllContract();
+    const url = `${config.apiyiBaseUrl()}/images/generations`;
     const res = await fetchWithRetry(
       url,
       () => ({
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${config.change2proApiKey()}`
+          Authorization: `Bearer ${config.apiyiApiKey()}`
         },
         body: JSON.stringify({
           model: config.image2Model(),
-          prompt: req.prompt,
-          ...capabilities.supportsBatchN ? { n: Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize)) } : {},
-          size: aspectRatioToSize(req.aspectRatio),
-          quality: "low",
-          output_format: "png"
+          prompt: apiyiAll ? promptWithAspectRatio(req.prompt, req.aspectRatio) : req.prompt,
+          ...apiyiAll ? { response_format: "b64_json" } : {
+            ...capabilities.supportsBatchN ? { n: Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize)) } : {},
+            size: aspectRatioToSize(req.aspectRatio),
+            quality: "low",
+            output_format: "png"
+          }
         })
       }),
       { providerId: PROVIDER_ID2 }
@@ -744,6 +791,7 @@ var image2Provider = {
       throw new ProviderError("edit requires referenceImages", 400, PROVIDER_ID2);
     }
     const capabilities = config.image2Capabilities();
+    const apiyiAll = usesApiyiAllContract();
     const maxReferences = Math.min(MAX_REFERENCE_IMAGES, capabilities.maxReferenceImages);
     if (req.referenceImages.length > maxReferences) {
       throw new ProviderError(`\u5F53\u524D AI \u670D\u52A1\u6700\u591A\u652F\u6301 ${maxReferences} \u5F20\u53C2\u8003\u56FE`, 400, PROVIDER_ID2, "invalid_request");
@@ -751,36 +799,51 @@ var image2Provider = {
     if (req.referenceImages.length > 1 && !capabilities.supportsMultiReference) {
       throw new ProviderError("\u5F53\u524D AI \u670D\u52A1\u672A\u5F00\u542F\u591A\u53C2\u8003\u56FE\uFF0C\u8BF7\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID2, "invalid_request");
     }
-    if (req.referenceImages.length > 1 && req.mask) {
+    if (!apiyiAll && req.referenceImages.length > 1 && req.mask) {
       throw new ProviderError("\u591A\u53C2\u8003\u56FE\u62FC\u56FE\u6682\u4E0D\u652F\u6301\u8499\u7248\uFF0C\u8BF7\u79FB\u9664\u8499\u7248\u6216\u53EA\u4FDD\u7559\u4E00\u5F20\u53C2\u8003\u56FE", 400, PROVIDER_ID2, "invalid_request");
     }
-    const referenceUpload = await prepareImage2ReferenceUpload(req.referenceImages);
-    const prompt = promptWithImageLayout(req.prompt, req.referenceImages.length);
-    const url = `${config.change2proBaseUrl()}/images/edits`;
+    if (apiyiAll && req.mask) {
+      throw new ProviderError("\u5F53\u524D API\u6613\u6A21\u578B\u4E0D\u652F\u6301\u8499\u7248\u7F16\u8F91\uFF0C\u8BF7\u79FB\u9664\u8499\u7248\u540E\u91CD\u8BD5", 400, PROVIDER_ID2, "invalid_request");
+    }
+    const referenceUploads = apiyiAll ? await prepareApiyiReferenceUploads(req.referenceImages) : void 0;
+    const referenceUpload = apiyiAll ? void 0 : await prepareImage2ReferenceUpload(req.referenceImages);
+    const prompt = apiyiAll ? promptWithAspectRatio(req.prompt, req.aspectRatio) : promptWithImageLayout(req.prompt, req.referenceImages.length);
+    const url = `${config.apiyiBaseUrl()}/images/edits`;
     const res = await fetchWithRetry(
       url,
       () => {
         const form = new FormData();
         form.append("model", config.image2Model());
         form.append("prompt", prompt);
-        if (req.aspectRatio) form.append("size", aspectRatioToSize(req.aspectRatio));
-        form.append("quality", "low");
-        form.append("output_format", "png");
-        if (capabilities.supportsBatchN) {
-          form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize))));
-        }
-        form.append(
-          "image",
-          new Blob([new Uint8Array(referenceUpload.buffer)], { type: referenceUpload.mime }),
-          referenceUpload.filename
-        );
-        if (req.mask) {
-          const { mime, buffer } = parseDataUrl(req.mask);
-          form.append("mask", new Blob([new Uint8Array(buffer)], { type: mime }), "mask.png");
+        if (apiyiAll) {
+          form.append("response_format", "b64_json");
+          for (const upload of referenceUploads ?? []) {
+            form.append(
+              "image",
+              new Blob([new Uint8Array(upload.buffer)], { type: upload.mime }),
+              upload.filename
+            );
+          }
+        } else if (referenceUpload) {
+          if (req.aspectRatio) form.append("size", aspectRatioToSize(req.aspectRatio));
+          form.append("quality", "low");
+          form.append("output_format", "png");
+          if (capabilities.supportsBatchN) {
+            form.append("n", String(Math.max(1, Math.min(req.batchSize ?? 1, capabilities.maxBatchSize))));
+          }
+          form.append(
+            "image",
+            new Blob([new Uint8Array(referenceUpload.buffer)], { type: referenceUpload.mime }),
+            referenceUpload.filename
+          );
+          if (req.mask) {
+            const { mime, buffer } = parseDataUrl(req.mask);
+            form.append("mask", new Blob([new Uint8Array(buffer)], { type: mime }), "mask.png");
+          }
         }
         return {
           method: "POST",
-          headers: { Authorization: `Bearer ${config.change2proApiKey()}` },
+          headers: { Authorization: `Bearer ${config.apiyiApiKey()}` },
           body: form
         };
       },
@@ -4313,13 +4376,14 @@ function providerSettings(providerId) {
     providerId,
     model: nanobanana ? config.nanobananaModel() : config.image2Model(),
     capabilities: nanobanana ? config.nanobananaCapabilities() : config.image2Capabilities(),
-    apiKey: nanobanana ? config.nanobananaApiKey() : config.change2proApiKey()
+    apiKey: nanobanana ? config.nanobananaApiKey() : config.apiyiApiKey(),
+    baseUrl: nanobanana ? config.change2proBaseUrl() : config.apiyiBaseUrl()
   };
 }
 var getDiagnostics = asyncHandler(async (_req, res) => {
   let gateway = "\u672A\u914D\u7F6E";
   try {
-    gateway = new URL(config.change2proBaseUrl()).host;
+    gateway = new URL(config.apiyiBaseUrl()).host;
   } catch {
   }
   const providers2 = ["nanobanana", "gpt-image-2"].map((providerId) => {
@@ -4358,14 +4422,14 @@ var probeDiagnostics = asyncHandler(async (req, res) => {
       const requestInit = () => ({ headers: { Authorization: `Bearer ${settings.apiKey}` } });
       try {
         await fetchWithRetry(
-          `${config.change2proBaseUrl()}/models/${encodeURIComponent(settings.model)}`,
+          `${settings.baseUrl}/models/${encodeURIComponent(settings.model)}`,
           requestInit,
           requestOptions
         );
       } catch (error) {
         if (!(error instanceof ProviderError) || error.status !== 404) throw error;
         const response = await fetchWithRetry(
-          `${config.change2proBaseUrl()}/models`,
+          `${settings.baseUrl}/models`,
           requestInit,
           requestOptions
         );
