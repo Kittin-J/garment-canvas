@@ -74,6 +74,7 @@ This project is indexed by GitNexus as **garment-canvas** (7300 symbols, 15964 r
 
 ## Git and Agent Collaboration
 
+- All GitHub operations must authenticate with a Fine-grained personal access token (PAT). Do not use Classic PATs or GitHub App/connector credentials for repository reads or writes. Scope the token to the selected repository and grant only the permissions required for the task; never place the token in chat, logs, commits, project files, or example environment files.
 - Claude may edit only inside a linked worktree created for its task. A read-only audit may run in the primary worktree, but it must not change files there.
 - The project hook enforces a conservative Bash allowlist in the primary worktree. If it blocks a command, use Read/Grep/GitNexus or restart in a linked worktree; do not bypass or disable the hook.
 - Treat the hook as a defense against accidental agent actions, not an adversarial security sandbox. Shell indirection and child processes cannot be completely classified from a command string; use an OS-level sandbox or read-only mount when running untrusted agents.
