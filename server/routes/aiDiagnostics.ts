@@ -15,14 +15,15 @@ function providerSettings(providerId: "nanobanana" | "gpt-image-2") {
     providerId,
     model: nanobanana ? config.nanobananaModel() : config.image2Model(),
     capabilities: nanobanana ? config.nanobananaCapabilities() : config.image2Capabilities(),
-    apiKey: nanobanana ? config.nanobananaApiKey() : config.change2proApiKey(),
+    apiKey: nanobanana ? config.nanobananaApiKey() : config.apiyiApiKey(),
+    baseUrl: nanobanana ? config.change2proBaseUrl() : config.apiyiBaseUrl(),
   };
 }
 
 const getDiagnostics = asyncHandler(async (_req, res) => {
   let gateway = "未配置";
   try {
-    gateway = new URL(config.change2proBaseUrl()).host;
+    gateway = new URL(config.apiyiBaseUrl()).host;
   } catch {
     // 配置错误会由 ready 检查和下面的 model getter 明确显示。
   }
@@ -65,7 +66,7 @@ const probeDiagnostics = asyncHandler(async (req, res) => {
       const requestInit = () => ({ headers: { Authorization: `Bearer ${settings.apiKey}` } });
       try {
         await fetchWithRetry(
-          `${config.change2proBaseUrl()}/models/${encodeURIComponent(settings.model)}`,
+          `${settings.baseUrl}/models/${encodeURIComponent(settings.model)}`,
           requestInit,
           requestOptions,
         );
@@ -73,7 +74,7 @@ const probeDiagnostics = asyncHandler(async (req, res) => {
         // 部分 OpenAI 兼容网关只实现模型列表，不实现 /models/:id。
         if (!(error instanceof ProviderError) || error.status !== 404) throw error;
         const response = await fetchWithRetry(
-          `${config.change2proBaseUrl()}/models`,
+          `${settings.baseUrl}/models`,
           requestInit,
           requestOptions,
         );

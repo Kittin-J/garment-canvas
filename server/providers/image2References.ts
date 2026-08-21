@@ -31,6 +31,24 @@ function extensionForMime(mime: string): string {
   }
 }
 
+/** API易 edits 接受重复的 image 字段；保持业务顺序并逐张上传。 */
+export async function prepareApiyiReferenceUploads(referenceImages: string[]): Promise<Image2ReferenceUpload[]> {
+  return referenceImages.map((referenceImage, index) => {
+    const { buffer, mime } = parseDataUrl(referenceImage);
+    if (!new Set(["image/png", "image/jpeg", "image/webp"]).has(mime)) {
+      throw new Error(`API易参考图 ${index + 1} 仅支持 PNG、JPEG 或 WebP`);
+    }
+    if (buffer.length > 10 * 1024 * 1024) {
+      throw new Error(`API易参考图 ${index + 1} 不能超过 10MB`);
+    }
+    return {
+      buffer,
+      filename: `reference-${index + 1}.${extensionForMime(mime)}`,
+      mime,
+    };
+  });
+}
+
 function referenceLabel(index: number): Buffer {
   const { tileSize, labelHeight } = IMAGE2_COLLAGE_LAYOUT;
   return Buffer.from(
