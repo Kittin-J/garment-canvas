@@ -50,6 +50,11 @@ function boundedIntegerEnv(name: string, fallback: number, min: number, max: num
   return Number.isInteger(value) ? Math.max(min, Math.min(max, value)) : fallback;
 }
 
+function normalizeOpenAiBaseUrl(value: string): string {
+  const normalized = value.replace(/\/+$/, "");
+  return /\/v1$/i.test(normalized) ? normalized : `${normalized}/v1`;
+}
+
 export interface ImageProviderCapabilities {
   supportsBatchN: boolean;
   maxBatchSize: number;
@@ -63,13 +68,19 @@ export const config = {
     (process.env.CHANGE2PRO_BASE_URL ?? "https://your-change2pro-host/v1").replace(/\/+$/, ""),
   change2proApiKey: () => required("CHANGE2PRO_API_KEY"),
 
+  /** API易 OpenAI Images 兼容接口；旧变量仅作为升级时的回退。 */
+  apiyiBaseUrl: () => normalizeOpenAiBaseUrl(
+    process.env.APIYI_BASE_URL || process.env.CHANGE2PRO_BASE_URL || "https://api.apiyi.com/v1",
+  ),
+  apiyiApiKey: () => process.env.APIYI_API_KEY || required("CHANGE2PRO_API_KEY"),
+
   /** nanobanana 可用独立 Key（如中转站按平台分组发 Key），缺省回退主 Key */
   nanobananaApiKey: () =>
     process.env.NANOBANANA_API_KEY || required("CHANGE2PRO_API_KEY"),
 
   // 不再假定任意 OpenAI 兼容网关都存在某个固定模型；部署必须明确声明模型 ID。
   nanobananaModel: () => required("NANOBANANA_MODEL"),
-  image2Model: () => required("IMAGE2_MODEL"),
+  image2Model: () => process.env.APIYI_IMAGE_MODEL?.trim() || process.env.IMAGE2_MODEL?.trim() || "gpt-image-2-all",
   nanobananaCapabilities: (): ImageProviderCapabilities => ({
     supportsBatchN: booleanEnv("NANOBANANA_SUPPORTS_N", false),
     maxBatchSize: boundedIntegerEnv("NANOBANANA_MAX_BATCH", 1, 1, 4),
@@ -77,10 +88,21 @@ export const config = {
     maxReferenceImages: boundedIntegerEnv("NANOBANANA_MAX_REFERENCE_IMAGES", 8, 1, 8),
   }),
   image2Capabilities: (): ImageProviderCapabilities => ({
-    supportsBatchN: booleanEnv("IMAGE2_SUPPORTS_N", false),
-    maxBatchSize: boundedIntegerEnv("IMAGE2_MAX_BATCH", 1, 1, 4),
-    supportsMultiReference: booleanEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", true),
-    maxReferenceImages: boundedIntegerEnv("IMAGE2_MAX_REFERENCE_IMAGES", 8, 1, 8),
+    supportsBatchN: config.image2Model() === "gpt-image-2-all"
+      ? false
+      : booleanEnv("IMAGE2_SUPPORTS_N", false),
+    maxBatchSize: config.image2Model() === "gpt-image-2-all"
+      ? 1
+      : boundedIntegerEnv("IMAGE2_MAX_BATCH", 1, 1, 4),
+    supportsMultiReference: config.image2Model() === "gpt-image-2-all"
+      ? true
+      : booleanEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", true),
+    maxReferenceImages: boundedIntegerEnv(
+      "APIYI_MAX_REFERENCE_IMAGES",
+      boundedIntegerEnv("IMAGE2_MAX_REFERENCE_IMAGES", 8, 1, 8),
+      1,
+      8,
+    ),
   }),
 
   port: () => Number(process.env.PORT ?? 3001),
@@ -105,11 +127,10 @@ export const config = {
 
   /** 不发外部请求的 AI 配置就绪检查，供 readiness 使用。 */
   aiConfigReady: () => {
-    const key = process.env.CHANGE2PRO_API_KEY || process.env.NANOBANANA_API_KEY;
-    const baseUrl = process.env.CHANGE2PRO_BASE_URL ?? "";
+    const key = process.env.APIYI_API_KEY || process.env.CHANGE2PRO_API_KEY;
+    const baseUrl = process.env.APIYI_BASE_URL || process.env.CHANGE2PRO_BASE_URL || "https://api.apiyi.com/v1";
     if (
-      !key || !baseUrl || /your-change2pro-host/i.test(baseUrl) ||
-      !process.env.IMAGE2_MODEL?.trim() || !process.env.NANOBANANA_MODEL?.trim()
+      !key || !baseUrl || /your-change2pro-host/i.test(baseUrl)
     ) return false;
     try {
       const url = new URL(baseUrl);

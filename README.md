@@ -86,16 +86,16 @@ INITIAL_ADMIN_PASSWORD=your-temporary-password
 自己的 CSV，管理员可按用户或全部导出。
 
 `/api/ready` 还会检查 AI 网关已配置：必须提供非空的
-`CHANGE2PRO_API_KEY`（或 `NANOBANANA_API_KEY`）以及 HTTPS
-`CHANGE2PRO_BASE_URL`。该检查不会主动调用外部模型，不会产生费用。
+`APIYI_API_KEY`（升级期间也兼容旧 `CHANGE2PRO_API_KEY`）以及 HTTPS
+`APIYI_BASE_URL`。该检查不会主动调用外部模型，不会产生费用。
 
 生成和工作流执行接口使用进程内限流：同一 IP 每分钟最多请求 5 次；服务重启后计数重置。
 
-带提示词的 AI 节点可按连线顺序接收最多 8 张参考图。按照灵眸 GPT Image 2
-的单图编辑契约，多张参考图会在服务端按顺序合成为带编号的参考板，再通过
-Images Edit 的单数 `image` multipart 字段提交。模型返回的 `size` 不作为最终
-像素保证；画幅比例以及 2K/4K 会在服务端读取结果后无拉伸地处理到目标尺寸。
-本地接口基准见 [`docs/ai/gpt-image-2-lmu.md`](docs/ai/gpt-image-2-lmu.md)。
+带提示词的 AI 节点可按连线顺序接收最多 8 张参考图。默认的 API易
+`gpt-image-2-all` 契约会按顺序重复提交同名 `image` multipart 字段；旧模型
+仍保留编号参考板兼容路径。模型返回尺寸不作为最终像素保证；画幅比例以及
+2K/4K 会在服务端读取结果后无拉伸地处理到目标尺寸。
+API易接口基准见 [`docs/ai/apiyi-gpt-image-2-all.md`](docs/ai/apiyi-gpt-image-2-all.md)。
 
 内置模板将“人物场景迁移”与“图案风格迁移”分开，避免人物/座椅语义污染
 印花图案处理。

@@ -312,6 +312,7 @@ async function main(): Promise<void> {
 
   await test("多参考图与 mask 组合在拼图和网关请求前被两个 Provider 拒绝", async () => {
     const restores = [
+      setEnv("IMAGE2_MODEL", "gpt-image-2"),
       setEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", "true"),
       setEnv("IMAGE2_MAX_REFERENCE_IMAGES", "8"),
       setEnv("NANOBANANA_SUPPORTS_MULTI_REFERENCE", "true"),
@@ -348,6 +349,7 @@ async function main(): Promise<void> {
 
   await test("多参考图能力开关关闭时在拼图和网关请求前拒绝", async () => {
     const restores = [
+      setEnv("IMAGE2_MODEL", "gpt-image-2"),
       setEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", "false"),
       setEnv("NANOBANANA_SUPPORTS_MULTI_REFERENCE", "false"),
     ];
@@ -378,6 +380,7 @@ async function main(): Promise<void> {
 
   await test("多参考图拼图在解码时限制每张图最多 40MP", async () => {
     const restores = [
+      setEnv("IMAGE2_MODEL", "gpt-image-2"),
       setEnv("IMAGE2_SUPPORTS_MULTI_REFERENCE", "true"),
       setEnv("IMAGE2_MAX_REFERENCE_IMAGES", "8"),
     ];
@@ -475,6 +478,54 @@ async function main(): Promise<void> {
     try {
       await image2Provider.generate({ prompt: "批量", batchSize: 4 });
       assert.equal(body.n, 2);
+    } finally {
+      restoreFetch();
+      restores.reverse().forEach((restore) => restore());
+    }
+  });
+
+  await test("API易 gpt-image-2-all 使用精简 generations 参数并按顺序重复上传 image", async () => {
+    const restores = [
+      setEnv("APIYI_BASE_URL", "https://api.apiyi.example"),
+      setEnv("APIYI_API_KEY", "apiyi-test-key"),
+      setEnv("APIYI_IMAGE_MODEL", "gpt-image-2-all"),
+      setEnv("AI_MAX_RETRIES", "0"),
+    ];
+    const requests: Array<{ url: string; body: unknown; authorization: string | null }> = [];
+    const restoreFetch = installFetchMock((input, init) => {
+      const headers = new Headers(init?.headers);
+      requests.push({
+        url: String(input),
+        body: init?.body,
+        authorization: headers.get("Authorization"),
+      });
+      return Response.json({ data: [{ b64_json: VALID_PNG_BASE64 }] });
+    });
+    try {
+      await image2Provider.generate({ prompt: "生成服装图", aspectRatio: "16:9", batchSize: 8 });
+      const generateBody = JSON.parse(String(requests[0].body)) as Record<string, unknown>;
+      assert.equal(requests[0].url, "https://api.apiyi.example/v1/images/generations");
+      assert.equal(requests[0].authorization, "Bearer apiyi-test-key");
+      assert.deepEqual(Object.keys(generateBody).sort(), ["model", "prompt", "response_format"]);
+      assert.equal(generateBody.model, "gpt-image-2-all");
+      assert.equal(generateBody.response_format, "b64_json");
+      assert.match(String(generateBody.prompt), /^横版 16:9，/);
+
+      const references = [
+        await solidPngDataUrl({ r: 20, g: 30, b: 40 }),
+        await solidPngDataUrl({ r: 50, g: 60, b: 70 }),
+      ];
+      await image2Provider.edit({ prompt: "把图1服装放到图2场景", referenceImages: references });
+      assert.equal(requests[1].url, "https://api.apiyi.example/v1/images/edits");
+      assert.ok(requests[1].body instanceof FormData);
+      const form = requests[1].body as FormData;
+      assert.equal(form.get("model"), "gpt-image-2-all");
+      assert.equal(form.get("response_format"), "b64_json");
+      assert.equal(form.getAll("image").length, 2);
+      assert.equal(form.has("n"), false);
+      assert.equal(form.has("size"), false);
+      assert.equal(form.has("quality"), false);
+      assert.equal(form.has("output_format"), false);
     } finally {
       restoreFetch();
       restores.reverse().forEach((restore) => restore());
